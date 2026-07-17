@@ -49,7 +49,11 @@ pub enum Mode {
 ///   stored `hk-` gateway key). The recommended path.
 /// - `Anthropic` / `OpenAI` — the vendor's own API, reached directly with the
 ///   user's own key. Not metered by Hanzo; billed by the vendor.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is hand-written to REDACT the secret (below): a run at `-vvv` wires
+/// `trace!`, so a stray `trace!(?routing)` must never print an `sk-ant-…`/`hk-…`/
+/// bearer — only the non-secret `api` survives.
+#[derive(Clone)]
 pub enum Routing {
     /// Route through the Hanzo gateway; `token` is the hanzo.id bearer / `hk-` key.
     Gateway {
@@ -64,6 +68,51 @@ pub enum Routing {
     OpenAI { key: String },
 }
 
+impl std::fmt::Debug for Routing {
+    /// Redacted: the `token`/`key` is a secret and must NEVER reach a log. Same
+    /// reason `Spec` omits `Debug` entirely.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Routing::Gateway { api, .. } => {
+                f.debug_struct("Gateway").field("api", api).field("token", &"***").finish()
+            }
+            Routing::Anthropic { .. } => f.debug_struct("Anthropic").field("key", &"***").finish(),
+            Routing::OpenAI { .. } => f.debug_struct("OpenAI").field("key", &"***").finish(),
+        }
+    }
+}
+
+/// The model-routing DECISION for a run — three outcomes, because the child's
+/// model-auth env must be handled DIFFERENTLY in each. Collapsing them (the old
+/// `Option<Routing>`) is exactly what let a selected-but-unresolved provider
+/// silently inherit a shell-set `ANTHROPIC_BASE_URL`:
+///   - `Via` — a credential resolved: SET it, and CLEAR the vendor's other auth
+///     vars so no stray inherited value shadows or redirects it.
+///   - `Inherit` — `--no-route` (or an unconfigured, signed-out run): the backend
+///     uses its OWN model account, so the child's inherited model-auth env is left
+///     exactly as the user's shell has it — the pass-through `--no-route` promises.
+///   - `FailClosed` — routing was INTENDED (a provider is selected) but NO
+///     credential resolved. Set nothing AND clear the vendor's model-auth env, so
+///     a run never ships prompts+code to an inherited/attacker-set endpoint.
+#[derive(Debug, Clone)]
+pub enum Route {
+    Via(Routing),
+    Inherit,
+    FailClosed,
+}
+
+impl Route {
+    /// The resolved credential+destination, if one was found. `Inherit` and
+    /// `FailClosed` carry none, so both read as `None` — what the banner + status
+    /// line want (they only distinguish "routing on → where" from "off").
+    pub fn via(&self) -> Option<&Routing> {
+        match self {
+            Route::Via(r) => Some(r),
+            Route::Inherit | Route::FailClosed => None,
+        }
+    }
+}
+
 /// A resolved hanzo-mcp launch (command + base args incl. `--project-dir`).
 #[derive(Debug, Clone)]
 pub struct McpAttach {
@@ -76,7 +125,10 @@ pub struct Spec {
     pub mode: Mode,
     pub task: Option<String>,
     pub cwd: PathBuf,
-    pub routing: Option<Routing>,
+    /// The resolved model-routing decision: set a credential (`Via`), inherit the
+    /// shell's (`Inherit`, `--no-route`), or fail closed and clear it
+    /// (`FailClosed`, a selected provider with no usable key).
+    pub routing: Route,
     pub mcp: Option<McpAttach>,
     /// Emit the machine-readable event stream (only when we actually stream to
     /// cloud). When false, a headless run keeps the backend's native output and
@@ -177,5 +229,33 @@ mod tests {
         assert_eq!(BackendKind::parse("dev").unwrap(), BackendKind::Dev);
         assert_eq!(BackendKind::parse("codex").unwrap(), BackendKind::Dev);
         assert!(BackendKind::parse("gpt").is_err());
+    }
+
+    /// LOW-2: `Routing`'s `Debug` must REDACT the secret. No path prints it today,
+    /// but `-vvv` wires `trace!`, so a future `trace!(?routing)` would otherwise
+    /// leak an `sk-ant-…`/`hk-…`/bearer. The non-secret `api` stays for debugging.
+    #[test]
+    fn routing_debug_redacts_the_secret() {
+        let g = Routing::Gateway { api: "https://api.hanzo.ai".into(), token: "hk-SECRET-TOKEN".into() };
+        let s = format!("{g:?}");
+        assert!(!s.contains("hk-SECRET-TOKEN"), "token leaked in Debug: {s}");
+        assert!(s.contains("***"), "expected a redaction marker: {s}");
+        assert!(s.contains("api.hanzo.ai"), "the non-secret api should survive: {s}");
+
+        assert!(!format!("{:?}", Routing::Anthropic { key: "sk-ant-SECRET".into() }).contains("sk-ant-SECRET"));
+        assert!(!format!("{:?}", Routing::OpenAI { key: "sk-proj-SECRET".into() }).contains("sk-proj-SECRET"));
+
+        // `Route` composes the redacting `Debug`, so wrapping never re-exposes it.
+        let r = Route::Via(Routing::Gateway { api: "x".into(), token: "hk-INNER".into() });
+        assert!(!format!("{r:?}").contains("hk-INNER"), "Route::Via leaked the inner secret");
+    }
+
+    /// `Route::via()` yields the credential only for `Via`; the two no-credential
+    /// outcomes both read as `None` (what the banner/status line consume).
+    #[test]
+    fn route_via_exposes_only_the_resolved_credential() {
+        assert!(Route::Via(Routing::OpenAI { key: "sk-x".into() }).via().is_some());
+        assert!(Route::Inherit.via().is_none());
+        assert!(Route::FailClosed.via().is_none());
     }
 }

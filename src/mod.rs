@@ -45,7 +45,7 @@ use crate::iam::identity::Identity;
 use crate::iam::provider::{self, Provider};
 use crate::{commands::network, iam::store};
 
-use backend::{resolve, resolve_mcp, BackendKind, Backend, Launch, Mode, Routing, Spec};
+use backend::{resolve, resolve_mcp, BackendKind, Backend, Launch, Mode, Route, Routing, Spec};
 use context::{ResumeRecord, Snapshot};
 use event::{Kind, Mapped, Status, Usage};
 use session::SessionClient;
@@ -144,42 +144,64 @@ fn route_plan(backend: BackendKind, provider: Option<&str>, has_bearer: bool) ->
 /// first credential actually held. Provider keys are read from the Vault LAZILY
 /// (only as the plan reaches them), so the common gateway path (bearer in hand)
 /// does zero extra keychain reads, and `--no-route` does none at all.
+///
+/// Returns a [`Route`] — the three-way decision the backend needs to treat the
+/// child's model-auth env correctly. `--no-route` ⇒ `Inherit`; a resolved
+/// credential ⇒ `Via`; nothing resolved ⇒ [`unresolved_route`] (fail closed iff a
+/// provider was selected, else inherit an unconfigured backend's own account).
 fn resolve_routing(
     cfg: &Config,
     route: bool,
     backend: BackendKind,
     api: &str,
     bearer: Option<&str>,
-) -> Result<Option<Routing>> {
+) -> Result<Route> {
     if !route {
-        return Ok(None);
+        // `--no-route`: the backend uses its OWN account; we touch no env.
+        return Ok(Route::Inherit);
     }
     let provider = cfg.auth.provider.as_deref();
     for cred in route_plan(backend, provider, bearer.is_some()) {
         match cred {
             Cred::Bearer => {
                 if let Some(token) = bearer {
-                    return Ok(Some(Routing::Gateway { api: api.to_string(), token: token.to_string() }));
+                    return Ok(Route::Via(Routing::Gateway { api: api.to_string(), token: token.to_string() }));
                 }
             }
             Cred::HanzoKey => {
                 if let Some(token) = provider::key(Provider::Hanzo)? {
-                    return Ok(Some(Routing::Gateway { api: api.to_string(), token }));
+                    return Ok(Route::Via(Routing::Gateway { api: api.to_string(), token }));
                 }
             }
             Cred::AnthropicKey => {
                 if let Some(key) = provider::key(Provider::Anthropic)? {
-                    return Ok(Some(Routing::Anthropic { key }));
+                    return Ok(Route::Via(Routing::Anthropic { key }));
                 }
             }
             Cred::OpenAIKey => {
                 if let Some(key) = provider::key(Provider::OpenAI)? {
-                    return Ok(Some(Routing::OpenAI { key }));
+                    return Ok(Route::Via(Routing::OpenAI { key }));
                 }
             }
         }
     }
-    Ok(None)
+    Ok(unresolved_route(provider.is_some()))
+}
+
+/// The routing outcome when the credential plan resolves NOTHING.
+///
+/// A SELECTED provider means the user EXPECTS that route, so silently inheriting a
+/// shell-set `ANTHROPIC_BASE_URL`/key would ship prompts+code somewhere they never
+/// chose — fail CLOSED (the backend then clears its vendor's model-auth env). With
+/// NO provider selected there is no such expectation (an unconfigured or
+/// signed-out run), so the backend keeps its OWN account, exactly as a bare
+/// `claude`/`dev` would — inheriting the shell is the honest, unchanged behavior.
+fn unresolved_route(provider_selected: bool) -> Route {
+    if provider_selected {
+        Route::FailClosed
+    } else {
+        Route::Inherit
+    }
 }
 
 /// May the ACTIVE identity re-attach to the cloud session a resume record names?
@@ -331,6 +353,19 @@ pub async fn run(cfg: &mut Config, opts: Options) -> Result<()> {
     // credential — the Hanzo gateway (metered) for a Hanzo login, or a provider's
     // OWN API for a stored OpenAI/Anthropic key. `--no-route` opts out entirely.
     let routing = resolve_routing(cfg, opts.route, kind, &api, bearer.as_deref())?;
+    // A SELECTED provider with no usable key fails closed: the backend clears its
+    // model-auth env (below), and we say WHY rather than let the route silently
+    // vanish into an inherited endpoint. `provider` is always `Some` here — it is
+    // what makes the outcome `FailClosed` rather than `Inherit`.
+    if matches!(routing, Route::FailClosed) {
+        if let Some(p) = cfg.auth.provider.as_deref() {
+            warn(&format!(
+                "selected provider `{p}` has no usable key — run `hanzo login` (or pass `--no-route` \
+                 to use the backend's own account). Model calls will NOT route, and the child's \
+                 inherited model credentials are cleared."
+            ));
+        }
+    }
 
     // For a linked interactive Claude run, pre-set the session id so its
     // transcript can be tailed; otherwise the resume handle names it.
@@ -397,7 +432,7 @@ pub async fn run(cfg: &mut Config, opts: Options) -> Result<()> {
         backend.label(),
         &cwd,
         &api,
-        routing.as_ref(),
+        routing.via(),
         bearer.is_some(),
         session_id.as_deref(),
         None,
@@ -1320,7 +1355,7 @@ mod tests {
             mode: Mode::Headless,
             task: Some("t".into()),
             cwd: PathBuf::from("."),
-            routing: None,
+            routing: Route::Inherit,
             mcp: None,
             structured: true,
             preset_session: None,
@@ -1451,6 +1486,19 @@ mod tests {
         assert_eq!(route_plan(Claude, None, false), vec![Cred::HanzoKey]);
         // Explicit "hanzo" behaves like the gateway default.
         assert_eq!(route_plan(Claude, Some("hanzo"), true), vec![Cred::Bearer, Cred::HanzoKey]);
+    }
+
+    /// LOW-1: when the credential plan resolves NOTHING, a SELECTED provider fails
+    /// closed (the backend then clears its model-auth env, and `run` warns), while
+    /// an unconfigured/signed-out run inherits the backend's own account —
+    /// unchanged, so "continuing locally" still works with a user's own key.
+    #[test]
+    fn unresolved_route_fails_closed_only_when_a_provider_is_selected() {
+        assert!(matches!(unresolved_route(true), Route::FailClosed));
+        assert!(matches!(unresolved_route(false), Route::Inherit));
+        // Both carry no credential — the banner reads them the same ("off").
+        assert!(unresolved_route(true).via().is_none());
+        assert!(unresolved_route(false).via().is_none());
     }
 
     /// A missing / deleted cwd yields a CLEAR message, not the cryptic
