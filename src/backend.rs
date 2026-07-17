@@ -39,14 +39,29 @@ pub enum Mode {
     Interactive,
 }
 
-/// Route model calls through the Hanzo gateway so token/cost meter into
-/// cloud_usage/o11y no matter which account/machine the dev is on.
+/// Where a run's model calls go, and with what credential. The secret rides in
+/// the child's ENV, never argv/logs, in every variant.
+///
+/// One value, three destinations — so "which provider am I logged in with?"
+/// has exactly one place it is answered for routing:
+/// - `Gateway` — the Hanzo gateway (api.hanzo.ai). Metered into cloud_usage/o11y
+///   regardless of account/machine; the credential is the hanzo.id bearer (or a
+///   stored `hk-` gateway key). The recommended path.
+/// - `Anthropic` / `OpenAI` — the vendor's own API, reached directly with the
+///   user's own key. Not metered by Hanzo; billed by the vendor.
 #[derive(Debug, Clone)]
-pub struct Routing {
-    /// The active network's api origin (e.g. https://api.hanzo.ai).
-    pub api: String,
-    /// The hanzo.id bearer to authenticate model calls (never logged/argv'd).
-    pub token: String,
+pub enum Routing {
+    /// Route through the Hanzo gateway; `token` is the hanzo.id bearer / `hk-` key.
+    Gateway {
+        /// The active network's api origin (e.g. https://api.hanzo.ai).
+        api: String,
+        /// The bearer/key authenticating gateway model calls.
+        token: String,
+    },
+    /// Talk to Anthropic directly; `key` is the user's `sk-ant-…` key.
+    Anthropic { key: String },
+    /// Talk to OpenAI directly; `key` is the user's `sk-…` key.
+    OpenAI { key: String },
 }
 
 /// A resolved hanzo-mcp launch (command + base args incl. `--project-dir`).

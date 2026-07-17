@@ -12,7 +12,7 @@ use anyhow::Result;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
-use super::backend::{Backend, Launch, Mode, Spec};
+use super::backend::{Backend, Launch, Mode, Routing, Spec};
 use super::event::{cap, clamp, Mapped, Usage};
 
 pub struct Dev;
@@ -57,23 +57,35 @@ impl Backend for Dev {
             args.push(cfg_array("mcp_servers.hanzo.args", &mcp.args));
         }
 
-        // Routing: native provider + token env, or a full custom provider when
-        // the active network points somewhere other than the native gateway.
-        if let Some(r) = &spec.routing {
-            cmd.env("HANZO_USER_KEY", &r.token);
-            if r.api.trim_end_matches('/') != NATIVE_API {
-                let base = format!("{}/v1", r.api.trim_end_matches('/'));
-                args.push("-c".into());
-                args.push(cfg_string("model_providers.hanzocode.name", "Hanzo Code"));
-                args.push("-c".into());
-                args.push(cfg_string("model_providers.hanzocode.base_url", &base));
-                args.push("-c".into());
-                args.push(cfg_string("model_providers.hanzocode.wire_api", "responses"));
-                args.push("-c".into());
-                args.push(cfg_string("model_providers.hanzocode.env_key", "HANZO_USER_KEY"));
-                args.push("-c".into());
-                args.push(cfg_string("model_provider", "hanzocode"));
+        // Routing (credential via env, never argv):
+        match &spec.routing {
+            // Gateway: the native `hanzo` provider + token env, or a full custom
+            // provider when the active network points somewhere other than the
+            // native gateway.
+            Some(Routing::Gateway { api, token }) => {
+                cmd.env("HANZO_USER_KEY", token);
+                if api.trim_end_matches('/') != NATIVE_API {
+                    let base = format!("{}/v1", api.trim_end_matches('/'));
+                    args.push("-c".into());
+                    args.push(cfg_string("model_providers.hanzocode.name", "Hanzo Code"));
+                    args.push("-c".into());
+                    args.push(cfg_string("model_providers.hanzocode.base_url", &base));
+                    args.push("-c".into());
+                    args.push(cfg_string("model_providers.hanzocode.wire_api", "responses"));
+                    args.push("-c".into());
+                    args.push(cfg_string("model_providers.hanzocode.env_key", "HANZO_USER_KEY"));
+                    args.push("-c".into());
+                    args.push(cfg_string("model_provider", "hanzocode"));
+                }
             }
+            // Direct OpenAI: the user's own key on codex's native `openai`
+            // provider (the default), reached at api.openai.com.
+            Some(Routing::OpenAI { key }) => {
+                cmd.env("OPENAI_API_KEY", key);
+            }
+            // An Anthropic key cannot drive codex (OpenAI wire protocol) — the
+            // resolver never pairs them, so this arm is unreachable.
+            Some(Routing::Anthropic { .. }) | None => {}
         }
 
         // Passthrough flags precede positionals so they can't swallow the prompt.
@@ -230,7 +242,7 @@ fn toml_string(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::code::backend::{McpAttach, Routing};
+    use crate::commands::code::backend::McpAttach;
     use crate::commands::code::event::Kind;
 
     fn spec(mode: Mode, api: &str) -> Spec {
@@ -238,7 +250,7 @@ mod tests {
             mode,
             task: Some("do it".into()),
             cwd: PathBuf::from("/tmp/proj"),
-            routing: Some(Routing { api: api.into(), token: "JWT".into() }),
+            routing: Some(Routing::Gateway { api: api.into(), token: "JWT".into() }),
             mcp: Some(McpAttach { program: "hanzo-mcp".into(), args: vec!["--project-dir".into(), "/tmp/proj".into()] }),
             structured: true,
             preset_session: None,
@@ -284,6 +296,22 @@ mod tests {
         assert!(args.iter().any(|a| a == r#"model_providers.hanzocode.base_url="http://localhost:3690/v1""#));
         assert!(args.iter().any(|a| a == r#"model_providers.hanzocode.wire_api="responses""#));
         assert!(args.iter().any(|a| a == r#"model_provider="hanzocode""#));
+    }
+
+    /// "Logged in with OpenAI": a stored OpenAI key drives codex directly on its
+    /// native `openai` provider — `OPENAI_API_KEY` in env, no Hanzo provider
+    /// override, and the key never in argv.
+    #[test]
+    fn openai_key_routes_dev_directly_via_env() {
+        let mut s = spec(Mode::Headless, "https://api.hanzo.ai");
+        s.routing = Some(Routing::OpenAI { key: "sk-openai-SECRET".into() });
+        let l = Dev.build(&s).unwrap();
+        let args = argv(&l);
+        assert_eq!(envmap(&l).get("OPENAI_API_KEY").map(String::as_str), Some("sk-openai-SECRET"));
+        // Direct: no Hanzo gateway provider override, no HANZO_USER_KEY.
+        assert!(!args.iter().any(|a| a.contains("model_provider")));
+        assert!(!envmap(&l).contains_key("HANZO_USER_KEY"));
+        assert!(!args.iter().any(|a| a.contains("sk-openai-SECRET")), "key must not be in argv");
     }
 
     #[test]

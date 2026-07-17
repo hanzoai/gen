@@ -42,6 +42,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncSeekExt};
 
 use crate::config::Config;
 use crate::iam::identity::Identity;
+use crate::iam::provider::{self, Provider};
 use crate::{commands::network, iam::store};
 
 use backend::{resolve, resolve_mcp, BackendKind, Backend, Launch, Mode, Routing, Spec};
@@ -85,6 +86,100 @@ pub(crate) fn effective_link(link: bool, no_link: bool, persisted: bool) -> bool
 /// never registers a target, exactly as it never streams a session.
 pub(crate) fn links_target(do_link: bool, has_bearer: bool) -> bool {
     do_link && has_bearer
+}
+
+/// Resolve the working directory, turning a missing/`ENOENT` cwd into a CLEAR
+/// message instead of the cryptic `resolving current dir` chain.
+///
+/// A fresh or odd environment must never die cryptically: `std::env::current_dir`
+/// fails when the process's cwd was deleted or is unreadable, and a bare `hanzo`
+/// there is exactly the first thing a new user might hit. Pure over the
+/// `io::Result` so the message is unit-testable without touching the real cwd.
+fn cwd_or_friendly(r: std::io::Result<PathBuf>) -> Result<PathBuf> {
+    r.map_err(|e| {
+        anyhow!(
+            "current directory is unavailable ({e}) — it may have been deleted, or you may lack \
+             permission to it. `cd` into a directory that exists and run `hanzo` again."
+        )
+    })
+}
+
+/// A credential source to try for a routed run, in preference order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Cred {
+    /// The active identity's hanzo.id bearer — already in hand, no Vault read.
+    Bearer,
+    /// A stored `hk-` Hanzo gateway key.
+    HanzoKey,
+    /// A stored `sk-ant-` Anthropic key (direct to api.anthropic.com).
+    AnthropicKey,
+    /// A stored `sk-` OpenAI key (direct to api.openai.com).
+    OpenAIKey,
+}
+
+/// The ordered credential preference for a routed run, from the active provider,
+/// the backend, and whether a bearer is held. PURE + testable — the impure
+/// resolver walks this and reads the Vault lazily, so the precedence lives in
+/// exactly one place.
+///
+/// A DIRECT provider is tried ONLY when it matches the backend it can drive
+/// (Anthropic↔Claude, OpenAI↔dev); the Hanzo gateway (bearer, then `hk-` key) is
+/// always the fallback, so a signed-in user keeps routing even if a direct key
+/// is absent or paired with the wrong backend.
+fn route_plan(backend: BackendKind, provider: Option<&str>, has_bearer: bool) -> Vec<Cred> {
+    let mut plan = Vec::new();
+    match (provider, backend) {
+        (Some("anthropic"), BackendKind::Claude) => plan.push(Cred::AnthropicKey),
+        (Some("openai"), BackendKind::Dev) => plan.push(Cred::OpenAIKey),
+        _ => {}
+    }
+    if has_bearer {
+        plan.push(Cred::Bearer);
+    }
+    plan.push(Cred::HanzoKey);
+    plan
+}
+
+/// Resolve the routing for this run by walking [`route_plan`] and taking the
+/// first credential actually held. Provider keys are read from the Vault LAZILY
+/// (only as the plan reaches them), so the common gateway path (bearer in hand)
+/// does zero extra keychain reads, and `--no-route` does none at all.
+fn resolve_routing(
+    cfg: &Config,
+    route: bool,
+    backend: BackendKind,
+    api: &str,
+    bearer: Option<&str>,
+) -> Result<Option<Routing>> {
+    if !route {
+        return Ok(None);
+    }
+    let provider = cfg.auth.provider.as_deref();
+    for cred in route_plan(backend, provider, bearer.is_some()) {
+        match cred {
+            Cred::Bearer => {
+                if let Some(token) = bearer {
+                    return Ok(Some(Routing::Gateway { api: api.to_string(), token: token.to_string() }));
+                }
+            }
+            Cred::HanzoKey => {
+                if let Some(token) = provider::key(Provider::Hanzo)? {
+                    return Ok(Some(Routing::Gateway { api: api.to_string(), token }));
+                }
+            }
+            Cred::AnthropicKey => {
+                if let Some(key) = provider::key(Provider::Anthropic)? {
+                    return Ok(Some(Routing::Anthropic { key }));
+                }
+            }
+            Cred::OpenAIKey => {
+                if let Some(key) = provider::key(Provider::OpenAI)? {
+                    return Ok(Some(Routing::OpenAI { key }));
+                }
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// May the ACTIVE identity re-attach to the cloud session a resume record names?
@@ -218,7 +313,7 @@ pub async fn run(cfg: &mut Config, opts: Options) -> Result<()> {
             };
             (cwd, Some(rec.backend_session_id.clone()), attach)
         }
-        None => (std::env::current_dir().context("resolving current dir")?, None, None),
+        None => (cwd_or_friendly(std::env::current_dir())?, None, None),
     };
 
     // MCP: resolve hanzo-mcp; a missing server warns but never blocks.
@@ -232,12 +327,10 @@ pub async fn run(cfg: &mut Config, opts: Options) -> Result<()> {
         None
     };
 
-    // Routing: meter model calls through the gateway when signed in.
-    let routing = if opts.route {
-        bearer.clone().map(|token| Routing { api: api.clone(), token })
-    } else {
-        None
-    };
+    // Routing: which model endpoint this run's calls go to, and with what
+    // credential — the Hanzo gateway (metered) for a Hanzo login, or a provider's
+    // OWN API for a stored OpenAI/Anthropic key. `--no-route` opts out entirely.
+    let routing = resolve_routing(cfg, opts.route, kind, &api, bearer.as_deref())?;
 
     // For a linked interactive Claude run, pre-set the session id so its
     // transcript can be tailed; otherwise the resume handle names it.
@@ -304,7 +397,7 @@ pub async fn run(cfg: &mut Config, opts: Options) -> Result<()> {
         backend.label(),
         &cwd,
         &api,
-        routing.is_some(),
+        routing.as_ref(),
         bearer.is_some(),
         session_id.as_deref(),
         None,
@@ -703,12 +796,12 @@ fn banner(
     backend: &str,
     cwd: &Path,
     api: &str,
-    routing: bool,
+    routing: Option<&Routing>,
     signed_in: bool,
     session: Option<&str>,
     theme: Option<&str>,
 ) {
-    let _ = theme; // theme is applied silently; not shown on the boot line
+    let _ = (theme, api); // theme applied silently; the route line carries its own host
     println!(
         "{} {} · {} · {}",
         "hanzo code".bold(),
@@ -716,8 +809,8 @@ fn banner(
         cwd.display().to_string().dimmed(),
         opts.resume.as_deref().map(|_| "resume").unwrap_or("start").dimmed(),
     );
-    let (route_line, stream_line) = status_lines(opts, api, routing, signed_in, session);
-    let route_line = if routing { route_line.green() } else { route_line.dimmed() };
+    let (route_line, stream_line) = status_lines(opts, routing, signed_in, session);
+    let route_line = if routing.is_some() { route_line.green() } else { route_line.dimmed() };
     let stream_line = if session.is_some() { stream_line.green() } else { stream_line.dimmed() };
     println!("  {route_line}");
     println!("  {stream_line}");
@@ -728,29 +821,37 @@ fn banner(
 /// unit-testable and stays honest.
 ///
 /// The two are INDEPENDENT: routing decides where prompts + code + tool output
-/// go for inference (`api.hanzo.ai` when on), streaming decides whether the
-/// session is mirrored to mission-control. "off" on one says nothing about the
-/// other — so an unlinked run must never imply "local only" while routing still
-/// ships code to the gateway.
+/// go for inference (the gateway, or a provider's own API), streaming decides
+/// whether the session is mirrored to mission-control. "off" on one says nothing
+/// about the other — so an unlinked run must never imply "local only" while
+/// routing still ships code somewhere.
 fn status_lines(
     opts: &Options,
-    api: &str,
-    routing: bool,
+    routing: Option<&Routing>,
     signed_in: bool,
     session: Option<&str>,
 ) -> (String, String) {
-    let host = api.trim_start_matches("https://").trim_start_matches("http://");
-    let route = if routing {
-        format!("model routing: on → {host} (prompts + code go here; usage metered to your org)")
-    } else if !opts.route {
-        "model routing: off (--no-route; the backend's own model account, code stays with your provider)".to_string()
-    } else if !signed_in {
-        "model routing: off (sign in with `hanzo login` to route + meter model calls)".to_string()
-    } else {
-        "model routing: off".to_string()
+    let strip = |u: &str| u.trim_start_matches("https://").trim_start_matches("http://").trim_end_matches('/').to_string();
+    let route = match routing {
+        Some(Routing::Gateway { api, .. }) => {
+            format!("model routing: on → {} (prompts + code go here; usage metered to your org)", strip(api))
+        }
+        Some(Routing::Anthropic { .. }) => {
+            "model routing: on → api.anthropic.com (your Anthropic key; usage billed by Anthropic)".to_string()
+        }
+        Some(Routing::OpenAI { .. }) => {
+            "model routing: on → api.openai.com (your OpenAI key; usage billed by OpenAI)".to_string()
+        }
+        None if !opts.route => {
+            "model routing: off (--no-route; the backend's own model account, code stays with your provider)".to_string()
+        }
+        None if !signed_in => {
+            "model routing: off (sign in with `hanzo login` to route + meter model calls)".to_string()
+        }
+        None => "model routing: off".to_string(),
     };
     let stream = match session {
-        Some(id) => format!("session stream: on → https://hanzo.bot/session/{id}"),
+        Some(id) => format!("session stream: on → https://hanzo.bot/sessions/{id}"),
         None => "session stream: off (this session is not mirrored to cloud; pass --link to stream it)".to_string(),
     };
     (route, stream)
@@ -1271,9 +1372,10 @@ mod tests {
             theme: None,
             passthrough: vec![],
         };
-        // Routing ON, stream OFF — the exact case LOW-1 flagged: --no-link but
-        // model calls still ship code to the gateway.
-        let (route, stream) = status_lines(&opts, "https://api.hanzo.ai", true, true, None);
+        // Routing ON (gateway), stream OFF — the exact case LOW-1 flagged:
+        // --no-link but model calls still ship code to the gateway.
+        let gw = Routing::Gateway { api: "https://api.hanzo.ai".into(), token: "T".into() };
+        let (route, stream) = status_lines(&opts, Some(&gw), true, None);
         assert!(route.contains("model routing: on"), "got: {route}");
         assert!(route.contains("api.hanzo.ai"));
         assert!(route.contains("prompts + code"));
@@ -1285,14 +1387,87 @@ mod tests {
         // --no-route is explicit and distinct from "off because not signed in".
         let mut o2 = opts;
         o2.route = false;
-        let (route2, _) = status_lines(&o2, "https://api.hanzo.ai", false, true, None);
+        let (route2, _) = status_lines(&o2, None, true, None);
         assert!(route2.contains("model routing: off"));
         assert!(route2.contains("--no-route"));
 
         // Stream ON names the session id and mission-control, not "link".
-        let (_, stream_on) = status_lines(&o2, "https://api.hanzo.ai", false, true, Some("sess_x"));
+        let (_, stream_on) = status_lines(&o2, None, true, Some("sess_x"));
         assert!(stream_on.contains("session stream: on"));
         assert!(stream_on.contains("sess_x"));
+        // Pin the canonical viewer route: the playground session page is
+        // `/sessions/:id` (plural, mirroring cloud's `/v1/agents/sessions/:id`
+        // resource and the app's `/collection/:id` house style). A singular
+        // `/session/` 404s — the route the app actually serves is `/sessions/`.
+        assert!(stream_on.contains("https://hanzo.bot/sessions/sess_x"), "got: {stream_on}");
+    }
+
+    /// A direct provider route names the VENDOR endpoint + who bills — never the
+    /// gateway, so the user is never misled about where their code + money go.
+    #[test]
+    fn status_line_names_the_direct_provider_endpoint() {
+        let opts = Options {
+            backend: "claude".into(),
+            link: false,
+            no_link: true,
+            route: true,
+            mcp: true,
+            project_mcp: false,
+            resume: None,
+            brand: "hanzo".into(),
+            task: None,
+            theme: None,
+            passthrough: vec![],
+        };
+        let anthropic = Routing::Anthropic { key: "sk-ant-x".into() };
+        let (route, _) = status_lines(&opts, Some(&anthropic), true, None);
+        assert!(route.contains("model routing: on"), "got: {route}");
+        assert!(route.contains("api.anthropic.com"), "got: {route}");
+        assert!(route.contains("billed by Anthropic"), "got: {route}");
+        assert!(!route.contains("api.hanzo.ai"), "a direct route must NOT claim the gateway");
+        // The key never appears in the human-facing line.
+        assert!(!route.contains("sk-ant-x"));
+
+        let openai = Routing::OpenAI { key: "sk-x".into() };
+        let (route, _) = status_lines(&opts, Some(&openai), true, None);
+        assert!(route.contains("api.openai.com") && route.contains("billed by OpenAI"), "got: {route}");
+    }
+
+    /// The routing precedence: a direct provider is preferred ONLY when it can
+    /// drive the backend, and the gateway (bearer, then hk-) is always the tail.
+    #[test]
+    fn route_plan_prefers_a_matching_direct_provider_else_the_gateway() {
+        use BackendKind::{Claude, Dev};
+        // Anthropic + Claude → try the Anthropic key first, then gateway.
+        assert_eq!(route_plan(Claude, Some("anthropic"), true), vec![Cred::AnthropicKey, Cred::Bearer, Cred::HanzoKey]);
+        // OpenAI + dev → the OpenAI key first.
+        assert_eq!(route_plan(Dev, Some("openai"), false), vec![Cred::OpenAIKey, Cred::HanzoKey]);
+        // Mismatched pairing (OpenAI selected, Claude backend) → NO direct key,
+        // fall straight to the gateway.
+        assert_eq!(route_plan(Claude, Some("openai"), true), vec![Cred::Bearer, Cred::HanzoKey]);
+        assert_eq!(route_plan(Dev, Some("anthropic"), false), vec![Cred::HanzoKey]);
+        // No provider selected → the gateway, bearer preferred over a stored key.
+        assert_eq!(route_plan(Claude, None, true), vec![Cred::Bearer, Cred::HanzoKey]);
+        assert_eq!(route_plan(Claude, None, false), vec![Cred::HanzoKey]);
+        // Explicit "hanzo" behaves like the gateway default.
+        assert_eq!(route_plan(Claude, Some("hanzo"), true), vec![Cred::Bearer, Cred::HanzoKey]);
+    }
+
+    /// A missing / deleted cwd yields a CLEAR message, not the cryptic
+    /// `resolving current dir` chain — a fresh or odd environment never dies
+    /// mysteriously.
+    #[test]
+    fn cwd_or_friendly_explains_a_missing_directory() {
+        let ok = cwd_or_friendly(Ok(PathBuf::from("/some/dir"))).unwrap();
+        assert_eq!(ok, PathBuf::from("/some/dir"));
+
+        let err = cwd_or_friendly(Err(std::io::Error::from(std::io::ErrorKind::NotFound)))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("current directory is unavailable"), "got: {err}");
+        assert!(err.to_lowercase().contains("cd into a directory") || err.contains("`cd`"), "got: {err}");
+        // The old cryptic phrasing must be gone.
+        assert!(!err.contains("resolving current dir"), "got: {err}");
     }
 
     /// MEDIUM-1: one giant newline-free line must NOT be buffered whole (OOM);
