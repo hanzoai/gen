@@ -106,10 +106,17 @@ impl Backend for Claude {
         // sets exactly what it needs and CLEARS the rest.
         match &spec.routing {
             // Gateway: Bearer + our base URL; clear the api-key so the Bearer is
-            // unambiguous.
-            Route::Via(Routing::Gateway { api, token }) => {
+            // unambiguous. Name the model too — Claude's built-in default
+            // (`claude-fable-5`) is not in the gateway catalog and would 400, so
+            // the routing decision already resolved a valid catalog id (`--model`
+            // > exported `ANTHROPIC_MODEL` > `~/.hanzo/settings.json` > built-in
+            // default `enso`). Setting it back to the user's own exported value is a
+            // deliberate no-op; a `--model` overrides it, exactly the intended precedence.
+            Route::Via(Routing::Gateway { api, token, model, small_fast_model }) => {
                 cmd.env("ANTHROPIC_BASE_URL", api.trim_end_matches('/'));
                 cmd.env("ANTHROPIC_AUTH_TOKEN", token);
+                cmd.env("ANTHROPIC_MODEL", model);
+                cmd.env("ANTHROPIC_SMALL_FAST_MODEL", small_fast_model);
                 cmd.env_remove("ANTHROPIC_API_KEY");
             }
             // Direct Anthropic: the user's own key on the default endpoint
@@ -304,7 +311,7 @@ mod tests {
             mode,
             task: Some("do it".into()),
             cwd: PathBuf::from("/tmp/proj"),
-            routing: Route::Via(Routing::Gateway { api: "https://api.hanzo.ai".into(), token: "JWT".into() }),
+            routing: Route::Via(Routing::Gateway { api: "https://api.hanzo.ai".into(), token: "JWT".into(), model: "enso".into(), small_fast_model: "enso-flash".into() }),
             mcp: Some(McpAttach { program: "hanzo-mcp".into(), args: vec!["--project-dir".into(), "/tmp/proj".into()] }),
             structured: true,
             preset_session: None,
@@ -373,6 +380,63 @@ mod tests {
         assert!(cleared("ANTHROPIC_BASE_URL"), "gateway base URL must be cleared for a direct key");
         let args = argv(&l);
         assert!(!args.iter().any(|a| a.contains("sk-ant-SECRET")), "key must not be in argv");
+    }
+
+    /// A gateway-routed run NAMES the model in the child env — Claude's built-in
+    /// default (`claude-fable-5`) is not in the gateway catalog and would 400. The
+    /// routing decision already resolved a valid catalog id; here it is the
+    /// built-in default pair (`enso`/`enso-flash`), set on BOTH `ANTHROPIC_MODEL`
+    /// and `ANTHROPIC_SMALL_FAST_MODEL`.
+    #[test]
+    fn gateway_route_injects_the_resolved_default_models() {
+        let l = Claude.build(&spec(Mode::Headless)).unwrap();
+        let env: std::collections::HashMap<_, _> = l
+            .command
+            .as_std()
+            .get_envs()
+            .filter_map(|(k, v)| Some((k.to_string_lossy().to_string(), v?.to_string_lossy().to_string())))
+            .collect();
+        assert_eq!(env.get("ANTHROPIC_MODEL").map(String::as_str), Some("enso"));
+        assert_eq!(env.get("ANTHROPIC_SMALL_FAST_MODEL").map(String::as_str), Some("enso-flash"));
+    }
+
+    /// An explicit model (from `--model`, already resolved into the routing value)
+    /// passes straight to `ANTHROPIC_MODEL`; the small/fast model keeps its own
+    /// resolution. No client-side allowlist — a bad id 400s at the gateway.
+    #[test]
+    fn gateway_route_honors_an_explicit_model() {
+        let mut s = spec(Mode::Headless);
+        s.routing = Route::Via(Routing::Gateway {
+            api: "https://api.hanzo.ai".into(),
+            token: "JWT".into(),
+            model: "enso".into(),
+            small_fast_model: "enso-flash".into(),
+        });
+        let l = Claude.build(&s).unwrap();
+        let env: std::collections::HashMap<_, _> = l
+            .command
+            .as_std()
+            .get_envs()
+            .filter_map(|(k, v)| Some((k.to_string_lossy().to_string(), v?.to_string_lossy().to_string())))
+            .collect();
+        assert_eq!(env.get("ANTHROPIC_MODEL").map(String::as_str), Some("enso"));
+    }
+
+    /// A DIRECT provider route must NEVER carry a gateway model. The model
+    /// lives only in `Routing::Gateway`, so a direct key run neither sets nor
+    /// clears `ANTHROPIC_MODEL*` — it leaves whatever the user's shell provides.
+    #[test]
+    fn direct_route_injects_no_gateway_model() {
+        for routing in [
+            Route::Via(Routing::Anthropic { key: "sk-ant-K".into() }),
+            Route::Via(Routing::OpenAI { key: "sk-K".into() }),
+        ] {
+            let mut s = spec(Mode::Headless);
+            s.routing = routing;
+            let l = Claude.build(&s).unwrap();
+            assert!(!touched(&l, "ANTHROPIC_MODEL"), "a direct route must not touch ANTHROPIC_MODEL");
+            assert!(!touched(&l, "ANTHROPIC_SMALL_FAST_MODEL"), "a direct route must not touch ANTHROPIC_SMALL_FAST_MODEL");
+        }
     }
 
     #[test]
@@ -496,7 +560,7 @@ mod tests {
 
         let mut s = spec(Mode::Headless);
         s.cwd = dir.path().to_path_buf();
-        s.routing = Route::Via(Routing::Gateway { api: "https://api.hanzo.ai".into(), token: "SECRET-BEARER".into() });
+        s.routing = Route::Via(Routing::Gateway { api: "https://api.hanzo.ai".into(), token: "SECRET-BEARER".into(), model: "enso".into(), small_fast_model: "enso-flash".into() });
         // Default: project_mcp = false (repo is untrusted).
         let l = Claude.build(&s).unwrap();
         let args = argv(&l);

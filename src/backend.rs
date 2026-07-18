@@ -61,6 +61,15 @@ pub enum Routing {
         api: String,
         /// The bearer/key authenticating gateway model calls.
         token: String,
+        /// The gateway catalog id for the main model, already resolved by precedence
+        /// (`--model`, then exported env, then `~/.hanzo/settings.json`, then the
+        /// built-in default). The gateway is the authority on validity — a bad id
+        /// 400s with the gateway's own message. Carried ONLY here so the model can
+        /// never leak onto a direct-provider route.
+        model: String,
+        /// The gateway catalog id for the small/fast model (Claude's
+        /// `ANTHROPIC_SMALL_FAST_MODEL`); `dev` has no small/fast model and ignores it.
+        small_fast_model: String,
     },
     /// Talk to Anthropic directly; `key` is the user's `sk-ant-…` key.
     Anthropic { key: String },
@@ -236,7 +245,7 @@ mod tests {
     /// leak an `sk-ant-…`/`hk-…`/bearer. The non-secret `api` stays for debugging.
     #[test]
     fn routing_debug_redacts_the_secret() {
-        let g = Routing::Gateway { api: "https://api.hanzo.ai".into(), token: "hk-SECRET-TOKEN".into() };
+        let g = Routing::Gateway { api: "https://api.hanzo.ai".into(), token: "hk-SECRET-TOKEN".into(), model: "enso".into(), small_fast_model: "enso-flash".into() };
         let s = format!("{g:?}");
         assert!(!s.contains("hk-SECRET-TOKEN"), "token leaked in Debug: {s}");
         assert!(s.contains("***"), "expected a redaction marker: {s}");
@@ -246,7 +255,7 @@ mod tests {
         assert!(!format!("{:?}", Routing::OpenAI { key: "sk-proj-SECRET".into() }).contains("sk-proj-SECRET"));
 
         // `Route` composes the redacting `Debug`, so wrapping never re-exposes it.
-        let r = Route::Via(Routing::Gateway { api: "x".into(), token: "hk-INNER".into() });
+        let r = Route::Via(Routing::Gateway { api: "x".into(), token: "hk-INNER".into(), model: "enso".into(), small_fast_model: "enso-flash".into() });
         assert!(!format!("{r:?}").contains("hk-INNER"), "Route::Via leaked the inner secret");
     }
 

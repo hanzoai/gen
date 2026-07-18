@@ -61,9 +61,15 @@ impl Backend for Dev {
         match &spec.routing {
             // Gateway: the native `hanzo` provider + token env, or a full custom
             // provider when the active network points somewhere other than the
-            // native gateway.
-            Route::Via(Routing::Gateway { api, token }) => {
+            // native gateway. Name the model too — codex's built-in default is not
+            // in the gateway catalog and would 400. The routing decision already
+            // resolved a valid catalog id (`--model` > `~/.hanzo/settings.json` >
+            // built-in default `enso`; `dev` reads no `ANTHROPIC_*` env). `dev` has
+            // no small/fast model.
+            Route::Via(Routing::Gateway { api, token, model, .. }) => {
                 cmd.env("HANZO_USER_KEY", token);
+                args.push("-c".into());
+                args.push(cfg_string("model", model));
                 if api.trim_end_matches('/') != NATIVE_API {
                     let base = format!("{}/v1", api.trim_end_matches('/'));
                     args.push("-c".into());
@@ -261,7 +267,7 @@ mod tests {
             mode,
             task: Some("do it".into()),
             cwd: PathBuf::from("/tmp/proj"),
-            routing: Route::Via(Routing::Gateway { api: api.into(), token: "JWT".into() }),
+            routing: Route::Via(Routing::Gateway { api: api.into(), token: "JWT".into(), model: "enso".into(), small_fast_model: "enso-flash".into() }),
             mcp: Some(McpAttach { program: "hanzo-mcp".into(), args: vec!["--project-dir".into(), "/tmp/proj".into()] }),
             structured: true,
             preset_session: None,
@@ -323,6 +329,33 @@ mod tests {
         assert!(!args.iter().any(|a| a.contains("model_provider")));
         assert!(!envmap(&l).contains_key("HANZO_USER_KEY"));
         assert!(!args.iter().any(|a| a.contains("sk-openai-SECRET")), "key must not be in argv");
+        // A direct route names NO gateway model — the top-level `model` override
+        // rides only the gateway path; codex keeps its own default here.
+        assert!(!args.iter().any(|a| a.starts_with("model=")), "direct route must not set a gateway model");
+    }
+
+    /// The dev gateway route names the model too (`-c model=<id>`): codex's built-in
+    /// default is not in the gateway catalog and would 400. Same gap as Claude,
+    /// fixed analogously — here the resolved built-in default (`enso`).
+    #[test]
+    fn gateway_route_names_the_resolved_model() {
+        let l = Dev.build(&spec(Mode::Headless, "https://api.hanzo.ai")).unwrap();
+        assert!(argv(&l).iter().any(|a| a == r#"model="enso""#), "gateway route must set -c model=<catalog id>");
+    }
+
+    /// An explicit model (from `--model`, resolved into the routing value) passes
+    /// straight through to codex's `model` config on the gateway route.
+    #[test]
+    fn gateway_route_honors_an_explicit_model() {
+        let mut s = spec(Mode::Headless, "https://api.hanzo.ai");
+        s.routing = Route::Via(Routing::Gateway {
+            api: "https://api.hanzo.ai".into(),
+            token: "JWT".into(),
+            model: "enso".into(),
+            small_fast_model: "enso-flash".into(),
+        });
+        let l = Dev.build(&s).unwrap();
+        assert!(argv(&l).iter().any(|a| a == r#"model="enso""#), "gateway route must honor an explicit model");
     }
 
     #[test]
