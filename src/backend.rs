@@ -70,6 +70,12 @@ pub enum Routing {
         /// The gateway catalog id for the small/fast model (Claude's
         /// `ANTHROPIC_SMALL_FAST_MODEL`); `dev` has no small/fast model and ignores it.
         small_fast_model: String,
+        /// The context window (tokens) to request for `model`. A backend pointed at
+        /// a custom gateway can't verify the model's real window and self-clamps to
+        /// 200K, so this NAMES it — Claude via the `[1m]` model suffix, `dev` via a
+        /// `model_catalog_json`. Carried ONLY here: a direct-provider route uses that
+        /// provider's own window, never this.
+        context_window: u64,
     },
     /// Talk to Anthropic directly; `key` is the user's `sk-ant-…` key.
     Anthropic { key: String },
@@ -122,6 +128,27 @@ impl Route {
     }
 }
 
+/// How much of the coding agent's actions run without a per-action prompt — the
+/// resolved `autoApprove` decision, mapped by each backend to its own flags.
+///
+/// Three states, so the user's confirmed always-on default and the two opt-outs
+/// each have exactly one representation (resolved once in [`super::resolve_approval`]):
+///   - `Ask` — the backend's own ask-for-permission mode (`--ask`/`--safe`, or
+///     `autoApprove: false`). Nothing is added; the user's sandbox governs.
+///   - `Auto` — auto-approve, sandbox KEPT (the default). Claude
+///     `--dangerously-skip-permissions`; `dev` `approval_policy=never` +
+///     `sandbox_mode=workspace-write`.
+///   - `Bypass` — auto-approve AND drop the sandbox (`--no-sandbox`, a deliberate
+///     per-invocation escalation, never a persisted default). `dev`
+///     `--dangerously-bypass-approvals-and-sandbox`; Claude is already sandbox-free
+///     under skip-permissions, so `Bypass` maps there identically to `Auto`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Approval {
+    Ask,
+    Auto,
+    Bypass,
+}
+
 /// A resolved hanzo-mcp launch (command + base args incl. `--project-dir`).
 #[derive(Debug, Clone)]
 pub struct McpAttach {
@@ -138,6 +165,10 @@ pub struct Spec {
     /// shell's (`Inherit`, `--no-route`), or fail closed and clear it
     /// (`FailClosed`, a selected provider with no usable key).
     pub routing: Route,
+    /// How much of the agent's actions auto-approve (the resolved `autoApprove`
+    /// decision). Orthogonal to routing — it governs the backend's permission mode,
+    /// not where model calls go. Each backend maps it to its own flags.
+    pub approval: Approval,
     pub mcp: Option<McpAttach>,
     /// Emit the machine-readable event stream (only when we actually stream to
     /// cloud). When false, a headless run keeps the backend's native output and
@@ -245,7 +276,7 @@ mod tests {
     /// leak an `sk-ant-…`/`hk-…`/bearer. The non-secret `api` stays for debugging.
     #[test]
     fn routing_debug_redacts_the_secret() {
-        let g = Routing::Gateway { api: "https://api.hanzo.ai".into(), token: "hk-SECRET-TOKEN".into(), model: "enso".into(), small_fast_model: "enso-flash".into() };
+        let g = Routing::Gateway { api: "https://api.hanzo.ai".into(), token: "hk-SECRET-TOKEN".into(), model: "enso".into(), small_fast_model: "enso-flash".into(), context_window: 1_000_000 };
         let s = format!("{g:?}");
         assert!(!s.contains("hk-SECRET-TOKEN"), "token leaked in Debug: {s}");
         assert!(s.contains("***"), "expected a redaction marker: {s}");
@@ -255,7 +286,7 @@ mod tests {
         assert!(!format!("{:?}", Routing::OpenAI { key: "sk-proj-SECRET".into() }).contains("sk-proj-SECRET"));
 
         // `Route` composes the redacting `Debug`, so wrapping never re-exposes it.
-        let r = Route::Via(Routing::Gateway { api: "x".into(), token: "hk-INNER".into(), model: "enso".into(), small_fast_model: "enso-flash".into() });
+        let r = Route::Via(Routing::Gateway { api: "x".into(), token: "hk-INNER".into(), model: "enso".into(), small_fast_model: "enso-flash".into(), context_window: 1_000_000 });
         assert!(!format!("{r:?}").contains("hk-INNER"), "Route::Via leaked the inner secret");
     }
 

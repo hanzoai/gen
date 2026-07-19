@@ -4,15 +4,26 @@
 //! attached with `-c mcp_servers.hanzo.*` overrides (ADDITIVE — the user's own
 //! servers, config and `dev login` are untouched, since we never repoint
 //! `CODEX_HOME`); model calls route through the native `hanzo` provider
-//! (`api.hanzo.ai/v1`) with the bearer supplied as `HANZO_USER_KEY`. We NEVER
-//! pass `--yolo` / `--dangerously-bypass-approvals-and-sandbox`; the user's
-//! sandbox governs and widening flags arrive only via explicit passthrough.
+//! (`api.hanzo.ai/v1`) with the bearer supplied as `HANZO_USER_KEY`.
+//!
+//! Auto-approve is ON by default (the confirmed default): `-c approval_policy="never"
+//! -c sandbox_mode="workspace-write"` — it stops asking but KEEPS the workspace
+//! sandbox. `--ask`/`--safe` (or `autoApprove: false`) hand back the user's own
+//! mode; `--no-sandbox` escalates to the full `--dangerously-bypass-approvals-and-sandbox`
+//! (a deliberate per-invocation act, never a persisted default). `dev` reads no
+//! repo-local MCP config, so it has no trust-gate vector.
+//!
+//! On the gateway route we give `dev` the model's REAL context window via a
+//! `model_catalog_json` we control — a custom/unknown model would otherwise clamp
+//! to codex's 272K fallback. This is the true-1M backend (open, we set the window
+//! directly), unlike the Claude backend which a closed client caps at 200K.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::{json, Value};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use super::backend::{Backend, Launch, Mode, Route, Routing, Spec};
+use super::backend::{Approval, Backend, Launch, Mode, Route, Routing, Spec};
 use super::event::{cap, clamp, Mapped, Usage};
 
 pub struct Dev;
@@ -20,6 +31,11 @@ pub struct Dev;
 /// The gateway origin the native `hanzo` provider already targets; when the
 /// active network matches it we need no provider override, only the token env.
 const NATIVE_API: &str = "https://api.hanzo.ai";
+
+/// Codex's context-window fallback for an unknown model. A gateway model's window
+/// is NAMED via a `model_catalog_json` only when it EXCEEDS this, so a run never
+/// shrinks a model below codex's own default.
+const CODEX_FALLBACK_WINDOW: u64 = 272_000;
 
 impl Backend for Dev {
     fn label(&self) -> &'static str {
@@ -35,6 +51,7 @@ impl Backend for Dev {
         cmd.current_dir(&spec.cwd);
 
         let mut args: Vec<String> = Vec::new();
+        let mut cleanup: Vec<tempfile::TempPath> = Vec::new();
         let headless = spec.mode == Mode::Headless;
 
         // Subcommand + resume selection. The JSONL event stream (`--json`) is
@@ -47,6 +64,20 @@ impl Backend for Dev {
         }
         if headless && spec.structured {
             args.push("--json".into());
+        }
+
+        // Auto-approve. `Auto` (the default) stops asking but KEEPS the workspace
+        // sandbox; `Bypass` (`--no-sandbox`) drops it entirely; `Ask` leaves the
+        // user's own mode. codex 0.144.x has no `--full-auto`/`--yolo`.
+        match spec.approval {
+            Approval::Auto => {
+                args.push("-c".into());
+                args.push(cfg_string("approval_policy", "never"));
+                args.push("-c".into());
+                args.push(cfg_string("sandbox_mode", "workspace-write"));
+            }
+            Approval::Bypass => args.push("--dangerously-bypass-approvals-and-sandbox".into()),
+            Approval::Ask => {}
         }
 
         // MCP: additive `-c` overrides (never touches the user's config/login).
@@ -66,10 +97,26 @@ impl Backend for Dev {
             // resolved a valid catalog id (`--model` > `~/.hanzo/settings.json` >
             // built-in default `enso`; `dev` reads no `ANTHROPIC_*` env). `dev` has
             // no small/fast model.
-            Route::Via(Routing::Gateway { api, token, model, .. }) => {
+            Route::Via(Routing::Gateway { api, token, model, context_window, .. }) => {
                 cmd.env("HANZO_USER_KEY", token);
                 args.push("-c".into());
                 args.push(cfg_string("model", model));
+                // Name the model's REAL window so codex doesn't clamp a custom id to
+                // its 272K fallback — the true-1M path. A `model_catalog_json` (which
+                // we control) declares it; applied at startup via `-c`.
+                if *context_window > CODEX_FALLBACK_WINDOW {
+                    let mut file = tempfile::Builder::new()
+                        .prefix("hanzo-codex-catalog-")
+                        .suffix(".json")
+                        .tempfile()
+                        .context("creating model-catalog temp file")?;
+                    file.write_all(model_catalog(model, *context_window).as_bytes())
+                        .context("writing model catalog")?;
+                    let path = file.into_temp_path();
+                    args.push("-c".into());
+                    args.push(cfg_string("model_catalog_json", &path.to_string_lossy()));
+                    cleanup.push(path);
+                }
                 if api.trim_end_matches('/') != NATIVE_API {
                     let base = format!("{}/v1", api.trim_end_matches('/'));
                     args.push("-c".into());
@@ -119,7 +166,7 @@ impl Backend for Dev {
         }
 
         cmd.args(&args);
-        Ok(Launch { command: cmd, cleanup: Vec::new() })
+        Ok(Launch { command: cmd, cleanup })
     }
 
     fn parse(&self, line: &str) -> Vec<Mapped> {
@@ -241,6 +288,22 @@ fn text_or_message(it: &Value) -> Option<String> {
         .map(String::from)
 }
 
+/// A codex `model_catalog_json` document declaring the gateway model's real
+/// context window, so codex uses the true window instead of clamping a
+/// custom/unknown model to its 272K fallback. `context_window` doubles as
+/// `max_context_window` (codex clamps `model_context_window` to the latter, so the
+/// ceiling must be raised here). Passed via `-c model_catalog_json=<file>`.
+fn model_catalog(model: &str, context_window: u64) -> String {
+    json!({
+        "models": [{
+            "slug": model,
+            "context_window": context_window,
+            "max_context_window": context_window,
+        }]
+    })
+    .to_string()
+}
+
 /// A `-c key=value` override where `value` is a TOML string literal.
 fn cfg_string(key: &str, val: &str) -> String {
     format!("{key}={}", toml_string(val))
@@ -267,7 +330,9 @@ mod tests {
             mode,
             task: Some("do it".into()),
             cwd: PathBuf::from("/tmp/proj"),
-            routing: Route::Via(Routing::Gateway { api: api.into(), token: "JWT".into(), model: "enso".into(), small_fast_model: "enso-flash".into() }),
+            routing: Route::Via(Routing::Gateway { api: api.into(), token: "JWT".into(), model: "enso".into(), small_fast_model: "enso-flash".into(), context_window: 1_000_000 }),
+            // The default is auto-approve ON (the confirmed default).
+            approval: Approval::Auto,
             mcp: Some(McpAttach { program: "hanzo-mcp".into(), args: vec!["--project-dir".into(), "/tmp/proj".into()] }),
             structured: true,
             preset_session: None,
@@ -302,8 +367,15 @@ mod tests {
         assert!(!args.iter().any(|a| a.contains("model_provider")));
         assert_eq!(envmap(&l).get("HANZO_USER_KEY").map(String::as_str), Some("JWT"));
         assert!(!args.iter().any(|a| a.contains("JWT")), "token must not be in argv");
-        // Never widen the sandbox.
+        // Auto-approve is ON by default: stop asking but KEEP the workspace sandbox
+        // (never the full bypass).
+        assert!(args.iter().any(|a| a == r#"approval_policy="never""#));
+        assert!(args.iter().any(|a| a == r#"sandbox_mode="workspace-write""#));
         assert!(!args.iter().any(|a| a.contains("yolo") || a.contains("dangerously-bypass")));
+        // The gateway model's real (1M) window is named via a model catalog (the
+        // true-1M path), since the default window exceeds codex's 272K fallback.
+        assert!(args.iter().any(|a| a.starts_with("model_catalog_json=")), "gateway route must name the model window: {args:?}");
+        assert_eq!(l.cleanup.len(), 1, "the catalog temp file must outlive the child");
     }
 
     #[test]
@@ -353,6 +425,7 @@ mod tests {
             token: "JWT".into(),
             model: "enso".into(),
             small_fast_model: "enso-flash".into(),
+            context_window: 1_000_000,
         });
         let l = Dev.build(&s).unwrap();
         assert!(argv(&l).iter().any(|a| a == r#"model="enso""#), "gateway route must honor an explicit model");
@@ -454,5 +527,64 @@ mod tests {
                 "{var} must be untouched under --no-route (Inherit)"
             );
         }
+    }
+
+    /// Auto (the default) keeps the sandbox; Ask leaves the user's mode; Bypass
+    /// (`--no-sandbox`) drops the sandbox with the full bypass flag. codex 0.144.x
+    /// has no `--full-auto`/`--yolo`, so those never appear.
+    #[test]
+    fn approval_maps_to_codex_flags() {
+        let build = |a: Approval| {
+            let mut s = spec(Mode::Headless, "https://api.hanzo.ai");
+            s.approval = a;
+            argv(&Dev.build(&s).unwrap())
+        };
+
+        let auto = build(Approval::Auto);
+        assert!(auto.iter().any(|a| a == r#"approval_policy="never""#));
+        assert!(auto.iter().any(|a| a == r#"sandbox_mode="workspace-write""#));
+        assert!(!auto.iter().any(|a| a == "--dangerously-bypass-approvals-and-sandbox"));
+
+        let ask = build(Approval::Ask);
+        assert!(!ask.iter().any(|a| a.contains("approval_policy")), "Ask leaves the user's own mode");
+        assert!(!ask.iter().any(|a| a.contains("sandbox_mode")));
+        assert!(!ask.iter().any(|a| a == "--dangerously-bypass-approvals-and-sandbox"));
+
+        let bypass = build(Approval::Bypass);
+        assert!(bypass.iter().any(|a| a == "--dangerously-bypass-approvals-and-sandbox"));
+        // Bypass replaces the sandboxed config, not adds to it.
+        assert!(!bypass.iter().any(|a| a.contains("sandbox_mode")));
+
+        for args in [auto, ask, bypass] {
+            assert!(!args.iter().any(|a| a.contains("yolo") || a == "--full-auto"));
+        }
+    }
+
+    /// The gateway route names the model's REAL window through a `model_catalog_json`
+    /// (the true-1M path) whenever it exceeds codex's 272K fallback, declaring both
+    /// `context_window` and `max_context_window` (codex clamps to the latter). A
+    /// window at or below the fallback writes NO catalog — codex's own resolution
+    /// stands and a temp file is never created.
+    #[test]
+    fn gateway_route_names_the_model_window_via_catalog() {
+        // Default 1M window -> catalog written + declared 1M.
+        let l = Dev.build(&spec(Mode::Headless, "https://api.hanzo.ai")).unwrap();
+        let path = argv(&l)
+            .into_iter()
+            .find_map(|a| a.strip_prefix("model_catalog_json=").map(str::to_string))
+            .expect("gateway route writes a model catalog");
+        let body = std::fs::read_to_string(path.trim_matches('"')).expect("catalog file exists");
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["models"][0]["slug"], "enso");
+        assert_eq!(v["models"][0]["context_window"], 1_000_000);
+        assert_eq!(v["models"][0]["max_context_window"], 1_000_000, "the ceiling must be raised or codex clamps");
+        assert_eq!(l.cleanup.len(), 1);
+
+        // A standard window (<= codex's fallback) writes NO catalog.
+        let mut s = spec(Mode::Headless, "https://api.hanzo.ai");
+        s.routing = Route::Via(Routing::Gateway { api: "https://api.hanzo.ai".into(), token: "JWT".into(), model: "enso".into(), small_fast_model: "enso-flash".into(), context_window: 200_000 });
+        let l = Dev.build(&s).unwrap();
+        assert!(!argv(&l).iter().any(|a| a.starts_with("model_catalog_json=")), "no catalog below codex's fallback");
+        assert!(l.cleanup.is_empty());
     }
 }

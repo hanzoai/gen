@@ -1,7 +1,8 @@
 //! The native `hanzo code` settings home: `~/.hanzo/settings.json`.
 //!
 //! ONE file configures the coding agent's defaults on a fresh machine — the model
-//! it names and whether it attaches the Hanzo MCP toolset — so a new box needs no
+//! it names, whether it auto-approves the agent's actions, whether it attaches the
+//! Hanzo MCP toolset, and the context window it requests — so a new box needs no
 //! per-shell `ANTHROPIC_MODEL` export or hand-edited `~/.claude/settings.json`.
 //! Every key is optional; a missing file or key falls through to the built-in
 //! default, and an explicit CLI flag or process env always wins over the file
@@ -25,10 +26,26 @@ pub struct Settings {
     /// ⇒ the built-in [`super::DEFAULT_SMALL_FAST_MODEL`]. `dev` has no small/fast model.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub small_fast_model: Option<String>,
+    /// Auto-approve the coding agent's actions without a per-action prompt. Unset
+    /// ⇒ ON (the built-in default — the confirmed always-on default). `--ask` /
+    /// `--safe` force it OFF regardless; `--no-sandbox` escalates past it. This is a
+    /// PERSISTED default only: dropping the sandbox entirely is never persisted, it
+    /// is always a per-invocation `--no-sandbox` (fail-secure — see [`super::Approval`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_approve: Option<bool>,
     /// Attach the Hanzo MCP toolset. Unset ⇒ ON (the built-in default). `--no-mcp`
     /// still forces it off regardless.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mcp: Option<bool>,
+    /// The context window (in tokens) `hanzo code` requests on the GATEWAY route.
+    /// Unset ⇒ [`super::DEFAULT_CONTEXT_WINDOW`] (1M). Hanzo's frontier models are
+    /// natively 1M, but a coding backend pointed at a custom gateway can't verify
+    /// that and clamps itself to the standard 200K, so this NAMES the real window:
+    /// Claude via the `[1m]` model suffix, `dev` via a `model_catalog_json`. Set it
+    /// below 1M (e.g. `200000`) to opt out of the extended window. Applies only to
+    /// the metered gateway route; a direct provider uses that provider's own window.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
 }
 
 impl Settings {
@@ -62,7 +79,9 @@ fn defaults_document() -> Settings {
     Settings {
         model: Some(super::DEFAULT_MODEL.to_string()),
         small_fast_model: Some(super::DEFAULT_SMALL_FAST_MODEL.to_string()),
+        auto_approve: Some(true),
         mcp: Some(true),
+        context_window: Some(super::DEFAULT_CONTEXT_WINDOW),
     }
 }
 
@@ -88,6 +107,7 @@ mod tests {
     fn empty_document_is_all_unset() {
         let s: Settings = serde_json::from_str("{}").expect("empty object parses");
         assert!(s.model.is_none() && s.small_fast_model.is_none() && s.mcp.is_none());
+        assert!(s.auto_approve.is_none() && s.context_window.is_none());
     }
 
     /// Values round-trip; the JSON keys are camelCase (mirroring Claude's own
@@ -95,12 +115,15 @@ mod tests {
     #[test]
     fn parses_camel_case_and_ignores_unknown_keys() {
         let s: Settings = serde_json::from_str(
-            r#"{ "model": "enso-ultra", "smallFastModel": "enso-flash", "mcp": false, "future": 1 }"#,
+            r#"{ "model": "enso-ultra", "smallFastModel": "enso-flash", "autoApprove": false,
+                 "mcp": false, "contextWindow": 200000, "future": 1 }"#,
         )
         .expect("parses");
         assert_eq!(s.model.as_deref(), Some("enso-ultra"));
         assert_eq!(s.small_fast_model.as_deref(), Some("enso-flash"));
+        assert_eq!(s.auto_approve, Some(false));
         assert_eq!(s.mcp, Some(false));
+        assert_eq!(s.context_window, Some(200_000));
     }
 
     /// The first-run document names every default explicitly — a self-documenting
@@ -110,7 +133,9 @@ mod tests {
         let doc = serde_json::to_string(&defaults_document()).unwrap();
         assert!(doc.contains("\"model\":\"enso\""), "got {doc}");
         assert!(doc.contains("\"smallFastModel\":\"enso-flash\""), "got {doc}");
+        assert!(doc.contains("\"autoApprove\":true"), "got {doc}");
         assert!(doc.contains("\"mcp\":true"), "got {doc}");
+        assert!(doc.contains("\"contextWindow\":1000000"), "got {doc}");
     }
 
     /// The path is the native home, distinct from `~/.config/hanzo/config.toml` and

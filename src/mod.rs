@@ -46,7 +46,7 @@ use crate::iam::identity::Identity;
 use crate::iam::provider::{self, Provider};
 use crate::{commands::network, iam::store};
 
-use backend::{resolve, resolve_mcp, BackendKind, Backend, Launch, Mode, Route, Routing, Spec};
+use backend::{resolve, resolve_mcp, Approval, BackendKind, Backend, Launch, Mode, Route, Routing, Spec};
 use context::{ResumeRecord, Snapshot};
 use event::{Kind, Mapped, Status, Usage};
 use session::SessionClient;
@@ -60,6 +60,13 @@ pub struct Options {
     pub route: bool,
     pub mcp: bool,
     pub project_mcp: bool,
+    /// Opt OUT of auto-approve (`--ask` / `--safe`): the backend runs in its own
+    /// ask-for-permission mode. Wins over `~/.hanzo/settings.json` `autoApprove`.
+    pub ask: bool,
+    /// Escalate PAST auto-approve to a full bypass that also drops the sandbox
+    /// (`--no-sandbox`): `dev` `--dangerously-bypass-approvals-and-sandbox`. A
+    /// deliberate per-invocation act, never a persisted default (fail-secure).
+    pub no_sandbox: bool,
     pub resume: Option<String>,
     pub brand: String,
     /// Claude theme to apply (None → the persisted `code.theme`; "none" → skip).
@@ -134,6 +141,34 @@ enum Cred {
 pub(super) const DEFAULT_MODEL: &str = "enso";
 pub(super) const DEFAULT_SMALL_FAST_MODEL: &str = "enso-flash";
 
+/// The context window `hanzo code` requests on the gateway route by default: the
+/// real 1M window Hanzo's frontier models serve. A coding backend pointed at a
+/// custom gateway can't verify this and self-clamps to the standard 200K, so the
+/// gateway route NAMES the window (Claude `[1m]` suffix, `dev` `model_catalog_json`).
+/// Overridable in `~/.hanzo/settings.json` `contextWindow`; below the standard
+/// window it's a no-op (opting out of the extended window).
+pub(super) const DEFAULT_CONTEXT_WINDOW: u64 = 1_000_000;
+
+/// Resolve the auto-approve decision by precedence: an explicit CLI flag wins,
+/// then `~/.hanzo/settings.json` `autoApprove`, then the built-in default (ON).
+/// PURE + testable; the impure settings read lives in [`run`].
+///
+/// `--no-sandbox` (escalate) and `--ask`/`--safe` (opt out) are mutually exclusive
+/// at the clap layer, so at most one is set. The persisted `autoApprove` can turn
+/// the default OFF but can NEVER reach `Bypass`: dropping the sandbox is always a
+/// deliberate per-invocation `--no-sandbox`, never a stored default (fail-secure).
+fn resolve_approval(ask: bool, no_sandbox: bool, settings: Option<bool>) -> Approval {
+    if no_sandbox {
+        Approval::Bypass
+    } else if ask {
+        Approval::Ask
+    } else if settings.unwrap_or(true) {
+        Approval::Auto
+    } else {
+        Approval::Ask
+    }
+}
+
 /// Resolve one gateway model id by precedence — the first NON-EMPTY of: an explicit
 /// `--model` flag, the user's own exported env, the `~/.hanzo/settings.json` value,
 /// else the built-in default. PURE + testable; the impure reads live in [`run`].
@@ -155,6 +190,7 @@ fn resolve_model(flag: Option<&str>, user_env: Option<&str>, settings: Option<&s
 struct GatewayModels {
     model: String,
     small_fast_model: String,
+    context_window: u64,
 }
 
 /// Resolve both gateway models once, reading the user's exported env and the
@@ -178,6 +214,7 @@ fn gateway_models(backend: BackendKind, model_flag: Option<&str>, settings: &Set
             settings.small_fast_model.as_deref(),
             DEFAULT_SMALL_FAST_MODEL,
         ),
+        context_window: settings.context_window.unwrap_or(DEFAULT_CONTEXT_WINDOW),
     }
 }
 
@@ -234,6 +271,7 @@ fn resolve_routing(
         token,
         model: models.model.clone(),
         small_fast_model: models.small_fast_model.clone(),
+        context_window: models.context_window,
     };
     let provider = cfg.auth.provider.as_deref();
     for cred in route_plan(backend, provider, bearer.is_some()) {
@@ -414,10 +452,20 @@ pub async fn run(cfg: &mut Config, opts: Options) -> Result<()> {
     };
 
     // The native `~/.hanzo/settings.json` — the ONE home for the coding agent's
-    // defaults (model, small/fast model, MCP on/off). Loaded once, read below;
-    // every value still yields to an explicit CLI flag / process env. Best-effort:
-    // a missing file is created with the defaults, a bad one degrades to them.
+    // defaults (model, small/fast model, auto-approve, MCP on/off, context window).
+    // Loaded once, read below; every value still yields to an explicit CLI flag /
+    // process env. Best-effort: a missing file is created with the defaults, a bad
+    // one degrades to them.
     let settings = Settings::load();
+
+    // Auto-approve: run the agent's actions without a per-action prompt by default
+    // (the confirmed default). `--ask`/`--safe` opt out; `--no-sandbox` escalates to
+    // a full bypass; else `~/.hanzo/settings.json` `autoApprove` decides, ON by
+    // default. This governs ONLY the backend's permission mode — never the trust
+    // gate: the repo `.mcp.json`/settings stay untrusted (`--strict-mcp-config` +
+    // `--setting-sources user`) regardless, so auto-approve can't reopen the
+    // bearer-exfil vector. Each backend maps the decision to its own flags.
+    let approval = resolve_approval(opts.ask, opts.no_sandbox, settings.auto_approve);
 
     // MCP: attach hanzo-mcp by default. `--no-mcp` forces it off (flag wins);
     // otherwise `~/.hanzo/settings.json` `mcp` decides, defaulting ON. A missing
@@ -527,6 +575,7 @@ pub async fn run(cfg: &mut Config, opts: Options) -> Result<()> {
         task: opts.task.clone(),
         cwd: cwd.clone(),
         routing,
+        approval,
         mcp,
         structured,
         preset_session: preset_session.clone(),
@@ -976,9 +1025,11 @@ fn status_lines(
 }
 
 fn report_link(id: &str) {
-    // One clean line — bare id (no `sess_`), `hanzo` (bare = a coding session).
+    // A COPY-PASTEABLE command and nothing else: `hanzo --resume <id>` now parses at
+    // the top level (a bare-`hanzo` code flag — see `main::Cli`), so the whole line is
+    // a valid invocation with no label prefix to accidentally copy. Bare id (no `sess_`).
     let short = id.strip_prefix("sess_").unwrap_or(id);
-    println!("{}", format!("resume: hanzo --resume {short}").magenta());
+    println!("{}", format!("hanzo --resume {short}").magenta());
 }
 
 fn render_event(kind: Kind, payload: &Value) {
@@ -1439,6 +1490,7 @@ mod tests {
             task: Some("t".into()),
             cwd: PathBuf::from("."),
             routing: Route::Inherit,
+            approval: Approval::Auto,
             mcp: None,
             structured: true,
             preset_session: None,
@@ -1484,6 +1536,8 @@ mod tests {
             route: true,
             mcp: true,
             project_mcp: false,
+            ask: false,
+            no_sandbox: false,
             resume: None,
             brand: "hanzo".into(),
             task: None,
@@ -1493,7 +1547,7 @@ mod tests {
         };
         // Routing ON (gateway), stream OFF — the exact case LOW-1 flagged:
         // --no-link but model calls still ship code to the gateway.
-        let gw = Routing::Gateway { api: "https://api.hanzo.ai".into(), token: "T".into(), model: "enso".into(), small_fast_model: "enso-flash".into() };
+        let gw = Routing::Gateway { api: "https://api.hanzo.ai".into(), token: "T".into(), model: "enso".into(), small_fast_model: "enso-flash".into(), context_window: 1_000_000 };
         let (route, stream) = status_lines(&opts, Some(&gw), true, None);
         assert!(route.contains("model routing: on"), "got: {route}");
         assert!(route.contains("api.hanzo.ai"));
@@ -1532,6 +1586,8 @@ mod tests {
             route: true,
             mcp: true,
             project_mcp: false,
+            ask: false,
+            no_sandbox: false,
             resume: None,
             brand: "hanzo".into(),
             task: None,
@@ -1590,6 +1646,40 @@ mod tests {
         // Empty / whitespace-only tiers name no model and are skipped.
         assert_eq!(resolve_model(Some("  "), Some(""), Some("file"), "enso"), "file");
         assert_eq!(resolve_model(Some(""), Some("  "), Some("  "), "enso"), "enso");
+    }
+
+    /// The auto-approve precedence: an explicit CLI flag wins, then the persisted
+    /// `autoApprove`, then the built-in default (ON → `Auto`). The escalation
+    /// (`--no-sandbox` → `Bypass`) and the opt-out (`--ask`/`--safe` → `Ask`) both
+    /// beat the persisted setting; the setting can turn the default OFF but can
+    /// NEVER reach `Bypass` — dropping the sandbox is always a per-invocation act.
+    #[test]
+    fn resolve_approval_precedence() {
+        // No flags: the persisted setting decides, defaulting ON (Auto).
+        assert_eq!(resolve_approval(false, false, None), Approval::Auto);
+        assert_eq!(resolve_approval(false, false, Some(true)), Approval::Auto);
+        assert_eq!(resolve_approval(false, false, Some(false)), Approval::Ask);
+        // `--ask`/`--safe` opt out, winning over a persisted `true`.
+        assert_eq!(resolve_approval(true, false, Some(true)), Approval::Ask);
+        assert_eq!(resolve_approval(true, false, None), Approval::Ask);
+        // `--no-sandbox` escalates, winning over any setting — including `false`
+        // (the flag is explicit; the setting can never itself reach Bypass).
+        assert_eq!(resolve_approval(false, true, Some(false)), Approval::Bypass);
+        assert_eq!(resolve_approval(false, true, Some(true)), Approval::Bypass);
+        assert_eq!(resolve_approval(false, true, None), Approval::Bypass);
+    }
+
+    /// The context window rides the gateway route by precedence `settings > default`,
+    /// resolved once in `gateway_models` and carried only inside `Routing::Gateway`.
+    #[test]
+    fn gateway_models_resolves_the_context_window() {
+        use BackendKind::Dev;
+        // Unset → the built-in 1M default.
+        let none = settings::Settings::default();
+        assert_eq!(gateway_models(Dev, None, &none).context_window, DEFAULT_CONTEXT_WINDOW);
+        // A settings value wins over the default (e.g. opting the window to standard).
+        let file = settings::Settings { context_window: Some(200_000), ..Default::default() };
+        assert_eq!(gateway_models(Dev, None, &file).context_window, 200_000);
     }
 
     /// `gateway_models` reads the exported `ANTHROPIC_*` env for the CLAUDE backend
