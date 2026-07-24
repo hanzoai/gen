@@ -21,12 +21,12 @@
 
 mod backend;
 mod claude;
-mod context;
+pub mod context;
 mod dev;
 mod event;
 mod session;
 mod settings;
-mod target;
+pub mod target;
 mod theme;
 #[cfg(test)]
 pub(crate) mod testmock;
@@ -376,7 +376,7 @@ pub(crate) fn cloud_resume_block(
             "session belongs to {other}; you are now {active}. A cloud session cannot move \
              between orgs, so your local conversation resumes with full context and a NEW cloud \
              session is registered, billed to {} from the first turn. \
-             (`hanzo switch {other}` to go back to the original session.)",
+             (`hanzo auth use {other}` to go back to the original session.)",
             active.owner
         ),
     })
@@ -401,7 +401,7 @@ pub async fn run(cfg: &mut Config, opts: Options) -> Result<()> {
 
     let mut do_link = effective_link(opts.link, opts.no_link, cfg.code.link);
     if do_link && bearer.is_none() {
-        warn("not signed in — run `hanzo login` to link this session. Continuing locally (no cloud stream).");
+        warn("not signed in — run `hanzo auth login` to link this session. Continuing locally (no cloud stream).");
         do_link = false;
     }
 
@@ -491,7 +491,7 @@ pub async fn run(cfg: &mut Config, opts: Options) -> Result<()> {
     if matches!(routing, Route::FailClosed) {
         if let Some(p) = cfg.auth.provider.as_deref() {
             warn(&format!(
-                "selected provider `{p}` has no usable key — run `hanzo login` (or pass `--no-route` \
+                "selected provider `{p}` has no usable key — run `hanzo auth login` (or pass `--no-route` \
                  to use the backend's own account). Model calls will NOT route, and the child's \
                  inherited model credentials are cleared."
             ));
@@ -1013,7 +1013,7 @@ fn status_lines(
             "model routing: off (--no-route; the backend's own model account, code stays with your provider)".to_string()
         }
         None if !signed_in => {
-            "model routing: off (sign in with `hanzo login` to route + meter model calls)".to_string()
+            "model routing: off (sign in with `hanzo auth login` to route + meter model calls)".to_string()
         }
         None => "model routing: off".to_string(),
     };
@@ -1163,7 +1163,7 @@ mod tests {
         // Billing is stated plainly — it moves to the active identity's org.
         assert!(note.contains("billed to admin"), "{note}");
         // And the way back is offered rather than done for them.
-        assert!(note.contains("hanzo switch hanzo/z"), "{note}");
+        assert!(note.contains("hanzo auth use hanzo/z"), "{note}");
     }
 
     /// Same human, same username, DIFFERENT org — the exact `admin/z` vs

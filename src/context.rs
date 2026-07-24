@@ -735,6 +735,16 @@ impl TargetRecord {
         let json = serde_json::to_vec_pretty(self).context("serializing target record")?;
         private::write(&path, &json).context("writing target record")
     }
+
+    /// Remove this machine's stored target record (`hanzo node leave`). Returns
+    /// `true` when a record existed and was removed, `false` when there was none.
+    pub fn forget(machine_id: &str) -> Result<bool> {
+        match std::fs::remove_file(target_path(machine_id)) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e).context("removing target record"),
+        }
+    }
 }
 
 /// Reduce an id to a safe single-segment filename stem (ascii alnum / `_` / `-`).
