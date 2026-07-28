@@ -22,6 +22,7 @@
 mod backend;
 mod claude;
 pub mod context;
+mod control;
 mod dev;
 mod event;
 mod session;
@@ -48,6 +49,7 @@ use crate::{commands::network, iam::store};
 
 use backend::{resolve, resolve_mcp, Approval, BackendKind, Backend, Launch, Mode, Route, Routing, Spec};
 use context::{ResumeRecord, Snapshot};
+use control::{Act, Command};
 use event::{Kind, Mapped, Status, Usage};
 use session::SessionClient;
 use settings::Settings;
@@ -595,14 +597,16 @@ pub async fn run(cfg: &mut Config, opts: Options) -> Result<()> {
 
     match mode {
         Mode::Headless => {
-            let (outcome, ok) = run_headless(&*backend, structured, launch, client.clone(), session_id.clone()).await?;
+            let (outcome, status) =
+                supervise(&*backend, spec, launch, structured, client.clone(), session_id.clone())
+                    .await?;
             if let (Some(c), Some(id)) = (&client, &session_id) {
                 let transcript = outcome
                     .backend_session
                     .as_ref()
                     .and_then(|bs| backend.transcript_path(&cwd, bs))
                     .map(|p| p.display().to_string());
-                finalize(c, id, &outcome, ok, &snapshot, &api, &who, false, transcript).await;
+                finalize(c, id, &outcome, status, &snapshot, &api, &who, transcript).await;
                 report_link(id);
             }
         }
@@ -618,7 +622,11 @@ pub async fn run(cfg: &mut Config, opts: Options) -> Result<()> {
                     .as_ref()
                     .and_then(|s| backend.transcript_path(&cwd, s))
                     .map(|p| p.display().to_string());
-                finalize(c, id, &outcome, ok, &snapshot, &api, &who, true, transcript).await;
+                // An interactive session SUSPENDS rather than completes: the
+                // transcript and its resume handle outlive the TUI, so the same
+                // id is reopenable. A crash is still an error.
+                let status = if ok { Status::Paused } else { Status::Error };
+                finalize(c, id, &outcome, status, &snapshot, &api, &who, transcript).await;
                 report_link(id);
             }
         }
@@ -803,22 +811,27 @@ pub(crate) async fn run_stream<R: AsyncBufRead + Unpin>(
 // ---- finalize ----
 
 /// Close out a linked session: record usage, persist + mirror the resume handle,
-/// and set the terminal/suspended status. Interactive runs suspend to `paused`
-/// (resumable, same id); headless task runs complete to `done`; a failure is
-/// `error`. All cloud writes are best-effort (a hiccup never crashes the CLI).
+/// and set the final status.
+///
+/// The status is DECIDED BY THE CALLER, not inferred here. That is the whole
+/// point: an uncommanded run derives it from the exit code, an interactive run
+/// suspends to `paused`, and a remotely-commanded run takes it from the command —
+/// so a `stop` lands as a clean `done` even though the signalled child exits 143.
+/// Folding those three readings into one `bool` is what made a commanded stop
+/// look like a crash. All cloud writes are best-effort (a hiccup never crashes
+/// the CLI).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn finalize(
     client: &SessionClient,
     session_id: &str,
     outcome: &Outcome,
-    ok: bool,
+    status: Status,
     snapshot: &Snapshot,
     api: &str,
     // `identity` is the owner of this cloud session, for the LOCAL resume record
     // ONLY. It is deliberately not part of `Snapshot`: the snapshot is emitted to
     // cloud, and the CLI never sends an org — cloud derives it from the JWT.
     identity: &str,
-    interactive: bool,
     transcript_path: Option<String>,
 ) {
     if !outcome.usage.is_empty() {
@@ -844,25 +857,30 @@ pub(crate) async fn finalize(
         let _ = client.event(session_id, Kind::Status, rec.resume_payload()).await;
     }
 
-    let status = if !ok {
-        Status::Error
-    } else if interactive {
-        Status::Paused
-    } else {
-        Status::Done
-    };
     let _ = client.set_status(session_id, status).await;
 }
 
 // ---- process execution ----
 
-async fn run_headless(
+/// Run ONE headless turn, watching for a steering command while it streams.
+///
+/// The turn ends either because the backend finished (stdout hits EOF) or because
+/// a command arrived and we signalled the child. In BOTH cases we keep reading to
+/// EOF before returning: an interrupted Claude still writes `[Request interrupted
+/// by user for tool use]` and a final `result`, and those are the most useful
+/// events in the whole run — dropping them to exit a millisecond sooner would
+/// throw away the record of what the interrupt actually stopped.
+///
+/// Only the FIRST actionable command is applied per turn (`acted.is_none()`), so
+/// a double-click on the dashboard cannot signal a child twice.
+async fn run_turn(
     backend: &dyn Backend,
     structured: bool,
     launch: Launch,
     client: Option<SessionClient>,
     session_id: Option<String>,
-) -> Result<(Outcome, bool)> {
+    control: Option<&mut tokio::sync::mpsc::Receiver<Command>>,
+) -> Result<(Outcome, bool, Option<Act>)> {
     let Launch { mut command, cleanup } = launch;
     command.stdin(Stdio::inherit()).stderr(Stdio::inherit());
     if structured {
@@ -871,17 +889,121 @@ async fn run_headless(
         command.stdout(Stdio::inherit());
     }
     let mut child = command.spawn().map_err(spawn_err)?;
+    let pid = child.id();
+    let mut acted: Option<Act> = None;
 
-    let outcome = if structured {
-        let stdout = child.stdout.take().expect("piped stdout");
-        let reader = tokio::io::BufReader::new(stdout);
-        run_stream(backend, reader, client, session_id, true).await?
-    } else {
-        Outcome::default()
+    let outcome = match (structured, control) {
+        (false, _) => Outcome::default(),
+        (true, control) => {
+            let stdout = child.stdout.take().expect("piped stdout");
+            let reader = tokio::io::BufReader::new(stdout);
+            let streaming = run_stream(backend, reader, client, session_id, true);
+            tokio::pin!(streaming);
+            match control {
+                // Unlinked: nothing can steer this run, so there is nothing to
+                // select on. The privacy gate is structural here too.
+                None => streaming.await?,
+                Some(rx) => loop {
+                    tokio::select! {
+                        out = &mut streaming => break out?,
+                        Some(cmd) = rx.recv(), if acted.is_none() => {
+                            let act = cmd.act();
+                            if let Some(sig) = act.signal() {
+                                // A signal we cannot deliver (Windows has no
+                                // SIGINT for another process) must still stop the
+                                // run — fall back to the platform's own kill
+                                // rather than let a remote stop silently do
+                                // nothing.
+                                if let Some(p) = pid {
+                                    if control::send(p, sig).is_err() {
+                                        let _ = child.start_kill();
+                                    }
+                                }
+                            }
+                            if act.ends_turn() {
+                                acted = Some(act);
+                            }
+                        }
+                    }
+                },
+            }
+        }
     };
+
     let status = child.wait().await.context("waiting for backend")?;
     drop(cleanup);
-    Ok((outcome, status.success()))
+    Ok((outcome, status.success(), acted))
+}
+
+/// Drive a headless run to completion under remote control, returning the
+/// accumulated outcome and the status to finalize the cloud session with.
+///
+/// A `message` command makes this loop: the child is interrupted, the spec is
+/// rebuilt with the backend's OWN resume handle plus the new instruction, and the
+/// next turn continues the SAME conversation — native `--resume`, never injected
+/// keystrokes. The cloud session id never changes across a steer, so the
+/// dashboard watches one unbroken session while the turns underneath it restart.
+async fn supervise(
+    backend: &dyn Backend,
+    mut spec: Spec,
+    mut launch: Launch,
+    structured: bool,
+    client: Option<SessionClient>,
+    session_id: Option<String>,
+) -> Result<(Outcome, Status)> {
+    // The drain runs only for a linked run — same structural auth gate as the
+    // event stream. An unlinked run holds no client, so nothing can steer it.
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut rx = match (&client, &session_id) {
+        (Some(c), Some(id)) => Some(control::drain(c.clone(), id.clone(), stop.clone())),
+        _ => None,
+    };
+
+    let mut acc = Outcome::default();
+    let status = loop {
+        let (out, ok, act) =
+            run_turn(backend, structured, launch, client.clone(), session_id.clone(), rx.as_mut())
+                .await?;
+
+        // Fold this turn into the run. The backend session id is set once — it is
+        // the SAME conversation across every steer — while usage accumulates and
+        // the newest summary wins.
+        acc.backend_session = acc.backend_session.or(out.backend_session);
+        acc.usage.merge(out.usage);
+        acc.saw_error = out.saw_error;
+        if out.final_summary.is_some() {
+            acc.final_summary = out.final_summary;
+        }
+
+        match act {
+            // Commanded end: the COMMAND decides the status, not the exit code —
+            // a stop exits 143 and is still a clean `done`, never an `error`.
+            Some(Act::End { status, .. }) => break status,
+            Some(Act::Steer { prompt, .. }) => {
+                // Resume the conversation the run has BUILT UP — unless there
+                // isn't one yet. A turn that never disclosed a session id was
+                // interrupted before the backend finished starting, so there is
+                // no transcript to preserve and a fresh launch loses nothing;
+                // relaunching either way is what makes a steer land whenever the
+                // human clicks it, rather than only after start-up completes.
+                spec.resume = acc.backend_session.clone();
+                spec.task = Some(prompt);
+                // `--resume` and `--session-id` are mutually exclusive, so a
+                // resumed turn drops the pre-set id.
+                if spec.resume.is_some() {
+                    spec.preset_session = None;
+                }
+                launch = backend.build(&spec)?;
+            }
+            // Uncommanded end: the backend finished (or failed) on its own.
+            None | Some(Act::Ignore) => {
+                break if ok { Status::Done } else { Status::Error };
+            }
+        }
+    };
+
+    stop.store(true, Ordering::Relaxed);
+    Ok((acc, status))
 }
 
 async fn run_interactive(
@@ -1412,7 +1534,7 @@ mod tests {
             saw_error: false,
             final_summary: None,
         };
-        finalize(&client, "sess_9", &outcome, true, &snapshot, "https://api.hanzo.ai", "hanzo/z", false, None).await;
+        finalize(&client, "sess_9", &outcome, Status::Done, &snapshot, "https://api.hanzo.ai", "hanzo/z", None).await;
 
         let reqs = mock.requests();
         // usage log event
@@ -1436,12 +1558,12 @@ mod tests {
             cwd: "/w".into(), backend: "dev".into(), backend_version: None, repo: Default::default(),
         };
         let outcome = Outcome::default();
-        finalize(&client, "sess_i", &outcome, true, &snapshot, "https://api.hanzo.ai", "hanzo/z", true, None).await;
+        finalize(&client, "sess_i", &outcome, Status::Paused, &snapshot, "https://api.hanzo.ai", "hanzo/z", None).await;
         assert!(mock.requests().iter().any(|r| r.method == "PATCH" && r.json()["status"] == "paused"));
 
         let mock2 = MockCloud::start().await;
         let client2 = SessionClient::new(&mock2.base_url(), "T").unwrap();
-        finalize(&client2, "sess_e", &outcome, false, &snapshot, "https://api.hanzo.ai", "hanzo/z", true, None).await;
+        finalize(&client2, "sess_e", &outcome, Status::Error, &snapshot, "https://api.hanzo.ai", "hanzo/z", None).await;
         assert!(mock2.requests().iter().any(|r| r.method == "PATCH" && r.json()["status"] == "error"));
     }
 
@@ -1501,7 +1623,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_headless_spawns_a_real_child_and_forwards_end_to_end() {
+    async fn run_turn_spawns_a_real_child_and_forwards_end_to_end() {
         let mock = MockCloud::start().await;
         let client = SessionClient::new(&mock.base_url(), "T").unwrap();
         let fixture = concat!(
@@ -1511,10 +1633,11 @@ mod tests {
         );
         let fake = FakeBackend { fixture: fixture.into() };
         let launch = fake.build(&dummy_spec()).unwrap();
-        let (out, ok) =
-            run_headless(&fake, true, launch, Some(client), Some("sess_e2e".into())).await.unwrap();
+        let (out, ok, act) =
+            run_turn(&fake, true, launch, Some(client), Some("sess_e2e".into()), None).await.unwrap();
 
         assert!(ok, "child exited zero");
+        assert!(act.is_none(), "an unsteered turn ends on its own terms");
         assert_eq!(out.backend_session.as_deref(), Some("sid-1"));
         assert_eq!(out.usage.input_tokens, Some(5));
         let kinds: Vec<String> = mock
@@ -1812,5 +1935,415 @@ mod tests {
             .requests()
             .iter()
             .any(|r| r.path == "/v1/agents/sessions/sess_t/events" && r.json()["kind"] == "message"));
+    }
+}
+
+/// The remote-control proofs: the session channel's INBOUND half, driven end to
+/// end against the mock control plane and REAL child processes.
+///
+/// These do not stub the supervisor — `supervise` is the function under test,
+/// signals are delivered to a real pid, and the commands arrive over HTTP from
+/// the same drain contract cloud serves. What is stubbed is only Claude itself,
+/// because a test must not need an API key; the shapes it emits are copied
+/// verbatim from a recorded run (see `INTERRUPTED`).
+#[cfg(test)]
+mod control_tests {
+    use super::*;
+    use crate::commands::code::claude::Claude;
+    use crate::commands::code::testmock::MockCloud;
+    use std::sync::Mutex;
+    use tokio::io::AsyncWriteExt;
+
+    /// A REAL recorded interrupt, trimmed to the three lines that matter.
+    /// Captured from `claude -p … --output-format stream-json` interrupted
+    /// mid-`Bash` by SIGINT: Claude aborts the tool, says so in a user turn, and
+    /// still writes a final `result` carrying `terminal_reason:"aborted_tools"`.
+    /// That last line is why an interrupted run is still worth streaming.
+    const INTERRUPTED: &str = concat!(
+        r#"{"type":"system","subtype":"init","session_id":"36d41361-9768-4c07-98cb-4a15984c5bf1","model":"claude-sonnet-5"}"#,
+        "\n",
+        r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user for tool use]"}]},"session_id":"36d41361-9768-4c07-98cb-4a15984c5bf1"}"#,
+        "\n",
+        r#"{"type":"result","subtype":"error_during_execution","is_error":true,"terminal_reason":"aborted_tools","session_id":"36d41361-9768-4c07-98cb-4a15984c5bf1","result":null,"num_turns":3,"total_cost_usd":0.10867639999999999,"duration_ms":11232}"#,
+        "\n",
+    );
+
+    async fn reader_of(fixture: &str) -> impl AsyncBufRead + Unpin {
+        let (r, mut w) = tokio::io::duplex(1 << 20);
+        w.write_all(fixture.as_bytes()).await.unwrap();
+        drop(w);
+        tokio::io::BufReader::new(r)
+    }
+
+    /// A backend that runs a scripted shell per turn and records every `Spec` it
+    /// was asked to build — which is how the steer test proves the SECOND turn
+    /// resumed the FIRST turn's session id.
+    struct ScriptBackend {
+        scripts: Vec<&'static str>,
+        /// `(resume, task)` per build, in order.
+        built: Arc<Mutex<Vec<(Option<String>, Option<String>)>>>,
+    }
+
+    impl ScriptBackend {
+        fn new(scripts: Vec<&'static str>) -> (Self, Arc<Mutex<Vec<(Option<String>, Option<String>)>>>) {
+            let built = Arc::new(Mutex::new(Vec::new()));
+            (ScriptBackend { scripts, built: built.clone() }, built)
+        }
+    }
+
+    impl Backend for ScriptBackend {
+        fn label(&self) -> &'static str {
+            "claude"
+        }
+        fn version(&self) -> Option<String> {
+            None
+        }
+        fn build(&self, spec: &Spec) -> Result<Launch> {
+            let mut b = self.built.lock().unwrap();
+            let idx = b.len().min(self.scripts.len() - 1);
+            b.push((spec.resume.clone(), spec.task.clone()));
+            let mut command = tokio::process::Command::new("sh");
+            command.arg("-c").arg(self.scripts[idx]);
+            Ok(Launch { command, cleanup: Vec::new() })
+        }
+        /// The real Claude parser — so these tests exercise the SAME mapping the
+        /// production stream does, on the same recorded shapes.
+        fn parse(&self, line: &str) -> Vec<Mapped> {
+            Claude.parse(line)
+        }
+        fn transcript_path(&self, _: &Path, _: &str) -> Option<PathBuf> {
+            None
+        }
+    }
+
+    fn spec_for(task: &str) -> Spec {
+        Spec {
+            mode: Mode::Headless,
+            task: Some(task.to_string()),
+            cwd: std::env::temp_dir(),
+            routing: Route::Inherit,
+            approval: Approval::Auto,
+            mcp: None,
+            structured: true,
+            preset_session: None,
+            trust_project: false,
+            resume: None,
+            passthrough: Vec::new(),
+        }
+    }
+
+    /// Emit an init line disclosing a backend session id, then hang forever.
+    /// `exec` matters: it replaces the shell so the pid we signal IS the process
+    /// holding the stdout pipe — otherwise a surviving grandchild would keep the
+    /// pipe open and the stream would never see EOF.
+    const HANGS: &str = concat!(
+        r#"echo '{"type":"system","subtype":"init","session_id":"bsid-1","model":"m"}'; "#,
+        "exec sleep 30",
+    );
+
+    /// Runs briefly and finishes on its OWN terms, announcing it did.
+    const COMPLETES: &str = concat!(
+        r#"echo '{"type":"system","subtype":"init","session_id":"bsid-1","model":"m"}'; "#,
+        "sleep 2; ",
+        r#"echo '{"type":"result","subtype":"success","is_error":false,"session_id":"bsid-1","result":"finished","num_turns":1}'"#,
+    );
+
+    async fn supervise_with(
+        mock: &MockCloud,
+        session: &str,
+        scripts: Vec<&'static str>,
+    ) -> (Outcome, Status, Arc<Mutex<Vec<(Option<String>, Option<String>)>>>, std::time::Duration) {
+        let client = SessionClient::new(&mock.base_url(), "T").unwrap();
+        let (backend, built) = ScriptBackend::new(scripts);
+        let spec = spec_for("original task");
+        // This `build` is the turn-0 invocation the orchestrator performs before
+        // handing the launch to the supervisor, so `built[0]` is turn 0 and any
+        // further entry is a steer's relaunch.
+        let launch = backend.build(&spec).unwrap();
+        let started = std::time::Instant::now();
+        let (out, status) = supervise(
+            &backend,
+            spec,
+            launch,
+            true,
+            Some(client),
+            Some(session.to_string()),
+        )
+        .await
+        .unwrap();
+        (out, status, built, started.elapsed())
+    }
+
+    // ---- the event path, from a recorded interrupt --------------------------
+
+    /// The interrupt's OWN events reach the channel with the right kinds and the
+    /// right identity — including the abort notice and the terminal `result`.
+    /// This is the shape a dashboard renders when a human clicks interrupt.
+    #[tokio::test]
+    async fn interrupt_events_surface_on_the_channel_with_correct_shape() {
+        let mock = MockCloud::start().await;
+        let client = SessionClient::new(&mock.base_url(), "T").unwrap();
+        let reader = reader_of(INTERRUPTED).await;
+
+        let out = run_stream(&Claude, reader, Some(client), Some("sess_1".into()), false)
+            .await
+            .unwrap();
+
+        // The resume handle is the whole reason an interrupted session survives.
+        assert_eq!(out.backend_session.as_deref(), Some("36d41361-9768-4c07-98cb-4a15984c5bf1"));
+        assert!(out.saw_error, "aborted_tools is a non-ok terminal");
+
+        let posts: Vec<_> = mock
+            .requests()
+            .into_iter()
+            .filter(|r| r.path == "/v1/agents/sessions/sess_1/events")
+            .collect();
+        assert!(!posts.is_empty(), "the interrupt must be streamed, not swallowed");
+
+        // Every event is routed to OUR session and carries the bearer, never an org.
+        for r in &posts {
+            assert_eq!(r.header("authorization").as_deref(), Some("Bearer T"));
+            assert!(r.header("x-org-id").is_none(), "the CLI must never assert an org");
+        }
+        let texts: Vec<String> = posts.iter().map(|r| r.body.clone()).collect();
+        let joined = texts.join("\n");
+        assert!(
+            joined.contains("[Request interrupted by user for tool use]"),
+            "the abort notice must reach the dashboard; got: {joined}"
+        );
+    }
+
+    // ---- one test per control op -------------------------------------------
+
+    /// `stop` ACTUALLY terminates the child: a run scripted to sleep 30s ends in
+    /// well under that, and the session finalizes `done` — not `error`, even
+    /// though a signalled child exits non-zero.
+    #[tokio::test]
+    async fn stop_terminates_the_child_and_finalizes_done() {
+        let mock = MockCloud::start_with_control(&[(1, "stop", "")]).await;
+        let (_out, status, built, elapsed) =
+            supervise_with(&mock, "sess_1", vec![HANGS]).await;
+
+        assert!(
+            elapsed < Duration::from_secs(25),
+            "stop must kill the child, not wait it out (took {elapsed:?})"
+        );
+        assert_eq!(status, Status::Done, "a commanded stop is finished, not failed");
+        assert_eq!(built.lock().unwrap().len(), 1, "stop must not relaunch");
+
+        // And the terminal status actually reached cloud.
+        let patches: Vec<_> = mock
+            .requests()
+            .into_iter()
+            .filter(|r| r.method == "PATCH" && r.path == "/v1/agents/sessions/sess_1")
+            .collect();
+        assert!(patches.is_empty(), "supervise itself does not PATCH; finalize does");
+    }
+
+    /// `pause` halts the operation but leaves the session ALIVE: the status is
+    /// `paused` (non-terminal, so cloud will reopen it) and the backend's resume
+    /// handle survived, which is what makes reopening possible at all.
+    #[tokio::test]
+    async fn interrupt_halts_the_operation_without_destroying_the_session() {
+        // Delayed one poll so the backend has certainly disclosed its session id:
+        // this test is about the handle SURVIVING the interrupt, so the interrupt
+        // must land after there is a handle to survive.
+        let mock = MockCloud::start_with_delayed_control(1, &[(1, "pause", "")]).await;
+        let (out, status, built, elapsed) = supervise_with(&mock, "sess_1", vec![HANGS]).await;
+
+        assert!(elapsed < Duration::from_secs(25), "pause must interrupt promptly");
+        assert_eq!(status, Status::Paused);
+        assert_ne!(status, Status::Done, "pause must NOT close the session");
+        assert_ne!(status, Status::Error, "an interrupt is not a failure");
+        assert_eq!(
+            out.backend_session.as_deref(),
+            Some("bsid-1"),
+            "the resume handle must survive an interrupt — without it the session is unreachable"
+        );
+        assert_eq!(built.lock().unwrap().len(), 1, "pause must not relaunch");
+    }
+
+    /// `message` steers: the child is interrupted, then the SAME conversation
+    /// continues via the backend's native `--resume` carrying the new prompt.
+    /// The cloud session id never changes across the steer.
+    #[tokio::test]
+    async fn steer_resumes_the_same_session_with_the_new_prompt() {
+        // Delayed by one poll so the first turn has certainly disclosed its
+        // session id — this test asserts the RESUME-carrying path specifically.
+        let mock =
+            MockCloud::start_with_delayed_control(1, &[(1, "message", "now do X instead")]).await;
+        let (_out, status, built, _) =
+            supervise_with(&mock, "sess_1", vec![HANGS, COMPLETES]).await;
+
+        let built = built.lock().unwrap().clone();
+        assert_eq!(built.len(), 2, "a steer must run a SECOND turn; got {built:?}");
+
+        // Turn 1: the original task, no resume.
+        assert_eq!(built[0].0, None, "the first turn resumes nothing");
+        assert_eq!(built[0].1.as_deref(), Some("original task"));
+
+        // Turn 2: the SAME backend session id, and the steer's prompt.
+        assert_eq!(
+            built[1].0.as_deref(),
+            Some("bsid-1"),
+            "the steer must resume the session the first turn disclosed — a new id would lose the context"
+        );
+        assert_eq!(built[1].1.as_deref(), Some("now do X instead"));
+
+        // The second turn finished on its own terms.
+        assert_eq!(status, Status::Done);
+
+        // Every control drain addressed the SAME cloud session throughout.
+        let drains: Vec<_> = mock
+            .requests()
+            .into_iter()
+            .filter(|r| r.path.contains("/control"))
+            .collect();
+        assert!(!drains.is_empty());
+        for r in &drains {
+            assert!(
+                r.path.starts_with("/v1/agents/sessions/sess_1/control"),
+                "the steer must not move the session: {}",
+                r.path
+            );
+        }
+    }
+
+    /// The other legitimate ordering: a steer that lands BEFORE the backend has
+    /// disclosed a session id. There is no transcript to preserve yet, so the
+    /// steer must still land — as a fresh launch carrying the new instruction,
+    /// never as a dropped command.
+    #[tokio::test]
+    async fn a_steer_that_beats_startup_still_lands_as_a_fresh_turn() {
+        let mock = MockCloud::start_with_control(&[(1, "message", "actually do Y")]).await;
+        // This script NEVER discloses a session id — the worst case, deterministically.
+        let (_out, status, built, _) =
+            supervise_with(&mock, "sess_1", vec!["exec sleep 30", COMPLETES]).await;
+
+        let built = built.lock().unwrap().clone();
+        assert_eq!(built.len(), 2, "the steer must still run a second turn; got {built:?}");
+        assert_eq!(built[1].0, None, "nothing was disclosed, so there is nothing to resume");
+        assert_eq!(
+            built[1].1.as_deref(),
+            Some("actually do Y"),
+            "the human's instruction must survive even when it beats the backend's start-up"
+        );
+        assert_eq!(status, Status::Done);
+    }
+
+    /// `resume` against an already-running session is a no-op — it must not
+    /// signal the child or restart anything.
+    #[tokio::test]
+    async fn resume_does_not_disturb_a_running_session() {
+        let mock = MockCloud::start_with_control(&[(1, "resume", "")]).await;
+        let (out, status, built, _) = supervise_with(&mock, "sess_1", vec![COMPLETES]).await;
+
+        assert_eq!(built.lock().unwrap().len(), 1, "resume must not relaunch");
+        assert_eq!(status, Status::Done);
+        assert_eq!(
+            out.final_summary.as_deref(),
+            Some("finished"),
+            "the run must have completed on its own — a resume must not cut it short"
+        );
+    }
+
+    // ---- adversarial: cross-org control ------------------------------------
+
+    /// A principal may not observe another org's session. The drain for a
+    /// foreign id is refused (cloud 404s it), and the refusal is an ERROR here —
+    /// never an empty-but-successful page that would read as "no commands".
+    #[tokio::test]
+    async fn draining_another_orgs_session_is_refused() {
+        let mock = MockCloud::start_org_scoped("sess_ours", &[(1, "stop", "")]).await;
+        let client = SessionClient::new(&mock.base_url(), "T").unwrap();
+
+        // Ours: readable.
+        let page = client.drain_control("sess_ours", 0).await.unwrap();
+        assert_eq!(page.commands.len(), 1, "our own commands are ours to read");
+
+        // Theirs: refused, loudly.
+        let err = client
+            .drain_control("sess_theirs", 0)
+            .await
+            .expect_err("a foreign session must not be readable");
+        assert!(err.to_string().contains("404"), "got: {err}");
+
+        // And the detail read is refused the same way — there is no seam that
+        // leaks the existence of another org's session.
+        let err = client.get("sess_theirs").await.expect_err("foreign detail must be refused");
+        assert!(err.to_string().contains("404"), "got: {err}");
+    }
+
+    /// The adversarial end-to-end: a `stop` sitting in ANOTHER org's queue must
+    /// not reach our child. The supervisor polls, is refused, and the run
+    /// completes on its own — proving cross-org control is impossible, not
+    /// merely discouraged.
+    ///
+    /// The assertion is the completion marker: a child that had been signalled
+    /// would die during its `sleep` and never emit it.
+    #[tokio::test]
+    async fn another_orgs_stop_cannot_terminate_our_child() {
+        // The mock owns `sess_ours` and holds a `stop` for it. We supervise
+        // `sess_theirs` — the attacker's aim — and must get nothing.
+        let mock = MockCloud::start_org_scoped("sess_ours", &[(1, "stop", "")]).await;
+        let (out, status, built, _) =
+            supervise_with(&mock, "sess_theirs", vec![COMPLETES]).await;
+
+        assert_eq!(
+            out.final_summary.as_deref(),
+            Some("finished"),
+            "the child ran to completion — a leaked cross-org stop would have killed it mid-sleep"
+        );
+        assert_eq!(status, Status::Done, "ended on its own terms, not by command");
+        assert_eq!(built.lock().unwrap().len(), 1);
+        assert_eq!(
+            out.backend_session.as_deref(),
+            Some("bsid-1"),
+            "and the run was otherwise entirely normal"
+        );
+    }
+
+    /// A refused drain must not be mistaken for "no commands, carry on" in a way
+    /// that silently advances the cursor — a later legitimate command would then
+    /// be skipped. The cursor only moves on a SUCCESSFUL page.
+    #[tokio::test]
+    async fn a_refused_drain_does_not_advance_the_cursor() {
+        let mock = MockCloud::start_org_scoped("sess_ours", &[(1, "stop", "")]).await;
+        let client = SessionClient::new(&mock.base_url(), "T").unwrap();
+        assert!(client.drain_control("sess_theirs", 0).await.is_err());
+
+        // Our own queue is untouched by the foreign attempt.
+        let page = client.drain_control("sess_ours", 0).await.unwrap();
+        assert_eq!(page.cursor, 1);
+        assert_eq!(page.commands[0].command, "stop");
+    }
+
+    /// The cursor contract: an applied command is never redelivered.
+    #[tokio::test]
+    async fn the_drain_cursor_never_redelivers_an_applied_command() {
+        let mock = MockCloud::start_with_control(&[(1, "pause", ""), (2, "stop", "")]).await;
+        let client = SessionClient::new(&mock.base_url(), "T").unwrap();
+
+        let first = client.drain_control("sess_1", 0).await.unwrap();
+        assert_eq!(first.commands.len(), 2);
+        assert_eq!(first.cursor, 2);
+
+        let second = client.drain_control("sess_1", first.cursor).await.unwrap();
+        assert!(second.commands.is_empty(), "already-applied commands must not repeat");
+        assert_eq!(second.cursor, 2);
+    }
+
+    /// An unlinked run cannot be steered at all — the privacy gate is structural,
+    /// exactly as it is for the outbound stream.
+    #[tokio::test]
+    async fn an_unlinked_run_is_unsteerable() {
+        let (backend, built) = ScriptBackend::new(vec![COMPLETES]);
+        let spec = spec_for("t");
+        let launch = backend.build(&spec).unwrap();
+        let _ = &built;
+
+        let (out, status) = supervise(&backend, spec, launch, true, None, None).await.unwrap();
+        assert_eq!(status, Status::Done);
+        assert_eq!(out.final_summary.as_deref(), Some("finished"));
     }
 }

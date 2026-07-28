@@ -49,6 +49,25 @@ struct Config {
     /// When true, POST /v1/billing/deposit answers commerce's VERBATIM
     /// PlatformOnly refusal — the deposit-403 incident, reproduced.
     deposit_refused: bool,
+    /// Steering commands this mock hands back on the control drain, as
+    /// `(seq, command, message)`. A drain returns those with `seq > after`,
+    /// oldest first — the same cursor contract as cloud's `drainControl`.
+    control: Vec<(i64, String, String)>,
+    /// The ONE session id this mock admits to owning. `None` means "every id is
+    /// ours" (the ordinary single-tenant fixture). `Some(id)` makes every OTHER
+    /// id a 404 on both the detail read and the control drain — which is exactly
+    /// what cloud does for a session belonging to another org, and what the
+    /// cross-org test needs in order to be adversarial rather than decorative.
+    owned: Option<String>,
+    /// Withhold the control queue for this many polls before serving it. Real
+    /// steering races the backend's start-up: a command that lands before the
+    /// backend has disclosed its session id is applied to a run with no resume
+    /// handle. Both orderings are legitimate and both are exercised — this knob
+    /// pins WHICH one a given test asserts, so the suite cannot pass or fail on
+    /// scheduler luck.
+    control_delay_polls: usize,
+    /// Polls observed so far, shared across connections.
+    polls: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// The ordinary control plane: everything succeeds. Each constructor below
@@ -61,6 +80,10 @@ impl Default for Config {
             targets_missing: false,
             session_get_code: None,
             deposit_refused: false,
+            control: Vec::new(),
+            owned: None,
+            control_delay_polls: 0,
+            polls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 }
@@ -103,6 +126,30 @@ impl MockCloud {
     /// SuperAdmin — the incident, on the wire.
     pub async fn start_deposit_refused() -> MockCloud {
         Self::with(Config { deposit_refused: true, ..Config::default() }).await
+    }
+
+    /// A mock whose control drain hands back `cmds` as `(seq, command, message)`.
+    pub async fn start_with_control(cmds: &[(i64, &str, &str)]) -> MockCloud {
+        let control =
+            cmds.iter().map(|(s, c, m)| (*s, (*c).to_string(), (*m).to_string())).collect();
+        Self::with(Config { control, ..Config::default() }).await
+    }
+
+    /// A mock that withholds `cmds` until after `delay` polls — so the backend
+    /// has certainly disclosed its session id before the command lands.
+    pub async fn start_with_delayed_control(delay: usize, cmds: &[(i64, &str, &str)]) -> MockCloud {
+        let control =
+            cmds.iter().map(|(s, c, m)| (*s, (*c).to_string(), (*m).to_string())).collect();
+        Self::with(Config { control, control_delay_polls: delay, ..Config::default() }).await
+    }
+
+    /// A mock that owns exactly ONE session id and 404s every other — cloud's
+    /// cross-org behaviour, so a poller aimed at a foreign session gets nothing
+    /// but a refusal.
+    pub async fn start_org_scoped(owner: &str, cmds: &[(i64, &str, &str)]) -> MockCloud {
+        let control =
+            cmds.iter().map(|(s, c, m)| (*s, (*c).to_string(), (*m).to_string())).collect();
+        Self::with(Config { control, owned: Some(owner.to_string()), ..Config::default() }).await
     }
 
     async fn with(cfg: Config) -> MockCloud {
@@ -236,8 +283,58 @@ fn respond(cfg: &Config, method: &str, path: &str) -> (String, String) {
             format!(r#"{{"id":"{id}","label":"evo","kind":"gpu","status":"online","sessions":0,"running":0}}"#),
         );
     }
+    // Control drain -> the commands newer than ?after=, oldest first, plus the
+    // cursor to poll from next. MUST precede the detail branch below: this path
+    // also starts with "/v1/agents/sessions/".
+    if method == "GET" && path.contains("/control") && path.starts_with("/v1/agents/sessions/") {
+        let (target, query) = path.split_once('?').unwrap_or((path, ""));
+        let id = target
+            .trim_start_matches("/v1/agents/sessions/")
+            .trim_end_matches("/control");
+        // Org scoping: a session this tenant does not own is a 404 — never a 200
+        // carrying another org's commands.
+        if let Some(owner) = &cfg.owned {
+            if owner != id {
+                return ("404 Not Found".into(), r#"{"error":"session not found"}"#.to_string());
+            }
+        }
+        // Withhold the queue for the configured number of polls.
+        let seen = cfg.polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let after_raw: i64 = query
+            .split('&')
+            .find_map(|kv| kv.strip_prefix("after="))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        if seen < cfg.control_delay_polls {
+            return ("200 OK".into(), format!(r#"{{"commands":[],"cursor":{after_raw}}}"#));
+        }
+        let after: i64 = query
+            .split('&')
+            .find_map(|kv| kv.strip_prefix("after="))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let mut cursor = after;
+        let mut items: Vec<String> = Vec::new();
+        for (seq, command, message) in cfg.control.iter().filter(|(s, _, _)| *s > after) {
+            cursor = cursor.max(*seq);
+            items.push(format!(
+                r#"{{"seq":{seq},"command":"{command}","message":"{message}"}}"#
+            ));
+        }
+        return (
+            "200 OK".into(),
+            format!(r#"{{"commands":[{}],"cursor":{cursor}}}"#, items.join(",")),
+        );
+    }
     // GET detail -> configured status
     if method == "GET" && path.starts_with("/v1/agents/sessions/") {
+        // Same org gate as the drain: a foreign id is never readable.
+        if let Some(owner) = &cfg.owned {
+            let id = path.trim_start_matches("/v1/agents/sessions/");
+            if owner != id {
+                return ("404 Not Found".into(), r#"{"error":"session not found"}"#.to_string());
+            }
+        }
         if let Some(code) = cfg.session_get_code {
             let line = match code {
                 403 => "403 Forbidden",

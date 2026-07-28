@@ -90,6 +90,21 @@ impl SessionClient {
         serde_json::from_value(v).context("parsing session info")
     }
 
+    /// Drain the steering commands issued since `after` — the INBOUND half of the
+    /// session channel (`cloud/apps/agents/sessions_control_drain.go`).
+    ///
+    /// Read-only and cursor-driven: cloud returns `control` events with
+    /// `seq > after`, oldest first, plus the cursor to poll from next, so an
+    /// applied command is never redelivered and a reconnect replays exactly what
+    /// was missed. Org scoping is the SAME check that guards the session itself —
+    /// a session belonging to another org is a clean 404 here, never a page of
+    /// someone else's commands.
+    pub async fn drain_control(&self, id: &str, after: i64) -> Result<super::control::Page> {
+        let path = format!("/v1/agents/sessions/{id}/control?after={after}");
+        let v = self.send(reqwest::Method::GET, &path, None).await?;
+        serde_json::from_value(v).context("parsing control page")
+    }
+
     async fn send(&self, method: reqwest::Method, path: &str, body: Option<&Value>) -> Result<Value> {
         let url = format!("{}{}", self.api, path);
         crate::http::send_json(&self.http, method, &url, &self.token, body).await
