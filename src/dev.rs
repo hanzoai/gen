@@ -200,7 +200,7 @@ impl Backend for Dev {
         }
     }
 
-    fn transcript_path(&self, _cwd: &Path, _backend_session_id: &str) -> Option<PathBuf> {
+    fn transcript_path(&self, _route: &Route, _cwd: &Path, _backend_session_id: &str) -> Option<PathBuf> {
         // `dev`'s rollout files are date-bucketed under CODEX_HOME; native
         // `dev exec resume <id>` locates them itself, so we don't tail them.
         None

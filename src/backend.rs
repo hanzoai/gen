@@ -216,7 +216,10 @@ pub trait Backend {
 
     /// Locate the backend's transcript file for a session id, so interactive
     /// linking can tail it. `None` when the backend has no tailable transcript.
-    fn transcript_path(&self, cwd: &Path, backend_session_id: &str) -> Option<PathBuf>;
+    /// The route is what decides which config home the run wrote it in, so it must
+    /// be the SAME value [`Backend::build`] launched with — a path resolved against
+    /// the other home names a file that never exists.
+    fn transcript_path(&self, route: &Route, cwd: &Path, backend_session_id: &str) -> Option<PathBuf>;
 }
 
 /// Resolve a backend kind to its implementation.

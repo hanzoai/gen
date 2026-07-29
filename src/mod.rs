@@ -25,10 +25,12 @@ pub mod context;
 mod control;
 mod dev;
 mod event;
+mod home;
 mod session;
 mod settings;
 pub mod target;
 mod theme;
+mod tier;
 #[cfg(test)]
 pub(crate) mod testmock;
 
@@ -500,6 +502,15 @@ pub async fn run(cfg: &mut Config, opts: Options) -> Result<()> {
         }
     }
 
+    // Seed Hanzo's OWN Claude config home (`~/.hanzo/claude`) with the first-run
+    // defaults a wrapped session needs — but only on a route that relocates it, so
+    // `--no-route` never writes Hanzo's defaults into the user's own install. This
+    // is the one WRITE; `claude::build` and the transcript pointer only READ the
+    // same pure function, so they cannot disagree about where the home is.
+    if kind == BackendKind::Claude {
+        home::prepare(&routing);
+    }
+
     // For a linked interactive Claude run, pre-set the session id so its
     // transcript can be tailed; otherwise the resume handle names it.
     let preset_session = if do_link && mode == Mode::Interactive && kind == BackendKind::Claude && opts.resume.is_none() {
@@ -554,11 +565,12 @@ pub async fn run(cfg: &mut Config, opts: Options) -> Result<()> {
     }
 
     // Claude theme (Dracula dark / Alucard light, auto by the user's preference).
-    // Native — writes ~/.claude/themes + selects it; never patches Claude. The guard
-    // restores the user's own theme when this session ends (any exit path). `dev`
+    // Native — writes `<config home>/themes` + selects it; never patches Claude. The
+    // guard restores the prior theme when this session ends (any exit path). `dev`
     // has no Claude themes. Held to end-of-run so plain `claude` keeps its theme.
-    let _theme_guard =
-        (kind == BackendKind::Claude).then(|| theme::apply(opts.theme.as_deref(), &cfg.code.theme));
+    // Takes the ROUTE because that is what decides which home this session reads.
+    let _theme_guard = (kind == BackendKind::Claude)
+        .then(|| theme::apply(&routing, opts.theme.as_deref(), &cfg.code.theme));
 
     banner(
         &opts,
@@ -590,6 +602,10 @@ pub async fn run(cfg: &mut Config, opts: Options) -> Result<()> {
         resume: resume_handle.clone(),
         passthrough: opts.passthrough.clone(),
     };
+    // The route also decides which config home the backend wrote its transcript in,
+    // so keep it for the pointer recorded after the child exits — the supervisor
+    // consumes `spec`. One value, read twice; never re-derived.
+    let route = spec.routing.clone();
     let launch = backend.build(&spec)?;
 
     // The session id we watch for the interactive transcript tail.
@@ -604,14 +620,14 @@ pub async fn run(cfg: &mut Config, opts: Options) -> Result<()> {
                 let transcript = outcome
                     .backend_session
                     .as_ref()
-                    .and_then(|bs| backend.transcript_path(&cwd, bs))
+                    .and_then(|bs| backend.transcript_path(&route, &cwd, bs))
                     .map(|p| p.display().to_string());
                 finalize(c, id, &outcome, status, &snapshot, &api, &who, transcript).await;
                 report_link(id);
             }
         }
         Mode::Interactive => {
-            let ok = run_interactive(&*backend, launch, client.clone(), session_id.clone(), &cwd, watch_sid).await?;
+            let ok = run_interactive(&*backend, launch, client.clone(), session_id.clone(), &route, &cwd, watch_sid).await?;
             if let (Some(c), Some(id)) = (&client, &session_id) {
                 // Interactive per-event stream arrives via the transcript tail;
                 // the resume handle here is what we pre-set / resumed.
@@ -620,7 +636,7 @@ pub async fn run(cfg: &mut Config, opts: Options) -> Result<()> {
                 let transcript = outcome
                     .backend_session
                     .as_ref()
-                    .and_then(|s| backend.transcript_path(&cwd, s))
+                    .and_then(|s| backend.transcript_path(&route, &cwd, s))
                     .map(|p| p.display().to_string());
                 // An interactive session SUSPENDS rather than completes: the
                 // transcript and its resume handle outlive the TUI, so the same
@@ -1011,6 +1027,9 @@ async fn run_interactive(
     launch: Launch,
     client: Option<SessionClient>,
     session_id: Option<String>,
+    // The route this run launched with — it names the config home the transcript
+    // is written in, so the tail must resolve against the same one.
+    route: &Route,
     cwd: &Path,
     watch_sid: Option<String>,
 ) -> Result<bool> {
@@ -1021,7 +1040,7 @@ async fn run_interactive(
     // Linked interactive per-event streaming rides the backend transcript tail.
     let stop = Arc::new(AtomicBool::new(false));
     let tail = match (&client, &session_id, &watch_sid) {
-        (Some(c), Some(id), Some(sid)) => backend.transcript_path(cwd, sid).map(|path| {
+        (Some(c), Some(id), Some(sid)) => backend.transcript_path(route, cwd, sid).map(|path| {
             tokio::spawn(tail_transcript(path, c.clone(), id.clone(), stop.clone()))
         }),
         _ => None,
@@ -1601,7 +1620,7 @@ mod tests {
         fn parse(&self, line: &str) -> Vec<Mapped> {
             Claude.parse(line)
         }
-        fn transcript_path(&self, _: &Path, _: &str) -> Option<PathBuf> {
+        fn transcript_path(&self, _: &Route, _: &Path, _: &str) -> Option<PathBuf> {
             None
         }
     }
@@ -2011,7 +2030,7 @@ mod control_tests {
         fn parse(&self, line: &str) -> Vec<Mapped> {
             Claude.parse(line)
         }
-        fn transcript_path(&self, _: &Path, _: &str) -> Option<PathBuf> {
+        fn transcript_path(&self, _: &Route, _: &Path, _: &str) -> Option<PathBuf> {
             None
         }
     }

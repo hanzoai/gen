@@ -15,13 +15,14 @@
 //! `.mcp.json` and settings/hooks out of the process env, so auto-approve never
 //! reopens the routing-bearer exfil vector.
 //!
-//! On the gateway route the model requests the real (1M) window via the `[1m]`
-//! extended-context suffix (Claude Code strips it before sending the bare id
-//! upstream). NOTE: Claude Code only LIFTS the window for models it recognizes
-//! (`claude-*`); for a custom gateway id (`enso`, `zen5`) it can't verify the
-//! window and clamps to 200K — so the `[1m]` suffix is correct-but-inert here and
-//! the Claude backend caps a custom model at 200K. The true-1M path is `dev` (which
-//! reads a model_catalog we control). Extra flags arrive only through passthrough.
+//! On the gateway route the model reaches Claude Code as a CARRIER — a `claude-*`
+//! id it recognizes — so the real (1M) window is granted instead of clamped, and
+//! a per-run `modelOverrides` overlay rewrites the carrier back to the zen id before
+//! the request leaves the process. The whole mapping lives in [`super::tier`]; a
+//! model outside it passes through with the bare-id + `[1m]` behavior. A ROUTED
+//! session runs in Hanzo's OWN config home (`~/.hanzo/claude`); `--no-route` keeps
+//! the user's `~/.claude`, because that is where the account it inherits lives (see
+//! [`super::home`]). Extra flags arrive only through passthrough.
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
@@ -30,10 +31,7 @@ use std::path::{Path, PathBuf};
 
 use super::backend::{Approval, Backend, Launch, Mode, Route, Routing, Spec};
 use super::event::{Mapped, Usage};
-
-/// Claude's standard context window; a request above it is "extended" (1M),
-/// signalled by the `[1m]` model-id suffix.
-const STANDARD_WINDOW: u64 = 200_000;
+use super::{home, tier};
 
 pub struct Claude;
 
@@ -50,6 +48,17 @@ impl Backend for Claude {
         let mut cmd = tokio::process::Command::new("claude");
         cmd.current_dir(&spec.cwd);
         let mut cleanup = Vec::new();
+
+        // A ROUTED `hanzo code claude` is not the user's own Claude Code install: it
+        // runs against its own config home, so their saved `/model` never becomes
+        // this session's identity (it OUTRANKS `ANTHROPIC_MODEL`) and Hanzo's
+        // injected tiers never leak back into their sessions. `--no-route` keeps
+        // Claude's own home, because that is where the account it was promised
+        // lives. Seeded by `run`; resolved here too because it is a pure function of
+        // the route (see [`home::relocate`]).
+        if let Some(dir) = home::relocate(&spec.routing) {
+            cmd.env("CLAUDE_CONFIG_DIR", dir);
+        }
 
         // Task (headless). The structured stream is requested ONLY when we stream
         // to cloud; otherwise the run keeps Claude's native output untouched.
@@ -132,19 +141,36 @@ impl Backend for Claude {
             Route::Via(Routing::Gateway { api, token, model, small_fast_model, context_window }) => {
                 cmd.env("ANTHROPIC_BASE_URL", api.trim_end_matches('/'));
                 cmd.env("ANTHROPIC_AUTH_TOKEN", token);
-                // Name the model; request the real (1M) window via the `[1m]`
-                // suffix for a large-context model. Claude Code strips `[1m]`
-                // before sending the id upstream, so it is safe on a custom id.
-                cmd.env("ANTHROPIC_MODEL", gateway_model(model, *context_window));
-                // The background/fast model via the CURRENT var; `ANTHROPIC_SMALL_FAST_MODEL`
-                // is deprecated, so set the successor and clear the old one so a
-                // stale shell export can't shadow it.
-                cmd.env("ANTHROPIC_DEFAULT_HAIKU_MODEL", small_fast_model);
+                // The model, every tiering slot Claude resolves subagents/`/compact`
+                // through, and the picker's labels — one pure map from `tier`, so
+                // carrier mapping and slot precedence have exactly one home.
+                cmd.envs(tier::env(model, small_fast_model, *context_window));
+                // `ANTHROPIC_SMALL_FAST_MODEL` is deprecated AND not rewritten by
+                // `modelOverrides`, so it could only ever carry a stale shell value
+                // past the mapping — clear it and let the HAIKU slot answer.
                 cmd.env_remove("ANTHROPIC_SMALL_FAST_MODEL");
                 // Surface the gateway's own catalog in `/model` (harmless when the
                 // gateway serves no `claude-*` ids; future-proof when it does).
                 cmd.env("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY", "1");
                 cmd.env_remove("ANTHROPIC_API_KEY");
+                // The carrier⇒zen map, as a per-RUN settings overlay. Claude budgets
+                // the context window from the carrier and sends the zen id, so the
+                // gateway is served what it actually has. It rides the run and not
+                // the config home because it is true only of THIS route: persisted,
+                // it would rewrite a `--no-route` or direct-Anthropic session's model
+                // to a zen id and 404 against api.anthropic.com. Model ids only — no
+                // secret ever reaches argv.
+                cmd.arg("--settings")
+                    .arg(json!({ "modelOverrides": tier::overrides() }).to_string());
+                // Correct the identity the CARRIER borrows. Claude Code is handed a
+                // `claude-*` id to budget from, so its base prompt has the model
+                // introduce itself as that model. An APPEND (never `--system-prompt`)
+                // keeps the harness's own tool-use/safety/coding prompt intact and
+                // rewrites only who it says it is. Applies in `--ask` too: identity is
+                // not a permission bypass.
+                if let Some(line) = tier::identity(model) {
+                    cmd.arg("--append-system-prompt").arg(line);
+                }
             }
             // Direct Anthropic: the user's own key on the default endpoint
             // (api.anthropic.com). Clear BASE_URL + AUTH_TOKEN so nothing redirects
@@ -201,46 +227,12 @@ impl Backend for Claude {
         }
     }
 
-    fn transcript_path(&self, cwd: &Path, backend_session_id: &str) -> Option<PathBuf> {
-        // Claude Code stores transcripts at
-        // ~/.claude/projects/<cwd-with-slashes-as-dashes>/<session-id>.jsonl.
-        let home = dirs::home_dir()?;
-        let slug: String = cwd
-            .display()
-            .to_string()
-            .chars()
-            .map(|c| if c == '/' || c == '\\' { '-' } else { c })
-            .collect();
-        Some(
-            home.join(".claude")
-                .join("projects")
-                .join(slug)
-                .join(format!("{backend_session_id}.jsonl")),
-        )
+    fn transcript_path(&self, route: &Route, cwd: &Path, backend_session_id: &str) -> Option<PathBuf> {
+        // Claude writes transcripts under `$CLAUDE_CONFIG_DIR/projects/`, so this
+        // must read the SAME home the launch sets — otherwise the cloud pointer and
+        // the interactive tail both name a file that never exists.
+        home::transcript(route, cwd, backend_session_id)
     }
-}
-
-/// The `ANTHROPIC_MODEL` value for the gateway route: the bare id, plus the `[1m]`
-/// extended-context suffix when the run requests a window beyond the standard 200K
-/// AND the model is a large-context one. Claude Code strips `[1m]` before sending
-/// the id upstream (the gateway receives the bare id), so the suffix is safe even
-/// on a custom id — but Claude Code only LIFTS the client window for a model it
-/// recognizes (`claude-*`), so on a custom gateway id the suffix is inert today and
-/// the window stays 200K (see the module docs). Short-context variants
-/// (`*-flash`, `*-mini` — the background/fast models) never get the suffix.
-fn gateway_model(model: &str, context_window: u64) -> String {
-    if context_window > STANDARD_WINDOW && !is_short_context(model) {
-        format!("{model}[1m]")
-    } else {
-        model.to_string()
-    }
-}
-
-/// A short-context model variant (`*-flash`, `*-mini`) — the small/fast background
-/// models, which must never request the 1M window.
-fn is_short_context(model: &str) -> bool {
-    let m = model.to_ascii_lowercase();
-    m.contains("flash") || m.contains("mini")
 }
 
 /// The `--mcp-config` document adding Hanzo's stdio server (Claude requires an
@@ -516,9 +508,10 @@ mod tests {
                 .map(|v| v.to_string_lossy().to_string())
                 .unwrap()
         };
-        // Large model + 1M window -> suffix.
+        // Large model + 1M window -> suffix. An UNTIERED id keeps this bare-id
+        // behavior; a tiered one rides its carrier instead (see the tier tests).
         assert_eq!(model_of("enso", 1_000_000), "enso[1m]");
-        assert_eq!(model_of("zen5-coder", 1_000_000), "zen5-coder[1m]");
+        assert_eq!(model_of("enso-pro", 1_000_000), "enso-pro[1m]");
         // Short-context variants never get it, even at a 1M window.
         assert_eq!(model_of("enso-flash", 1_000_000), "enso-flash");
         assert_eq!(model_of("zen5-mini", 1_000_000), "zen5-mini");
@@ -628,15 +621,6 @@ mod tests {
     fn parse_error_result_is_not_ok() {
         let line = r#"{"type":"result","subtype":"error_during_execution","is_error":true}"#;
         assert!(matches!(Claude.parse(line).last().unwrap(), Mapped::Terminal{ok:false, ..}));
-    }
-
-    #[test]
-    fn transcript_path_uses_dash_slug() {
-        let p = Claude
-            .transcript_path(&PathBuf::from("/home/z/proj"), "sid-1")
-            .unwrap();
-        let s = p.display().to_string();
-        assert!(s.ends_with("/.claude/projects/-home-z-proj/sid-1.jsonl"), "got {s}");
     }
 
     /// The `--mcp-config` file paths Claude is handed, in order.
@@ -823,6 +807,151 @@ mod tests {
         }
         // The bearer rides in env only — never argv.
         assert!(!args.iter().any(|a| a.contains("SECRET-BEARER")), "token must not be in argv");
+    }
+
+    /// The resolved child env for a launch, as a map (set values only).
+    fn env_of(l: &Launch) -> std::collections::HashMap<String, String> {
+        l.command
+            .as_std()
+            .get_envs()
+            .filter_map(|(k, v)| Some((k.to_string_lossy().to_string(), v?.to_string_lossy().to_string())))
+            .collect()
+    }
+
+    fn launch_with(model: &str, small_fast: &str, cw: u64) -> Launch {
+        let mut s = spec(Mode::Headless);
+        s.routing = Route::Via(Routing::Gateway {
+            api: "https://api.hanzo.ai".into(),
+            token: "JWT".into(),
+            model: model.into(),
+            small_fast_model: small_fast.into(),
+            context_window: cw,
+        });
+        Claude.build(&s).unwrap()
+    }
+
+    /// A zen tier rides its CARRIER — a model id Claude Code recognizes — so the
+    /// client grants the real 1M context budget instead of clamping a custom id to
+    /// 128K/200K. `modelOverrides` in the seeded settings maps the carrier back to
+    /// the zen id before the request leaves the client, so the gateway still serves
+    /// `zen5-pro`.
+    #[test]
+    fn a_zen_tier_rides_its_recognized_carrier() {
+        let env = env_of(&launch_with("zen5-pro", "zen5-flash", 1_000_000));
+        assert_eq!(env.get("ANTHROPIC_MODEL").map(String::as_str), Some("claude-opus-4-8[1m]"));
+        let env = env_of(&launch_with("zen5", "zen5-flash", 1_000_000));
+        assert_eq!(env.get("ANTHROPIC_MODEL").map(String::as_str), Some("claude-sonnet-4-6[1m]"));
+        let env = env_of(&launch_with("zen5-coder", "zen5-flash", 1_000_000));
+        assert_eq!(env.get("ANTHROPIC_MODEL").map(String::as_str), Some("claude-sonnet-5"));
+        // A tier with no carrier (the short-context flash tier) is pinned directly.
+        let env = env_of(&launch_with("zen5-flash", "zen5-flash", 1_000_000));
+        assert_eq!(env.get("ANTHROPIC_MODEL").map(String::as_str), Some("zen5-flash"));
+    }
+
+    /// Claude's own tiering (subagents, `/compact`, the background model) resolves
+    /// through the `ANTHROPIC_DEFAULT_*_MODEL` slots. Unset, they fall back to
+    /// `claude-*` ids the gateway does not serve — so every subagent 400s. The
+    /// gateway route fills every slot, with the picker's branding.
+    #[test]
+    fn every_tiering_slot_is_named_and_branded() {
+        let env = env_of(&launch_with("zen5", "zen5-flash", 1_000_000));
+        assert_eq!(env.get("ANTHROPIC_DEFAULT_SONNET_MODEL").map(String::as_str), Some("claude-sonnet-4-6[1m]"));
+        assert_eq!(env.get("ANTHROPIC_DEFAULT_OPUS_MODEL").map(String::as_str), Some("claude-opus-4-8[1m]"));
+        assert_eq!(env.get("ANTHROPIC_DEFAULT_FABLE_MODEL").map(String::as_str), Some("claude-fable-5[1m]"));
+        assert_eq!(env.get("ANTHROPIC_DEFAULT_HAIKU_MODEL").map(String::as_str), Some("zen5-flash"));
+        assert_eq!(env.get("ANTHROPIC_DEFAULT_SONNET_MODEL_NAME").map(String::as_str), Some("Zen5"));
+        assert_eq!(env.get("ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME").map(String::as_str), Some("Zen5 Flash"));
+        assert!(env.contains_key("ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION"));
+    }
+
+    /// A small/fast model OUTSIDE the tier table still fills the slot, but carries
+    /// no label — the picker must never name a model the slot does not hold.
+    #[test]
+    fn an_untiered_small_fast_model_fills_its_slot_unlabelled() {
+        let env = env_of(&launch_with("enso", "enso-flash", 1_000_000));
+        assert_eq!(env.get("ANTHROPIC_DEFAULT_HAIKU_MODEL").map(String::as_str), Some("enso-flash"));
+        assert!(!env.contains_key("ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME"), "an untiered id must not borrow a tier's label");
+        // An untiered main model keeps the bare-id + `[1m]` behavior.
+        assert_eq!(env.get("ANTHROPIC_MODEL").map(String::as_str), Some("enso[1m]"));
+    }
+
+    /// Opting back to the standard window drops the extended-context suffix from
+    /// the carrier too — the setting governs every model, tiered or not.
+    #[test]
+    fn standard_window_drops_the_suffix_from_a_carrier() {
+        let env = env_of(&launch_with("zen5-pro", "zen5-flash", 200_000));
+        assert_eq!(env.get("ANTHROPIC_MODEL").map(String::as_str), Some("claude-opus-4-8"));
+    }
+
+    /// A ROUTED `hanzo code claude` is NOT the user's own Claude Code install: it
+    /// runs against its own config home, so the user's saved `/model` never leaks in
+    /// as this session's identity and Hanzo's injected tiers never leak back out.
+    #[test]
+    fn a_routed_session_runs_in_hanzos_own_claude_config_home() {
+        let env = env_of(&launch_with("zen5", "zen5-flash", 1_000_000));
+        let dir = env.get("CLAUDE_CONFIG_DIR").expect("CLAUDE_CONFIG_DIR must relocate the config home");
+        assert!(dir.ends_with("/.hanzo/claude"), "got {dir}");
+        assert!(!dir.ends_with("/.claude"), "must never be the user's own Claude home");
+    }
+
+    /// `--no-route` promises Claude its OWN account — and on this platform that
+    /// account is a FILE in the config home (`~/.claude/.credentials.json`).
+    /// Relocating the home would hand the user an empty home and a login prompt
+    /// instead of the pass-through, so a hands-off route must set no
+    /// `CLAUDE_CONFIG_DIR` at all.
+    #[test]
+    fn a_no_route_session_keeps_claudes_own_config_home() {
+        for route in [Route::Inherit, Route::FailClosed] {
+            let mut s = spec(Mode::Interactive);
+            s.routing = route.clone();
+            let env = env_of(&Claude.build(&s).unwrap());
+            assert!(
+                !env.contains_key("CLAUDE_CONFIG_DIR"),
+                "{route:?} must not relocate the home — the account it inherits lives in the old one"
+            );
+        }
+    }
+
+    /// The transcript pointer must follow the config home the run ACTUALLY used —
+    /// Claude writes transcripts under `$CLAUDE_CONFIG_DIR/projects/`, so a path
+    /// built from the other home names a file that never exists (a dead cloud
+    /// pointer and a tail that reads nothing). Both routes, one resolver.
+    #[test]
+    fn transcript_path_follows_the_config_home_of_its_route() {
+        let at = |r: &Route| {
+            Claude
+                .transcript_path(r, &PathBuf::from("/home/z/proj"), "sid-1")
+                .unwrap()
+                .display()
+                .to_string()
+        };
+        let routed = at(&Route::Via(Routing::Gateway {
+            api: "https://api.hanzo.ai".into(),
+            token: "JWT".into(),
+            model: "zen5".into(),
+            small_fast_model: "zen5-flash".into(),
+            context_window: 1_000_000,
+        }));
+        assert!(routed.ends_with("/.hanzo/claude/projects/-home-z-proj/sid-1.jsonl"), "got {routed}");
+        let inherited = at(&Route::Inherit);
+        assert!(inherited.ends_with("/.claude/projects/-home-z-proj/sid-1.jsonl"), "got {inherited}");
+    }
+
+    /// A zen tier rides a `claude-*` CARRIER, so Claude Code's base prompt would
+    /// have the model introduce itself as that carrier. The gateway route appends
+    /// (never replaces) an identity line naming the real tier — the harness keeps
+    /// its own tool-use/safety prompt. An id with no carrier claims nothing.
+    #[test]
+    fn a_carried_model_is_told_which_model_it_actually_is() {
+        let args = argv(&launch_with("zen5-pro", "zen5-flash", 1_000_000));
+        let i = args.iter().position(|a| a == "--append-system-prompt").expect("carried model must correct its identity");
+        let line = &args[i + 1];
+        assert!(line.contains("Zen5 Pro"), "must name the tier it really is: {line}");
+        assert!(line.contains("zen5-pro"), "must name the served id: {line}");
+        assert!(!line.contains("claude-opus"), "must not repeat the carrier back to the model: {line}");
+        // An untiered id rides no carrier, so nothing is claimed on its behalf.
+        let plain = argv(&launch_with("enso", "enso-flash", 1_000_000));
+        assert!(!plain.iter().any(|a| a == "--append-system-prompt"), "an uncarried model needs no correction");
     }
 
     /// The three `ANTHROPIC_*` vars Claude reads for model auth.

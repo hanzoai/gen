@@ -1,33 +1,43 @@
 //! Claude theme policy for `hanzo code claude` — NATIVE, no binary patching.
 //!
-//! Claude Code loads custom themes from `~/.claude/themes/*.json` (its own
+//! Claude Code loads custom themes from `<config home>/themes/*.json` (its own
 //! `loadCustomThemes`) and selects one via `theme: "custom:<name>"` in
-//! `~/.claude/settings.json` (built-ins are the bare name). Hanzo owns the theme
-//! DATA (bundled JSON in Claude's schema) and drops it + selects it. Nothing
+//! `<config home>/settings.json` (built-ins are the bare name). Hanzo owns the
+//! theme DATA (bundled JSON in Claude's schema) and drops it + selects it. Nothing
 //! patches the Claude binary — a wrong/absent theme is ignored, never a crash.
 //!
-//! Wrapper hygiene: we SAVE the user's current theme, apply ours for the wrapped
-//! session, and RESTORE it when the session ends (RAII, any exit path). So plain
-//! `claude` keeps the user's own theme.
+//! **The home is the ROUTE's** ([`super::home`]), never a fixed `~/.claude`. A
+//! routed session reads `~/.hanzo/claude`, so writing the theme to the user's own
+//! home would be doubly wrong: the session it is meant for never sees it, and the
+//! install it was never meant for is mutated.
+//!
+//! Wrapper hygiene: we SAVE the current theme, apply ours for the wrapped session,
+//! and RESTORE it when the session ends (RAII, any exit path). That matters most on
+//! the hands-off route, where the home IS the user's, so plain `claude` keeps their
+//! own theme.
 //!
 //! Auto light/dark: with the default `code.theme = "auto"`, we honor the user's
 //! light/dark preference — Alucard (light Dracula) when their theme is a light
 //! one, Dracula (dark) otherwise. Presets live in hanzoai/themes.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+use super::backend::Route;
+use super::home;
 
 const DRACULA: &str = include_str!("../../../assets/themes/claude/dracula.json");
 const ALUCARD: &str = include_str!("../../../assets/themes/claude/alucard.json");
 
 /// Restores the previously-selected Claude theme when dropped (wrapper hygiene).
 /// Holding `_guard` across the backend launch restores on ANY exit — normal,
-/// error, or panic.
-pub struct Restore(Option<String>);
+/// error, or panic. It carries the home it read the theme FROM, so the restore
+/// cannot land anywhere else than the write did.
+pub struct Restore(Option<(PathBuf, String)>);
 
 impl Drop for Restore {
     fn drop(&mut self) {
-        if let Some(theme) = self.0.take() {
-            set_theme_raw(&theme);
+        if let Some((home, theme)) = self.0.take() {
+            set_theme_raw(&home, &theme);
         }
     }
 }
@@ -43,13 +53,15 @@ pub fn effective(flag: Option<&str>, persisted: &str) -> Option<String> {
 }
 
 /// Apply the effective theme for a Claude session and return a guard that restores
-/// the user's prior theme on drop. "auto" picks Alucard for a light prior theme,
-/// Dracula otherwise. Best-effort — never blocks or fails the session.
-pub fn apply(flag: Option<&str>, persisted: &str) -> Restore {
-    let prev = current_theme();
-    let Some(mut name) = effective(flag, persisted) else {
-        return Restore(None); // theming off: nothing applied, nothing to restore
+/// the prior theme on drop. "auto" picks Alucard for a light prior theme, Dracula
+/// otherwise. `route` names the config home this session actually reads, so the
+/// theme lands where the session will look for it. Best-effort — never blocks or
+/// fails the session.
+pub fn apply(route: &Route, flag: Option<&str>, persisted: &str) -> Restore {
+    let (Some(home), Some(mut name)) = (home::of(route), effective(flag, persisted)) else {
+        return Restore(None); // theming off (or no $HOME): nothing applied, nothing to restore
     };
+    let prev = current_theme(&home);
     if name == "auto" {
         name = if prev.as_deref().map(is_light_ref).unwrap_or(false) {
             "alucard".into()
@@ -58,14 +70,14 @@ pub fn apply(flag: Option<&str>, persisted: &str) -> Restore {
         };
     }
     // Drop the bundled preset's file so Claude can load it (user-supplied names
-    // are assumed already present in ~/.claude/themes).
+    // are assumed already present in the home's themes/).
     match name.as_str() {
-        "dracula" => write_theme("dracula", DRACULA),
-        "alucard" => write_theme("alucard", ALUCARD),
+        "dracula" => write_theme(&home, "dracula", DRACULA),
+        "alucard" => write_theme(&home, "alucard", ALUCARD),
         _ => {}
     }
-    set_theme_raw(&theme_ref(&name));
-    Restore(prev)
+    set_theme_raw(&home, &theme_ref(&name));
+    Restore(prev.map(|t| (home, t)))
 }
 
 /// Claude's built-in themes are selected by bare name; a custom theme (a file in
@@ -93,24 +105,24 @@ fn is_light_ref(theme: &str) -> bool {
     t.starts_with("light") || t == "alucard"
 }
 
-fn write_theme(name: &str, body: &str) {
-    let Some(dir) = themes_dir() else { return };
+fn write_theme(home: &Path, name: &str, body: &str) {
+    let dir = home.join("themes");
     let _ = std::fs::create_dir_all(&dir);
     let _ = std::fs::write(dir.join(format!("{name}.json")), body);
 }
 
-/// Read Claude's currently-selected theme (raw settings value), if any.
-fn current_theme() -> Option<String> {
-    let path = claude_settings()?;
-    let cfg: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).ok()?).ok()?;
+/// Read the currently-selected theme (raw settings value) from `home`, if any.
+fn current_theme(home: &Path) -> Option<String> {
+    let cfg: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(settings(home)).ok()?).ok()?;
     cfg.get("theme")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
 }
 
-/// Write the exact `theme` value into settings.json, preserving other settings.
-fn set_theme_raw(value: &str) {
-    let Some(path) = claude_settings() else { return };
+/// Write the exact `theme` value into `home`'s settings.json, preserving the rest.
+fn set_theme_raw(home: &Path, value: &str) {
+    let path = settings(home);
     let mut cfg: serde_json::Value = std::fs::read_to_string(&path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
@@ -123,14 +135,8 @@ fn set_theme_raw(value: &str) {
     }
 }
 
-fn home() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
-}
-fn claude_settings() -> Option<PathBuf> {
-    Some(home()?.join(".claude").join("settings.json"))
-}
-fn themes_dir() -> Option<PathBuf> {
-    Some(home()?.join(".claude").join("themes"))
+fn settings(home: &Path) -> PathBuf {
+    home.join("settings.json")
 }
 
 #[cfg(test)]
