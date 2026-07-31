@@ -84,6 +84,24 @@ impl SessionClient {
         Ok(())
     }
 
+    /// Publish where this session's live terminal can be WATCHED, or withdraw it
+    /// with `None`. Cloud stores the address and never the connection, so the
+    /// bytes keep flowing machine-to-viewer even though the roster lives there.
+    ///
+    /// The URL must be https — cloud refuses anything else, because the console
+    /// frames this value and any other scheme is a way to get a javascript: or
+    /// file: URL rendered on a signed-in page.
+    pub async fn set_terminal(&self, id: &str, url: Option<&str>) -> Result<()> {
+        let body = json!({ "terminal": url.unwrap_or("") });
+        self.send(
+            reqwest::Method::PATCH,
+            &format!("/v1/agents/sessions/{id}"),
+            Some(&body),
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Fetch a session's current server-side status (for resume decisions).
     pub async fn get(&self, id: &str) -> Result<Info> {
         let v = self.send(reqwest::Method::GET, &format!("/v1/agents/sessions/{id}"), None).await?;
