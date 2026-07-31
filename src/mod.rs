@@ -395,7 +395,7 @@ pub async fn run(cfg: &mut Config, opts: Options) -> Result<()> {
     // Auth: the ACTIVE identity's hanzo.id bearer from the OS keychain (never
     // argv/logged). The identity rides along because the cloud session this run
     // registers is org-scoped to its `owner` — the two must not drift.
-    let (identity, bearer) = match store::active_token(cfg, &opts.brand)? {
+    let (identity, bearer) = match store::active_token(cfg, &opts.brand).await? {
         Some((id, t)) => (Some(id), Some(t.access_token)),
         None => (None, None),
     };
@@ -405,7 +405,7 @@ pub async fn run(cfg: &mut Config, opts: Options) -> Result<()> {
 
     let mut do_link = effective_link(opts.link, opts.no_link, cfg.code.link);
     if do_link && bearer.is_none() {
-        warn("not signed in — run `hanzo auth login` to link this session. Continuing locally (no cloud stream).");
+        crate::warn("not signed in — run `hanzo auth login` to link this session. Continuing locally (no cloud stream).");
         do_link = false;
     }
 
@@ -434,7 +434,7 @@ pub async fn run(cfg: &mut Config, opts: Options) -> Result<()> {
             if !rec.repo.is_empty() {
                 let now = context::Repo::capture(&cwd);
                 if now.root != rec.repo.root || now.remote != rec.repo.remote {
-                    warn(&format!(
+                    crate::warn(&format!(
                         "working dir {} is a different repository than when session {id} was recorded — resuming anyway",
                         rec.cwd
                     ));
@@ -446,7 +446,7 @@ pub async fn run(cfg: &mut Config, opts: Options) -> Result<()> {
             let attach = match cloud_resume_block(&rec.identity, identity.as_ref(), &rec.api, &api) {
                 None => Some(id.clone()),
                 Some(note) => {
-                    warn(&note);
+                    crate::warn(&note);
                     None
                 }
             };
@@ -477,7 +477,7 @@ pub async fn run(cfg: &mut Config, opts: Options) -> Result<()> {
     let mcp = if opts.mcp && settings.mcp.unwrap_or(true) {
         let m = resolve_mcp(&cwd);
         if m.is_none() {
-            warn("hanzo-mcp not found (install `hanzo-mcp` or `uv`) — continuing without the Hanzo toolset.");
+            crate::warn("hanzo-mcp not found (install `hanzo-mcp` or `uv`) — continuing without the Hanzo toolset.");
         }
         m
     } else {
@@ -494,7 +494,7 @@ pub async fn run(cfg: &mut Config, opts: Options) -> Result<()> {
     // what makes the outcome `FailClosed` rather than `Inherit`.
     if matches!(routing, Route::FailClosed) {
         if let Some(p) = cfg.auth.provider.as_deref() {
-            warn(&format!(
+            crate::warn(&format!(
                 "selected provider `{p}` has no usable key — run `hanzo auth login` (or pass `--no-route` \
                  to use the backend's own account). Model calls will NOT route, and the child's \
                  inherited model credentials are cleared."
@@ -540,7 +540,7 @@ pub async fn run(cfg: &mut Config, opts: Options) -> Result<()> {
             Err(e) => {
                 // Fail-open for availability: never block the dev's work on a
                 // cloud hiccup — degrade to a local (unlinked) run.
-                warn(&format!("could not register session ({e}); continuing locally."));
+                crate::warn(&format!("could not register session ({e}); continuing locally."));
             }
         }
     }
@@ -689,7 +689,7 @@ pub(crate) async fn resolve_cloud_session(
             }
             // Unverified. Do not assert a lineage we could not confirm.
             Err(e) => {
-                warn(&format!(
+                crate::warn(&format!(
                     "could not verify session {old} ({e}); starting a fresh cloud session with no \
                      resume lineage."
                 ));
@@ -731,7 +731,7 @@ impl Sink {
                 }
                 if let (Some(c), Some(id)) = (&self.client, &self.session_id) {
                     if let Err(e) = c.event(id, kind, payload).await {
-                        warn(&format!("stream event dropped: {e}"));
+                        crate::warn(&format!("stream event dropped: {e}"));
                     }
                 }
             }
@@ -1238,10 +1238,6 @@ fn session_title(opts: &Options) -> String {
         Some(t) => t.chars().take(120).collect(),
         None => "interactive coding session".to_string(),
     }
-}
-
-fn warn(msg: &str) {
-    eprintln!("{} {}", "warning:".yellow().bold(), msg);
 }
 
 fn spawn_err(e: std::io::Error) -> anyhow::Error {
