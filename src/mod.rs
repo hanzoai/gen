@@ -26,7 +26,7 @@ mod control;
 mod dev;
 mod event;
 mod home;
-mod session;
+pub mod session;
 mod settings;
 pub mod target;
 mod theme;

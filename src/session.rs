@@ -84,6 +84,31 @@ impl SessionClient {
         Ok(())
     }
 
+    /// Register a session for a linked SHELL. Same registry, same org scoping as
+    /// `register`; it just carries the execution context a shell knows about
+    /// itself — which machine and which directory — so the console can group it.
+    pub async fn register_shell(
+        &self,
+        agent: &str,
+        title: &str,
+        host: &str,
+        cwd: &str,
+    ) -> Result<Registered> {
+        let body = json!({
+            "agent": agent, "title": title, "host": host, "cwd": cwd,
+            "status": Status::Running.as_str(),
+        });
+        let v = self
+            .send(reqwest::Method::POST, "/v1/agents/sessions", Some(&body))
+            .await?;
+        let id = v
+            .get("id")
+            .and_then(Value::as_str)
+            .context("register response missing id")?
+            .to_string();
+        Ok(Registered { id })
+    }
+
     /// Publish where this session's live terminal can be WATCHED, or withdraw it
     /// with `None`. Cloud stores the address and never the connection, so the
     /// bytes keep flowing machine-to-viewer even though the roster lives there.
