@@ -1,6 +1,10 @@
-//! The `dev` (Codex fork) backend.
+//! Our own coding agent, `dev` (hanzoai/dev) — the DEFAULT backend — and
+//! `codex`, which `dev` began as a fork of. Both take the same `-c` config
+//! overrides and emit the same JSONL event stream, so one [`Agent`] driver runs
+//! either; the program name is the only difference, and each reads its own
+//! config home.
 //!
-//! Headless runs stream the v2 `ThreadEvent` JSONL via `dev exec --json`; MCP is
+//! Headless runs stream the v2 `ThreadEvent` JSONL via `<agent> exec --json`; MCP is
 //! attached with `-c mcp_servers.hanzo.*` overrides (ADDITIVE — the user's own
 //! servers, config and `dev login` are untouched, since we never repoint
 //! `CODEX_HOME`); model calls route through the native `hanzo` provider
@@ -26,7 +30,22 @@ use std::path::{Path, PathBuf};
 use super::backend::{Approval, Backend, Launch, Mode, Route, Routing, Spec};
 use super::event::{cap, clamp, Mapped, Usage};
 
-pub struct Dev;
+/// The driver for the two agents that speak this protocol: our own `dev`
+/// (hanzoai/dev) and `codex`, which ours began as a fork of. They take the same
+/// `-c` config overrides and emit the same JSONL event stream, so ONE driver
+/// serves both — they differ only in the program they exec and therefore in the
+/// config home each reads. Adding a third program here is a const, not a file.
+pub struct Agent {
+    program: &'static str,
+}
+
+impl Agent {
+    /// Our own coding agent — the default backend.
+    pub const DEV: Agent = Agent { program: "dev" };
+    /// `codex`, driven as its own backend. NOT an alias of `dev`: a user who
+    /// names it gets that program, or a clear failure if it is not installed.
+    pub const CODEX: Agent = Agent { program: "codex" };
+}
 
 /// The gateway origin the native `hanzo` provider already targets; when the
 /// active network matches it we need no provider override, only the token env.
@@ -37,17 +56,17 @@ const NATIVE_API: &str = "https://api.hanzo.ai";
 /// shrinks a model below codex's own default.
 const CODEX_FALLBACK_WINDOW: u64 = 272_000;
 
-impl Backend for Dev {
+impl Backend for Agent {
     fn label(&self) -> &'static str {
-        "dev"
+        self.program
     }
 
     fn version(&self) -> Option<String> {
-        super::backend::backend_version("dev")
+        super::backend::backend_version(self.program)
     }
 
     fn build(&self, spec: &Spec) -> Result<Launch> {
-        let mut cmd = tokio::process::Command::new("dev");
+        let mut cmd = tokio::process::Command::new(self.program);
         cmd.current_dir(&spec.cwd);
 
         let mut args: Vec<String> = Vec::new();
@@ -299,6 +318,24 @@ fn model_catalog(model: &str, context_window: u64) -> String {
             "slug": model,
             "context_window": context_window,
             "max_context_window": context_window,
+            // The rest of the entry is REQUIRED by the agent's catalog parser —
+            // it rejects the whole file on the first missing field, and that
+            // took the SESSION down with it rather than merely losing the
+            // window. These are inert defaults; only the two windows above
+            // carry meaning for us. Unknown keys are ignored, so one superset
+            // satisfies both agents' slightly different schemas.
+            "display_name": model,
+            "base_instructions": "",
+            "supported_reasoning_levels": [],
+            "supports_reasoning_summaries": false,
+            "supports_parallel_tool_calls": false,
+            "experimental_supported_tools": [],
+            "support_verbosity": false,
+            "shell_type": "default",
+            "truncation_policy": { "mode": "tokens", "limit": context_window },
+            "visibility": "list",
+            "supported_in_api": true,
+            "priority": 0,
         }]
     })
     .to_string()
@@ -356,7 +393,7 @@ mod tests {
 
     #[test]
     fn headless_exec_json_with_native_provider_needs_only_token_env() {
-        let l = Dev.build(&spec(Mode::Headless, "https://api.hanzo.ai")).unwrap();
+        let l = Agent::DEV.build(&spec(Mode::Headless, "https://api.hanzo.ai")).unwrap();
         let args = argv(&l);
         assert_eq!(&args[0..2], &["exec", "--json"]);
         assert_eq!(args.last().unwrap(), "do it"); // prompt is the trailing positional
@@ -380,7 +417,7 @@ mod tests {
 
     #[test]
     fn custom_network_api_defines_a_full_provider() {
-        let l = Dev.build(&spec(Mode::Headless, "http://localhost:3690")).unwrap();
+        let l = Agent::DEV.build(&spec(Mode::Headless, "http://localhost:3690")).unwrap();
         let args = argv(&l);
         assert!(args.iter().any(|a| a == r#"model_providers.hanzocode.base_url="http://localhost:3690/v1""#));
         assert!(args.iter().any(|a| a == r#"model_providers.hanzocode.wire_api="responses""#));
@@ -394,7 +431,7 @@ mod tests {
     fn openai_key_routes_dev_directly_via_env() {
         let mut s = spec(Mode::Headless, "https://api.hanzo.ai");
         s.routing = Route::Via(Routing::OpenAI { key: "sk-openai-SECRET".into() });
-        let l = Dev.build(&s).unwrap();
+        let l = Agent::DEV.build(&s).unwrap();
         let args = argv(&l);
         assert_eq!(envmap(&l).get("OPENAI_API_KEY").map(String::as_str), Some("sk-openai-SECRET"));
         // Direct: no Hanzo gateway provider override, no HANZO_USER_KEY.
@@ -411,7 +448,7 @@ mod tests {
     /// fixed analogously — here the resolved built-in default (`enso`).
     #[test]
     fn gateway_route_names_the_resolved_model() {
-        let l = Dev.build(&spec(Mode::Headless, "https://api.hanzo.ai")).unwrap();
+        let l = Agent::DEV.build(&spec(Mode::Headless, "https://api.hanzo.ai")).unwrap();
         assert!(argv(&l).iter().any(|a| a == r#"model="enso""#), "gateway route must set -c model=<catalog id>");
     }
 
@@ -427,7 +464,7 @@ mod tests {
             small_fast_model: "enso-flash".into(),
             context_window: 1_000_000,
         });
-        let l = Dev.build(&s).unwrap();
+        let l = Agent::DEV.build(&s).unwrap();
         assert!(argv(&l).iter().any(|a| a == r#"model="enso""#), "gateway route must honor an explicit model");
     }
 
@@ -435,7 +472,7 @@ mod tests {
     fn headless_resume_uses_exec_resume_with_sid_before_prompt() {
         let mut s = spec(Mode::Headless, "https://api.hanzo.ai");
         s.resume = Some("thread-uuid".into());
-        let l = Dev.build(&s).unwrap();
+        let l = Agent::DEV.build(&s).unwrap();
         let args = argv(&l);
         assert_eq!(&args[0..3], &["exec", "resume", "--json"]);
         let sid = args.iter().position(|a| a == "thread-uuid").unwrap();
@@ -448,7 +485,7 @@ mod tests {
         let mut s = spec(Mode::Interactive, "https://api.hanzo.ai");
         s.task = None;
         s.resume = Some("tid".into());
-        let l = Dev.build(&s).unwrap();
+        let l = Agent::DEV.build(&s).unwrap();
         let args = argv(&l);
         assert_eq!(args[0], "resume");
         assert!(args.iter().any(|a| a == "tid"));
@@ -457,16 +494,16 @@ mod tests {
 
     #[test]
     fn parse_thread_started_is_backend_session() {
-        let out = Dev.parse(r#"{"type":"thread.started","thread_id":"th-1"}"#);
+        let out = Agent::DEV.parse(r#"{"type":"thread.started","thread_id":"th-1"}"#);
         assert!(matches!(&out[0], Mapped::BackendSession(s) if s == "th-1"));
     }
 
     #[test]
     fn parse_agent_message_and_command_execution() {
-        let msg = Dev.parse(r#"{"type":"item.completed","item":{"id":"i1","type":"agent_message","text":"hi"}}"#);
+        let msg = Agent::DEV.parse(r#"{"type":"item.completed","item":{"id":"i1","type":"agent_message","text":"hi"}}"#);
         assert!(matches!(&msg[0], Mapped::Event{kind:Kind::Message, payload} if payload["text"]=="hi"));
 
-        let cmd = Dev.parse(r#"{"type":"item.completed","item":{"id":"i2","type":"command_execution","command":"ls -la","aggregated_output":"a\nb","exit_code":0,"status":"completed"}}"#);
+        let cmd = Agent::DEV.parse(r#"{"type":"item.completed","item":{"id":"i2","type":"command_execution","command":"ls -la","aggregated_output":"a\nb","exit_code":0,"status":"completed"}}"#);
         let Mapped::Event{kind, payload} = &cmd[0] else { panic!() };
         assert_eq!(*kind, Kind::ToolCall);
         assert_eq!(payload["name"], "shell");
@@ -476,13 +513,13 @@ mod tests {
 
     #[test]
     fn parse_mcp_and_collab_and_turn_usage() {
-        let mcp = Dev.parse(r#"{"type":"item.completed","item":{"id":"i","type":"mcp_tool_call","server":"hanzo","tool":"fs_read","arguments":{"path":"x"},"status":"completed"}}"#);
+        let mcp = Agent::DEV.parse(r#"{"type":"item.completed","item":{"id":"i","type":"mcp_tool_call","server":"hanzo","tool":"fs_read","arguments":{"path":"x"},"status":"completed"}}"#);
         assert!(matches!(&mcp[0], Mapped::Event{kind:Kind::ToolCall, payload} if payload["name"]=="hanzo/fs_read"));
 
-        let collab = Dev.parse(r#"{"type":"item.completed","item":{"id":"i","type":"collab_tool_call","tool":"spawn","receiver_thread_ids":["t2"],"prompt":"go"}}"#);
+        let collab = Agent::DEV.parse(r#"{"type":"item.completed","item":{"id":"i","type":"collab_tool_call","tool":"spawn","receiver_thread_ids":["t2"],"prompt":"go"}}"#);
         assert!(matches!(&collab[0], Mapped::Event{kind:Kind::Spawn, ..}));
 
-        let turn = Dev.parse(r#"{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":5,"reasoning_output_tokens":1}}"#);
+        let turn = Agent::DEV.parse(r#"{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":5,"reasoning_output_tokens":1}}"#);
         let Mapped::Usage(u) = &turn[0] else { panic!() };
         assert_eq!(u.input_tokens, Some(10));
         assert_eq!(u.output_tokens, Some(5));
@@ -492,11 +529,11 @@ mod tests {
     #[test]
     fn parse_turn_failed_and_error_are_terminal_not_ok() {
         assert!(matches!(
-            Dev.parse(r#"{"type":"turn.failed","error":{"message":"boom"}}"#).last().unwrap(),
+            Agent::DEV.parse(r#"{"type":"turn.failed","error":{"message":"boom"}}"#).last().unwrap(),
             Mapped::Terminal{ok:false, ..}
         ));
         assert!(matches!(
-            Dev.parse(r#"{"type":"error","message":"fatal"}"#).last().unwrap(),
+            Agent::DEV.parse(r#"{"type":"error","message":"fatal"}"#).last().unwrap(),
             Mapped::Terminal{ok:false, ..}
         ));
     }
@@ -513,14 +550,14 @@ mod tests {
 
         let mut s = spec(Mode::Headless, "https://api.hanzo.ai");
         s.routing = Route::FailClosed;
-        let l = Dev.build(&s).unwrap();
+        let l = Agent::DEV.build(&s).unwrap();
         for var in ["OPENAI_API_KEY", "OPENAI_BASE_URL", "HANZO_USER_KEY"] {
             assert!(cleared(&l, var), "{var} must be cleared under FailClosed");
         }
 
         let mut s = spec(Mode::Headless, "https://api.hanzo.ai");
         s.routing = Route::Inherit;
-        let l = Dev.build(&s).unwrap();
+        let l = Agent::DEV.build(&s).unwrap();
         for var in ["OPENAI_API_KEY", "OPENAI_BASE_URL"] {
             assert!(
                 !l.command.as_std().get_envs().any(|(k, _)| k.to_string_lossy() == var),
@@ -537,7 +574,7 @@ mod tests {
         let build = |a: Approval| {
             let mut s = spec(Mode::Headless, "https://api.hanzo.ai");
             s.approval = a;
-            argv(&Dev.build(&s).unwrap())
+            argv(&Agent::DEV.build(&s).unwrap())
         };
 
         let auto = build(Approval::Auto);
@@ -568,7 +605,7 @@ mod tests {
     #[test]
     fn gateway_route_names_the_model_window_via_catalog() {
         // Default 1M window -> catalog written + declared 1M.
-        let l = Dev.build(&spec(Mode::Headless, "https://api.hanzo.ai")).unwrap();
+        let l = Agent::DEV.build(&spec(Mode::Headless, "https://api.hanzo.ai")).unwrap();
         let path = argv(&l)
             .into_iter()
             .find_map(|a| a.strip_prefix("model_catalog_json=").map(str::to_string))
@@ -580,10 +617,37 @@ mod tests {
         assert_eq!(v["models"][0]["max_context_window"], 1_000_000, "the ceiling must be raised or codex clamps");
         assert_eq!(l.cleanup.len(), 1);
 
+        // EVERY field the agents' catalog parser requires must be present. It
+        // refuses the whole document on the first missing one, and that refusal
+        // killed the session outright — a lost context window would have been
+        // survivable, a session that cannot start is not. Both agents share
+        // this required set; extra keys are ignored by both.
+        for field in [
+            "slug",
+            "display_name",
+            "base_instructions",
+            "context_window",
+            "max_context_window",
+            "supported_reasoning_levels",
+            "supports_reasoning_summaries",
+            "supports_parallel_tool_calls",
+            "experimental_supported_tools",
+            "support_verbosity",
+            "shell_type",
+            "truncation_policy",
+            "visibility",
+            "supported_in_api",
+            "priority",
+        ] {
+            assert!(!v["models"][0][field].is_null(), "catalog entry must declare `{field}`");
+        }
+        assert_eq!(v["models"][0]["truncation_policy"]["mode"], "tokens");
+        assert_eq!(v["models"][0]["truncation_policy"]["limit"], 1_000_000);
+
         // A standard window (<= codex's fallback) writes NO catalog.
         let mut s = spec(Mode::Headless, "https://api.hanzo.ai");
         s.routing = Route::Via(Routing::Gateway { api: "https://api.hanzo.ai".into(), token: "JWT".into(), model: "enso".into(), small_fast_model: "enso-flash".into(), context_window: 200_000 });
-        let l = Dev.build(&s).unwrap();
+        let l = Agent::DEV.build(&s).unwrap();
         assert!(!argv(&l).iter().any(|a| a.starts_with("model_catalog_json=")), "no catalog below codex's fallback");
         assert!(l.cleanup.is_empty());
     }

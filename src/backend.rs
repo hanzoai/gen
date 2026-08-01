@@ -1,5 +1,7 @@
-//! The coding-backend seam: ONE trait both `claude` and `dev` satisfy, so the
-//! orchestrator (register → spawn → stream → finalize) is identical for either.
+//! The coding-backend seam: ONE trait every backend satisfies, so the
+//! orchestrator (register → spawn → stream → finalize) is identical for all of
+//! them. Three backends today — our own `dev` (the default), `claude` and
+//! `codex` — and they are distinct products, never aliases of one another.
 //!
 //! Each backend owns only what genuinely differs: how it is invoked (argv +
 //! env), how its native MCP + model-routing are wired, and how one line of its
@@ -10,25 +12,107 @@ use anyhow::Result;
 use std::path::{Path, PathBuf};
 
 use super::claude::Claude;
-use super::dev::Dev;
+use super::dev::Agent;
 use super::event::Mapped;
 
-/// Which coding agent to wrap.
+/// Which coding agent to wrap. Three distinct products — never aliases of each
+/// other: a user who names one gets THAT agent, or a clear failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendKind {
-    Claude,
+    /// Our own coding agent (hanzoai/dev). The default.
     Dev,
+    Claude,
+    Codex,
 }
 
 impl BackendKind {
-    /// Parse the `--backend` value. The default is Claude.
+    /// Parse a backend name. Every accepted spelling lives HERE and nowhere else.
     pub fn parse(s: &str) -> Result<BackendKind> {
         match s.trim().to_ascii_lowercase().as_str() {
+            "dev" => Ok(BackendKind::Dev),
             "claude" | "claude-code" | "cc" => Ok(BackendKind::Claude),
-            "dev" | "codex" => Ok(BackendKind::Dev),
-            other => anyhow::bail!("unknown backend '{other}' (expected: claude | dev)"),
+            "codex" => Ok(BackendKind::Codex),
+            other => anyhow::bail!("unknown backend '{other}' (expected: {EXPECTED})"),
         }
     }
+
+    /// Does this operand NAME a backend (as opposed to being a task)? Reads the
+    /// same table [`BackendKind::parse`] does, so the two can never disagree.
+    pub fn names(s: &str) -> bool {
+        BackendKind::parse(s).is_ok()
+    }
+}
+
+/// The backend names offered in help text and in the "unknown backend" error.
+const EXPECTED: &str = "dev | claude | codex";
+
+/// The default backend when no spelling names one: OUR agent.
+const DEFAULT: BackendKind = BackendKind::Dev;
+
+/// How a backend was named on the command line. The CLI offers several spellings
+/// —
+///
+/// ```text
+/// hanzo code dev         hanzo code --dev      hanzo code --backend dev
+/// hanzo code claude      hanzo code --claude
+/// hanzo code codex       hanzo code --codex
+/// hanzo dev              (top-level shorthand for `hanzo code dev`)
+/// hanzo code             (default backend: dev)
+/// hanzo "fix the test"   (bare session, default backend)
+/// ```
+///
+/// — and every one of them lands in [`select`]. THIS IS THE ONLY PLACE A BACKEND
+/// IS RESOLVED. The spellings are pure surface: they differ in nothing but how
+/// the name was written, and they all launch through the single
+/// [`super::run`] path. If you are about to add a second launch path for a new
+/// spelling, add a spelling here instead.
+pub struct Selection {
+    /// The first positional operand — a backend name, or the task.
+    pub positional: Option<String>,
+    /// The second positional — only reachable as `hanzo code <backend> <task>`.
+    pub tail: Option<String>,
+    /// `--backend X`, or whichever of `--claude` / `--codex` / `--dev` was set.
+    /// clap's arg group guarantees at most one of those reaches us.
+    pub named: Option<String>,
+}
+
+/// Resolve `(backend, task)` from every spelling at once.
+///
+/// The one rule for the positional operand: it is the BACKEND if it is exactly a
+/// backend name, otherwise it is the TASK. So `hanzo code dev` picks a backend
+/// and `hanzo code "fix the test"` states a task, with no flag needed for either.
+///
+/// Naming the backend twice is an error rather than a precedence rule, because a
+/// precedence rule here is one nobody could remember: `hanzo code claude --codex`
+/// has no defensible winner, so it gets a clean message instead of a silent pick.
+pub fn select(sel: Selection) -> Result<(BackendKind, Option<String>)> {
+    let positional_names_backend = sel.positional.as_deref().is_some_and(BackendKind::names);
+
+    if positional_names_backend {
+        if let Some(named) = &sel.named {
+            let pos = sel.positional.as_deref().unwrap_or_default();
+            anyhow::bail!(
+                "backend named twice: `{pos}` and `--{named}` — name it once \
+                 (`hanzo code {pos}` or `hanzo code --{named}`)"
+            );
+        }
+        let kind = BackendKind::parse(sel.positional.as_deref().unwrap_or_default())?;
+        return Ok((kind, sel.tail));
+    }
+
+    // The positional is a task (or absent), so a second one has nothing to bind to.
+    if let Some(extra) = &sel.tail {
+        anyhow::bail!(
+            "unexpected argument '{extra}' — a task is ONE argument; quote it \
+             (`hanzo code \"fix the failing test\"`)"
+        );
+    }
+
+    let kind = match sel.named.as_deref() {
+        Some(name) => BackendKind::parse(name)?,
+        None => DEFAULT,
+    };
+    Ok((kind, sel.positional))
 }
 
 /// Headless (structured stream on stdout) or interactive (TTY handed to the
@@ -225,8 +309,9 @@ pub trait Backend {
 /// Resolve a backend kind to its implementation.
 pub fn resolve(kind: BackendKind) -> Box<dyn Backend> {
     match kind {
+        BackendKind::Dev => Box::new(Agent::DEV),
         BackendKind::Claude => Box::new(Claude),
-        BackendKind::Dev => Box::new(Dev),
+        BackendKind::Codex => Box::new(Agent::CODEX),
     }
 }
 
@@ -265,12 +350,73 @@ pub fn backend_version(bin: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    fn sel(positional: Option<&str>, tail: Option<&str>, named: Option<&str>) -> Selection {
+        Selection {
+            positional: positional.map(String::from),
+            tail: tail.map(String::from),
+            named: named.map(String::from),
+        }
+    }
+
+    /// The point of [`select`]: every spelling is the SAME resolution. If these
+    /// ever disagree, someone has forked the command.
+    #[test]
+    fn every_spelling_resolves_to_the_same_backend() {
+        for (positional, named) in [(Some("dev"), None), (None, Some("dev"))] {
+            let (kind, task) = select(sel(positional, None, named)).unwrap();
+            assert_eq!(kind, BackendKind::Dev);
+            assert_eq!(task, None);
+        }
+        for (positional, named) in [(Some("claude"), None), (None, Some("claude"))] {
+            assert_eq!(select(sel(positional, None, named)).unwrap().0, BackendKind::Claude);
+        }
+        for (positional, named) in [(Some("codex"), None), (None, Some("codex"))] {
+            assert_eq!(select(sel(positional, None, named)).unwrap().0, BackendKind::Codex);
+        }
+    }
+
+    /// Naming nothing runs OUR agent — `hanzo code` and a bare `hanzo` alike.
+    #[test]
+    fn the_default_backend_is_ours() {
+        assert_eq!(select(sel(None, None, None)).unwrap().0, BackendKind::Dev);
+    }
+
+    /// A lone operand is the TASK unless it is exactly a backend name — the one
+    /// rule that lets `hanzo code dev` and `hanzo code "fix it"` both work.
+    #[test]
+    fn a_lone_operand_is_a_task_unless_it_names_a_backend() {
+        let (kind, task) = select(sel(Some("fix the failing test"), None, None)).unwrap();
+        assert_eq!(kind, BackendKind::Dev, "an unrecognised operand must not change the backend");
+        assert_eq!(task.as_deref(), Some("fix the failing test"));
+
+        // `hanzo code claude "fix it"` — backend positionally, task after it.
+        let (kind, task) = select(sel(Some("claude"), Some("fix it"), None)).unwrap();
+        assert_eq!(kind, BackendKind::Claude);
+        assert_eq!(task.as_deref(), Some("fix it"));
+    }
+
+    /// Naming the backend twice is refused outright. A precedence rule here is
+    /// one nobody could remember, and silently running an agent the user did not
+    /// name is worse than refusing.
+    #[test]
+    fn naming_the_backend_twice_is_an_error() {
+        let err = select(sel(Some("claude"), None, Some("codex"))).unwrap_err().to_string();
+        assert!(err.contains("named twice"), "got: {err}");
+        assert!(err.contains("claude") && err.contains("codex"), "both spellings named: {err}");
+
+        // An unquoted multi-word task is a mistake worth catching, not a silent join.
+        let err = select(sel(Some("fix"), Some("it"), None)).unwrap_err().to_string();
+        assert!(err.contains("unexpected argument"), "got: {err}");
+    }
+
     #[test]
     fn backend_kind_parse() {
+        assert_eq!(BackendKind::parse("dev").unwrap(), BackendKind::Dev);
         assert_eq!(BackendKind::parse("claude").unwrap(), BackendKind::Claude);
         assert_eq!(BackendKind::parse("CC").unwrap(), BackendKind::Claude);
-        assert_eq!(BackendKind::parse("dev").unwrap(), BackendKind::Dev);
-        assert_eq!(BackendKind::parse("codex").unwrap(), BackendKind::Dev);
+        // `codex` is its OWN backend. Aliasing it to `dev` would silently run a
+        // different agent than the one the user named.
+        assert_eq!(BackendKind::parse("codex").unwrap(), BackendKind::Codex);
         assert!(BackendKind::parse("gpt").is_err());
     }
 

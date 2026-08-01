@@ -19,7 +19,7 @@
 //! `--resume <sessionId>` restores cwd/repo/ref and relaunches the backend with
 //! its native resume against the same cloud session.
 
-mod backend;
+pub mod backend;
 mod claude;
 pub mod context;
 mod control;
@@ -58,7 +58,10 @@ use settings::Settings;
 
 /// Parsed `hanzo code` invocation.
 pub struct Options {
-    pub backend: String,
+    /// The backend, ALREADY resolved by [`backend::select`] — the one place any
+    /// spelling (`code dev`, `code --dev`, `--backend dev`, `hanzo dev`) becomes
+    /// a backend. It arrives here as a value, not a string to be parsed again.
+    pub backend: BackendKind,
     pub link: bool,
     pub no_link: bool,
     pub route: bool,
@@ -387,7 +390,7 @@ pub(crate) fn cloud_resume_block(
 }
 
 pub async fn run(cfg: &mut Config, opts: Options) -> Result<()> {
-    let kind = BackendKind::parse(&opts.backend)?;
+    let kind = opts.backend;
     let backend = resolve(kind);
     let mode = if opts.task.is_some() { Mode::Headless } else { Mode::Interactive };
     let api = network::active(cfg).api;
@@ -904,7 +907,7 @@ async fn run_turn(
     } else {
         command.stdout(Stdio::inherit());
     }
-    let mut child = command.spawn().map_err(spawn_err)?;
+    let mut child = command.spawn().map_err(spawn_err(backend.label()))?;
     let pid = child.id();
     let mut acted: Option<Act> = None;
 
@@ -1035,7 +1038,7 @@ async fn run_interactive(
 ) -> Result<bool> {
     let Launch { mut command, cleanup } = launch;
     command.stdin(Stdio::inherit()).stdout(Stdio::inherit()).stderr(Stdio::inherit());
-    let mut child = command.spawn().map_err(spawn_err)?;
+    let mut child = command.spawn().map_err(spawn_err(backend.label()))?;
 
     // Linked interactive per-event streaming rides the backend transcript tail.
     let stop = Arc::new(AtomicBool::new(false));
@@ -1240,8 +1243,21 @@ fn session_title(opts: &Options) -> String {
     }
 }
 
-fn spawn_err(e: std::io::Error) -> anyhow::Error {
-    anyhow!("failed to launch the coding backend ({e}) — is it installed and on PATH?")
+/// A backend that is not installed is the ONE failure a user hits before any of
+/// their work starts, so it names the program and how to pick another rather
+/// than reporting a bare OS error.
+fn spawn_err(program: &str) -> impl Fn(std::io::Error) -> anyhow::Error + '_ {
+    move |e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            anyhow!(
+                "the `{program}` coding agent is not installed (not on PATH) — \
+                 install it, or name another backend: `hanzo code dev`, \
+                 `hanzo code claude`, `hanzo code codex`"
+            )
+        } else {
+            anyhow!("failed to launch the `{program}` coding agent: {e}")
+        }
+    }
 }
 
 fn now() -> i64 {
@@ -1264,7 +1280,7 @@ fn uuid_v4() -> String {
 mod tests {
     use super::*;
     use crate::commands::code::claude::Claude;
-    use crate::commands::code::dev::Dev;
+    use crate::commands::code::dev::Agent;
     use crate::commands::code::testmock::MockCloud;
     use tokio::io::AsyncWriteExt;
 
@@ -1423,7 +1439,7 @@ mod tests {
             r#"{"type":"turn.completed","usage":{"input_tokens":3,"output_tokens":1,"cached_input_tokens":0}}"#, "\n"
         );
         let reader = reader_of(fixture).await;
-        let out = run_stream(&Dev, reader, Some(client), Some("sess_2".into()), false).await.unwrap();
+        let out = run_stream(&Agent::DEV, reader, Some(client), Some("sess_2".into()), false).await.unwrap();
         assert_eq!(out.backend_session.as_deref(), Some("th-9"));
         assert_eq!(out.usage.output_tokens, Some(1));
         let has_toolcall = mock
@@ -1668,7 +1684,7 @@ mod tests {
     #[test]
     fn banner_separates_model_routing_from_session_stream() {
         let opts = Options {
-            backend: "claude".into(),
+            backend: BackendKind::Claude,
             link: false,
             no_link: true,
             route: true,
@@ -1718,7 +1734,7 @@ mod tests {
     #[test]
     fn status_line_names_the_direct_provider_endpoint() {
         let opts = Options {
-            backend: "claude".into(),
+            backend: BackendKind::Claude,
             link: false,
             no_link: true,
             route: true,
