@@ -2006,17 +2006,20 @@ mod control_tests {
         tokio::io::BufReader::new(r)
     }
 
+    /// Every `(resume, task)` a backend was asked to build, in order — held by the
+    /// backend and by the test that reads it, which is why it is shared.
+    type Builds = Arc<Mutex<Vec<(Option<String>, Option<String>)>>>;
+
     /// A backend that runs a scripted shell per turn and records every `Spec` it
     /// was asked to build — which is how the steer test proves the SECOND turn
     /// resumed the FIRST turn's session id.
     struct ScriptBackend {
         scripts: Vec<&'static str>,
-        /// `(resume, task)` per build, in order.
-        built: Arc<Mutex<Vec<(Option<String>, Option<String>)>>>,
+        built: Builds,
     }
 
     impl ScriptBackend {
-        fn new(scripts: Vec<&'static str>) -> (Self, Arc<Mutex<Vec<(Option<String>, Option<String>)>>>) {
+        fn new(scripts: Vec<&'static str>) -> (Self, Builds) {
             let built = Arc::new(Mutex::new(Vec::new()));
             (ScriptBackend { scripts, built: built.clone() }, built)
         }

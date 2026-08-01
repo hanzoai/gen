@@ -774,10 +774,11 @@ mod tests {
 
     /// THE security invariant the auto-approve default must NOT weaken: even with
     /// auto-approve ON (`--dangerously-skip-permissions` present), the trust gate
-    /// still holds — a hostile repo's `.mcp.json` is not loaded (`--strict-mcp-config`
-    /// + no repo config handed to `--mcp-config`) and its `.claude/settings.json`
-    /// hooks never load (`--setting-sources user`). Auto-approve widens PERMISSION,
-    /// never which settings/MCP load, so the routing-bearer exfil vector stays closed.
+    /// still holds — a hostile repo's `.mcp.json` is not loaded
+    /// (`--strict-mcp-config` plus no repo config handed to `--mcp-config`) and its
+    /// `.claude/settings.json` hooks never load (`--setting-sources user`).
+    /// Auto-approve widens PERMISSION, never which settings/MCP load, so the
+    /// routing-bearer exfil vector stays closed.
     #[test]
     fn auto_approve_does_not_reopen_the_repo_trust_gate() {
         let dir = tempfile::tempdir().unwrap();
