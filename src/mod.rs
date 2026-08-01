@@ -24,7 +24,10 @@ mod claude;
 pub mod context;
 mod control;
 mod dev;
-mod event;
+// The status vocabulary IS part of the session client's signature (`set_status`),
+// so anything that can hold a session — `hanzo link` as much as `hanzo code` —
+// must be able to name the value it is setting.
+pub mod event;
 mod home;
 pub mod session;
 mod settings;
@@ -534,7 +537,7 @@ pub async fn run(cfg: &mut Config, opts: Options) -> Result<()> {
     let mut session_id: Option<String> = None;
     if let Some(c) = &client {
         let title = session_title(&opts);
-        match resolve_cloud_session(c, backend.label(), &title, resume_from.as_deref()).await {
+        match resolve_cloud_session(c, &snapshot, &title, resume_from.as_deref()).await {
             Ok((id, forked_from)) => {
                 // The "where it runs" context snapshot (no secrets).
                 let _ = c.event(&id, Kind::Status, snapshot.context_payload(forked_from.as_deref())).await;
@@ -616,10 +619,18 @@ pub async fn run(cfg: &mut Config, opts: Options) -> Result<()> {
 
     match mode {
         Mode::Headless => {
-            let (outcome, status) =
+            let run =
                 supervise(&*backend, spec, launch, structured, client.clone(), session_id.clone())
-                    .await?;
+                    .await;
             if let (Some(c), Some(id)) = (&client, &session_id) {
+                // A run that could not COMPLETE still ended. Propagating the error
+                // straight out — which is what `?` here used to do — leaves the row
+                // this run registered claiming to be running for good, and the
+                // registry has no heartbeat to contradict it.
+                let (outcome, status) = match &run {
+                    Ok((o, s)) => (o.clone(), *s),
+                    Err(_) => (Outcome::default(), Status::Error),
+                };
                 let transcript = outcome
                     .backend_session
                     .as_ref()
@@ -628,9 +639,10 @@ pub async fn run(cfg: &mut Config, opts: Options) -> Result<()> {
                 finalize(c, id, &outcome, status, &snapshot, &api, &who, transcript).await;
                 report_link(id);
             }
+            run?;
         }
         Mode::Interactive => {
-            let ok = run_interactive(&*backend, launch, client.clone(), session_id.clone(), &route, &cwd, watch_sid).await?;
+            let run = run_interactive(&*backend, launch, client.clone(), session_id.clone(), &route, &cwd, watch_sid).await;
             if let (Some(c), Some(id)) = (&client, &session_id) {
                 // Interactive per-event stream arrives via the transcript tail;
                 // the resume handle here is what we pre-set / resumed.
@@ -643,11 +655,16 @@ pub async fn run(cfg: &mut Config, opts: Options) -> Result<()> {
                     .map(|p| p.display().to_string());
                 // An interactive session SUSPENDS rather than completes: the
                 // transcript and its resume handle outlive the TUI, so the same
-                // id is reopenable. A crash is still an error.
-                let status = if ok { Status::Paused } else { Status::Error };
+                // id is reopenable. A crash — or a TUI that never got off the
+                // ground — is an error, and either way it is over.
+                let status = match &run {
+                    Ok(true) => Status::Paused,
+                    _ => Status::Error,
+                };
                 finalize(c, id, &outcome, status, &snapshot, &api, &who, transcript).await;
                 report_link(id);
             }
+            run?;
         }
     }
     Ok(())
@@ -673,10 +690,14 @@ fn preset_session_of(spec: &Spec) -> Option<String> {
 /// the guarantee holds for any caller rather than only for today's single one.
 pub(crate) async fn resolve_cloud_session(
     client: &SessionClient,
-    agent: &str,
+    // The SAME snapshot the session reports as its context: it already knows the
+    // backend, the machine and the directory, so a register cannot name one of
+    // them differently or leave the machine off and land in "unknown machine".
+    snapshot: &Snapshot,
     title: &str,
     resume_from: Option<&str>,
 ) -> Result<(String, Option<String>)> {
+    let register = || client.register(&snapshot.backend, title, &snapshot.host, &snapshot.cwd);
     if let Some(old) = resume_from {
         match client.get(old).await {
             // Live: same-id re-attach, move it back to running.
@@ -687,7 +708,7 @@ pub(crate) async fn resolve_cloud_session(
             // Terminal and VERIFIED ours: cloud forbids reopening it, so fork a
             // new session and record the lineage we just confirmed.
             Ok(_) => {
-                let reg = client.register(agent, title).await?;
+                let reg = register().await?;
                 return Ok((reg.id, Some(old.to_string())));
             }
             // Unverified. Do not assert a lineage we could not confirm.
@@ -696,12 +717,12 @@ pub(crate) async fn resolve_cloud_session(
                     "could not verify session {old} ({e}); starting a fresh cloud session with no \
                      resume lineage."
                 ));
-                let reg = client.register(agent, title).await?;
+                let reg = register().await?;
                 return Ok((reg.id, None));
             }
         }
     }
-    let reg = client.register(agent, title).await?;
+    let reg = register().await?;
     Ok((reg.id, None))
 }
 
@@ -1015,9 +1036,7 @@ async fn supervise(
                 launch = backend.build(&spec)?;
             }
             // Uncommanded end: the backend finished (or failed) on its own.
-            None | Some(Act::Ignore) => {
-                break if ok { Status::Done } else { Status::Error };
-            }
+            None | Some(Act::Ignore) => break Status::of(ok),
         }
     };
 
@@ -1291,6 +1310,21 @@ mod tests {
         tokio::io::BufReader::new(r)
     }
 
+    /// The "where it runs" value every linked session carries. One fixture, so a
+    /// test cannot accidentally assert against a snapshot with no machine in it.
+    fn snapshot(backend: &str) -> Snapshot {
+        Snapshot {
+            machine_id: "m".into(),
+            host: "evo".into(),
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            cwd: "/w".into(),
+            backend: backend.into(),
+            backend_version: None,
+            repo: Default::default(),
+        }
+    }
+
     fn id(s: &str) -> Identity {
         // Derived from claims, as everywhere else — there is no other way to
         // build one, which is the point.
@@ -1453,7 +1487,7 @@ mod tests {
     async fn resolve_fresh_registers_a_new_session() {
         let mock = MockCloud::start().await;
         let client = SessionClient::new(&mock.base_url(), "T").unwrap();
-        let (id, forked) = resolve_cloud_session(&client, "claude", "t", None).await.unwrap();
+        let (id, forked) = resolve_cloud_session(&client, &snapshot("claude"), "t", None).await.unwrap();
         assert_eq!(id, "sess_mock");
         assert!(forked.is_none());
         assert!(mock.requests().iter().any(|r| r.method == "POST" && r.path == "/v1/agents/sessions"));
@@ -1463,7 +1497,7 @@ mod tests {
     async fn resume_nonterminal_reuses_same_id_without_registering() {
         let mock = MockCloud::start_get_status("paused").await;
         let client = SessionClient::new(&mock.base_url(), "T").unwrap();
-        let (id, forked) = resolve_cloud_session(&client, "claude", "t", Some("sess_old")).await.unwrap();
+        let (id, forked) = resolve_cloud_session(&client, &snapshot("claude"), "t", Some("sess_old")).await.unwrap();
         assert_eq!(id, "sess_old", "must re-attach the SAME id");
         assert!(forked.is_none());
         let reqs = mock.requests();
@@ -1476,7 +1510,7 @@ mod tests {
     async fn resume_terminal_forks_a_new_session_with_lineage() {
         let mock = MockCloud::start_get_status("done").await;
         let client = SessionClient::new(&mock.base_url(), "T").unwrap();
-        let (id, forked) = resolve_cloud_session(&client, "claude", "t", Some("sess_old")).await.unwrap();
+        let (id, forked) = resolve_cloud_session(&client, &snapshot("claude"), "t", Some("sess_old")).await.unwrap();
         assert_eq!(id, "sess_mock");
         assert_eq!(forked.as_deref(), Some("sess_old"));
         assert!(mock.requests().iter().any(|r| r.method == "POST" && r.path == "/v1/agents/sessions"));
@@ -1494,7 +1528,7 @@ mod tests {
             let mock = MockCloud::start_session_get_failing(code).await;
             let client = SessionClient::new(&mock.base_url(), "T").unwrap();
 
-            let (id, forked) = resolve_cloud_session(&client, "claude", "t", Some("sess_other_org"))
+            let (id, forked) = resolve_cloud_session(&client, &snapshot("claude"), "t", Some("sess_other_org"))
                 .await
                 .unwrap();
 
@@ -1549,16 +1583,7 @@ mod tests {
     async fn finalize_reports_usage_resume_handle_and_terminal_status() {
         let mock = MockCloud::start().await;
         let client = SessionClient::new(&mock.base_url(), "T").unwrap();
-        let snapshot = Snapshot {
-            machine_id: "m".into(),
-            host: "h".into(),
-            os: "linux".into(),
-            arch: "x86_64".into(),
-            cwd: "/w".into(),
-            backend: "claude".into(),
-            backend_version: None,
-            repo: Default::default(),
-        };
+        let snapshot = snapshot("claude");
         let outcome = Outcome {
             backend_session: Some("sid-x".into()),
             usage: Usage { input_tokens: Some(9), ..Default::default() },
@@ -1584,10 +1609,7 @@ mod tests {
     async fn finalize_interactive_suspends_to_paused_and_failure_is_error() {
         let mock = MockCloud::start().await;
         let client = SessionClient::new(&mock.base_url(), "T").unwrap();
-        let snapshot = Snapshot {
-            machine_id: "m".into(), host: "h".into(), os: "linux".into(), arch: "x".into(),
-            cwd: "/w".into(), backend: "dev".into(), backend_version: None, repo: Default::default(),
-        };
+        let snapshot = snapshot("dev");
         let outcome = Outcome::default();
         finalize(&client, "sess_i", &outcome, Status::Paused, &snapshot, "https://api.hanzo.ai", "hanzo/z", None).await;
         assert!(mock.requests().iter().any(|r| r.method == "PATCH" && r.json()["status"] == "paused"));

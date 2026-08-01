@@ -55,6 +55,24 @@ impl Status {
             Status::Error => "error",
         }
     }
+
+    /// Whether reaching this status ENDS the session. Cloud stamps `endedAt` and
+    /// refuses every later move, so this is the value — not the caller — that
+    /// decides what "finished" means; everything that must happen exactly once at
+    /// the end (withdrawing the terminal URL) keys off it.
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Status::Done | Status::Error)
+    }
+
+    /// How a run that returned `ok`/failed ended. One mapping, so no caller
+    /// invents its own spelling of "it worked".
+    pub fn of(ok: bool) -> Status {
+        if ok {
+            Status::Done
+        } else {
+            Status::Error
+        }
+    }
 }
 
 /// Per-session token/cost usage, as reported by a backend's terminal summary.

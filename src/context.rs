@@ -569,18 +569,34 @@ pub fn machine_id() -> String {
     id
 }
 
-fn hostname() -> String {
-    if let Ok(out) = Command::new("hostname").output() {
-        if out.status.success() {
-            let h = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !h.is_empty() {
-                return h;
-            }
-        }
-    }
-    std::env::var("HOSTNAME")
-        .or_else(|_| std::env::var("COMPUTERNAME"))
-        .unwrap_or_else(|_| "unknown".to_string())
+/// What this machine calls itself. THE one hostname in the CLI — a session, a
+/// run-target and a snapshot must agree about which computer they are on, and
+/// two probes with two fallbacks is the way they come to disagree.
+///
+/// Never empty, and never the word "unknown". Every source here can fail (no
+/// `hostname` binary, an exported-but-empty `$HOSTNAME`), and an empty host is
+/// the one value the console cannot group: those rows pile into a single
+/// "unknown machine" bucket that no amount of looking can take apart. So the
+/// last resort is the stable per-install [`machine_id`] — an opaque name is a
+/// far weaker fact than `evo`, but it is still a fact, and it groups.
+pub fn hostname() -> String {
+    Command::new("hostname")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| named(&String::from_utf8_lossy(&o.stdout)))
+        .or_else(|| std::env::var("HOSTNAME").ok().and_then(|h| named(&h)))
+        .or_else(|| std::env::var("COMPUTERNAME").ok().and_then(|h| named(&h)))
+        .unwrap_or_else(machine_id)
+}
+
+/// A candidate that actually NAMES something, trimmed — or nothing. Every source
+/// of a hostname can hand back a blank (a `hostname` binary that prints an empty
+/// line, an exported-but-empty `$HOSTNAME`), and a blank passed on as if it were
+/// a name is how a machine ends up unidentifiable rather than merely unnamed.
+fn named(s: &str) -> Option<String> {
+    let s = s.trim();
+    (!s.is_empty()).then(|| s.to_string())
 }
 
 /// Best-effort git context for `cwd`. A non-repo yields an empty [`Repo`].
@@ -878,6 +894,32 @@ mod tests {
         let loaded = ResumeRecord::load(&id).unwrap().unwrap();
         assert_eq!(loaded, rec);
         let _ = std::fs::remove_file(record_path(&id));
+    }
+
+    // ---- naming the machine ----
+
+    /// A blank is not a name. This is the whole bug behind the console's "unknown
+    /// machine" bucket: a probe that succeeds and says nothing looks like an
+    /// answer, and every row that inherits it becomes ungroupable.
+    #[test]
+    fn a_blank_probe_is_not_a_name() {
+        assert_eq!(named("evo"), Some("evo".into()));
+        assert_eq!(named(" evo.local \n"), Some("evo.local".into()));
+        for blank in ["", " ", "\n", "\t\r\n"] {
+            assert_eq!(named(blank), None, "{blank:?} is not a machine name");
+        }
+    }
+
+    /// Whatever the machine can or cannot tell us about itself, it ends up with a
+    /// name — the last resort being the stable per-install id, which groups even
+    /// though it does not describe. An empty host is the one answer that must be
+    /// unreachable, so the invariant is asserted on the real function.
+    #[test]
+    fn a_machine_always_names_itself() {
+        let h = hostname();
+        assert!(!h.trim().is_empty(), "a session with no host cannot be grouped");
+        assert_eq!(h, h.trim(), "a padded host is a different string every time");
+        assert!(!Snapshot::capture(Path::new("/"), "claude", None).host.is_empty());
     }
 
     // ---- machine capability plane ----
