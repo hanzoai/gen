@@ -558,17 +558,15 @@ pub async fn run(cfg: &mut Config, opts: Options) -> Result<()> {
     // the same structural auth check as the session link (`links_target`) — an
     // unauthenticated run holds no bearer, spawns nothing here, and reaches cloud not
     // at all.
-    if links_target(do_link, bearer.is_some()) {
-        if let Some(token) = bearer.clone() {
-            let api = api.clone();
-            let machine_id = snapshot.machine_id.clone();
-            let host = snapshot.host.clone();
-            tokio::spawn(async move {
-                let machine = context::Machine::capture().await;
-                target::sync(&api, &token, &machine_id, &host, &machine).await;
-            });
+    // A BEAT, not a single register: cloud reads liveness from when a machine last
+    // wrote, so announcing once and going quiet reads offline ninety seconds into a
+    // session that is still running. The guard beats until this run returns.
+    let _machine = match (links_target(do_link, bearer.is_some()), bearer.as_deref()) {
+        (true, Some(token)) => {
+            Some(target::beat(&api, token, &snapshot.machine_id, &snapshot.host))
         }
-    }
+        _ => None,
+    };
 
     // Claude theme (Dracula dark / Alucard light, auto by the user's preference).
     // Native — writes `<config home>/themes` + selects it; never patches Claude. The

@@ -151,6 +151,60 @@ pub async fn sync(api: &str, token: &str, machine_id: &str, host: &str, machine:
     }
 }
 
+/// How often a held-open machine says it is still alive.
+///
+/// Cloud's `LiveWindow` is 90 seconds and its comment names THIS beat: a target
+/// that has not written inside the window reads offline no matter what its row
+/// says. Beating at a third of the window means two beats can be lost — a suspended
+/// laptop, a flaky link — before a live machine is reported dead.
+pub const BEAT: Duration = Duration::from_secs(30);
+
+/// A heartbeat that runs for exactly as long as the caller holds this guard.
+///
+/// REGISTERING IS NOT BEING ALIVE. A register stamps the server's staleness clock
+/// once; ninety seconds later cloud calls the machine offline — correctly, because
+/// nothing has said otherwise since. A machine that registered at link time and
+/// then went quiet is indistinguishable from one that was unplugged, which is why
+/// the console filled with dead-looking boxes that were in fact running.
+///
+/// There is no goodbye. Ending the beat IS the ending: the window expires and the
+/// machine reads offline on its own. A second "I am leaving" message would be a
+/// second way to say the same thing, and the one that gets lost when the power
+/// cord goes.
+pub struct Beat(tokio::task::JoinHandle<()>);
+
+impl Drop for Beat {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Hold this machine's run-target open: register now, then re-state it every
+/// [`BEAT`] until the returned guard drops.
+///
+/// Each beat RE-CAPTURES the machine, because a heartbeat's payload is what the
+/// box is doing NOW — a repeat of the load average from an hour ago is a timestamp
+/// wearing a sample's clothes. Detached and best-effort throughout: `sync` already
+/// swallows every failure, so a cloud outage costs freshness, never the shell.
+pub fn beat(api: &str, token: &str, machine_id: &str, host: &str) -> Beat {
+    beat_every(BEAT, api, token, machine_id, host)
+}
+
+/// [`beat`] with the period as a parameter, so a test can watch the loop repeat
+/// without waiting minutes for it. `BEAT` is the ONE period production uses — this
+/// is the mechanism, not a setting.
+fn beat_every(period: Duration, api: &str, token: &str, machine_id: &str, host: &str) -> Beat {
+    let (api, token) = (api.to_string(), token.to_string());
+    let (machine_id, host) = (machine_id.to_string(), host.to_string());
+    Beat(tokio::spawn(async move {
+        loop {
+            let machine = Machine::capture().await;
+            sync(&api, &token, &machine_id, &host, &machine).await;
+            tokio::time::sleep(period).await;
+        }
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,6 +322,67 @@ mod tests {
         assert!(reqs.iter().any(|r| r.method == "POST" && r.path == "/v1/agents/targets"), "falls back to register");
         // The freshly registered id replaced the stale one.
         assert_eq!(TargetRecord::load(&machine).unwrap().unwrap().id, "tgt_mock");
+        let _ = std::fs::remove_file(super::super::context::target_path_for_test(&machine));
+    }
+
+    /// The beat has to land INSIDE cloud's window, repeatedly. One register is what
+    /// the CLI used to do, and it is why a machine that was running read offline
+    /// ninety seconds later: the row was never written again, so the only fact the
+    /// server had was stale.
+    #[test]
+    fn the_beat_fits_inside_the_window_it_is_answering() {
+        // cloud/apps/agents/targets.go: LiveWindow = 90 * time.Second.
+        assert!(
+            BEAT.as_secs() * 3 <= 90,
+            "two beats must be losable before a live machine reads dead"
+        );
+    }
+
+    /// Wait until `f` holds, or fail — polling, because what is being observed is
+    /// another task making progress and a fixed sleep would encode this machine's
+    /// speed as the contract.
+    async fn until(what: &str, f: impl Fn() -> bool) {
+        for _ in 0..600 {
+            if f() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    /// Holding a machine open writes MORE THAN ONCE — the difference between
+    /// "registered" and "alive", and the whole reason this exists.
+    #[tokio::test]
+    async fn a_held_machine_keeps_saying_so() {
+        let mock = MockCloud::start().await;
+        let machine = format!("beat_{}", std::process::id());
+        let _ = std::fs::remove_file(super::super::context::target_path_for_test(&machine));
+
+        let held = beat_every(Duration::from_millis(10), &mock.base_url(), "T", &machine, "evo");
+        until("a machine to keep beating", || mock.requests().len() >= 3).await;
+        drop(held);
+
+        let _ = std::fs::remove_file(super::super::context::target_path_for_test(&machine));
+    }
+
+    /// Letting go stops the beat, and stopping is the whole ending: cloud's window
+    /// expires on its own. Nothing sends a goodbye, so nothing can fail to.
+    #[tokio::test]
+    async fn letting_go_stops_it() {
+        let mock = MockCloud::start().await;
+        let machine = format!("beatdrop_{}", std::process::id());
+        let _ = std::fs::remove_file(super::super::context::target_path_for_test(&machine));
+
+        let held = beat_every(Duration::from_millis(10), &mock.base_url(), "T", &machine, "evo");
+        until("the first beat", || !mock.requests().is_empty()).await;
+        drop(held);
+        // A beat already in flight may still land, so settle before reading the mark.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let after_drop = mock.requests().len();
+
+        tokio::time::sleep(Duration::from_millis(500)).await; // 50 periods' worth
+        assert_eq!(mock.requests().len(), after_drop, "a dropped beat writes nothing more");
         let _ = std::fs::remove_file(super::super::context::target_path_for_test(&machine));
     }
 }
