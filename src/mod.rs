@@ -561,12 +561,8 @@ pub async fn run(cfg: &mut Config, opts: Options) -> Result<()> {
     // A BEAT, not a single register: cloud reads liveness from when a machine last
     // wrote, so announcing once and going quiet reads offline ninety seconds into a
     // session that is still running. The guard beats until this run returns.
-    let _machine = match (links_target(do_link, bearer.is_some()), bearer.as_deref()) {
-        (true, Some(token)) => {
-            Some(target::beat(&api, token, &snapshot.machine_id, &snapshot.host))
-        }
-        _ => None,
-    };
+    let _machine = links_target(do_link, bearer.is_some())
+        .then(|| target::beat(cfg, &api, &snapshot.machine_id, &snapshot.host));
 
     // Claude theme (Dracula dark / Alucard light, auto by the user's preference).
     // Native — writes `<config home>/themes` + selects it; never patches Claude. The

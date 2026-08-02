@@ -19,7 +19,9 @@ use serde_json::Value;
 use std::time::Duration;
 
 use super::context::{Machine, Metrics, Spec, TargetRecord};
+use crate::config::Config;
 use crate::http::send_json;
+use crate::iam::{paths, store};
 
 #[derive(Clone)]
 pub struct TargetClient {
@@ -184,22 +186,65 @@ impl Drop for Beat {
 ///
 /// Each beat RE-CAPTURES the machine, because a heartbeat's payload is what the
 /// box is doing NOW — a repeat of the load average from an hour ago is a timestamp
-/// wearing a sample's clothes. Detached and best-effort throughout: `sync` already
-/// swallows every failure, so a cloud outage costs freshness, never the shell.
-pub fn beat(api: &str, token: &str, machine_id: &str, host: &str) -> Beat {
-    beat_every(BEAT, api, token, machine_id, host)
+/// wearing a sample's clothes.
+///
+/// AND EACH BEAT RE-READS THE CREDENTIAL. An access token lives one hour; a link
+/// lives as long as the shell does. A beat holding the token it was handed at
+/// startup therefore beats correctly for an hour and then spends the rest of the
+/// session sending an expired bearer — which `sync` swallows, because every
+/// failure here is best-effort by design. The machine goes offline while the
+/// process is still running and still serving, which is the exact symptom the
+/// heartbeat exists to prevent. `store::active_token` is the ONE accessor that
+/// refreshes, and it takes its own `Config` clone: the credential file is the
+/// shared state, not the struct, and its writes are already serialized under the
+/// credential lock.
+pub fn beat(cfg: &Config, api: &str, machine_id: &str, host: &str) -> Beat {
+    beat_every(BEAT, Creds::Refreshing(Box::new(cfg.clone())), api, machine_id, host)
+}
+
+/// Where a beat gets its bearer.
+///
+/// Production has exactly ONE source — `store::active_token`, the single accessor
+/// that refreshes — and the test variant is compiled only under `cfg(test)`, so
+/// there is no second credential path to drift. It exists because the loop is what
+/// needs observing, and a unit test must not read the developer's real vault.
+enum Creds {
+    Refreshing(Box<Config>),
+    #[cfg(test)]
+    Fixed(String),
+}
+
+impl Creds {
+    async fn bearer(&mut self) -> Option<String> {
+        match self {
+            Creds::Refreshing(cfg) => store::active_token(cfg, paths::DEFAULT_BRAND)
+                .await
+                .ok()
+                .flatten()
+                .map(|(_, t)| t.access_token),
+            #[cfg(test)]
+            Creds::Fixed(t) => Some(t.clone()),
+        }
+    }
 }
 
 /// [`beat`] with the period as a parameter, so a test can watch the loop repeat
 /// without waiting minutes for it. `BEAT` is the ONE period production uses — this
 /// is the mechanism, not a setting.
-fn beat_every(period: Duration, api: &str, token: &str, machine_id: &str, host: &str) -> Beat {
-    let (api, token) = (api.to_string(), token.to_string());
+fn beat_every(period: Duration, mut creds: Creds, api: &str, machine_id: &str, host: &str) -> Beat {
+    let api = api.to_string();
     let (machine_id, host) = (machine_id.to_string(), host.to_string());
     Beat(tokio::spawn(async move {
         loop {
-            let machine = Machine::capture().await;
-            sync(&api, &token, &machine_id, &host, &machine).await;
+            // A beat with no credential is a beat that cannot land, so skip the
+            // capture too rather than probe the machine for nothing.
+            match creds.bearer().await {
+                Some(token) => {
+                    let machine = Machine::capture().await;
+                    sync(&api, &token, &machine_id, &host, &machine).await;
+                }
+                None => tracing::debug!("no credential for this beat; the machine will read offline"),
+            }
             tokio::time::sleep(period).await;
         }
     }))
@@ -359,10 +404,41 @@ mod tests {
         let machine = format!("beat_{}", std::process::id());
         let _ = std::fs::remove_file(super::super::context::target_path_for_test(&machine));
 
-        let held = beat_every(Duration::from_millis(10), &mock.base_url(), "T", &machine, "evo");
+        let held = beat_every(Duration::from_millis(10), Creds::Fixed("T".into()), &mock.base_url(), &machine, "evo");
         until("a machine to keep beating", || mock.requests().len() >= 3).await;
         drop(held);
 
+        let _ = std::fs::remove_file(super::super::context::target_path_for_test(&machine));
+    }
+
+    /// A beat asks for its bearer EVERY time, so a credential that changes under
+    /// it is picked up. Holding the token handed over at startup is why a link
+    /// beat correctly for one hour — the life of an access token — and then spent
+    /// the rest of the session sending an expired bearer, which `sync` swallows
+    /// by design. The machine read offline while the shell was still serving.
+    #[tokio::test]
+    async fn every_beat_re_reads_the_credential() {
+        let mock = MockCloud::start().await;
+        let machine = format!("beatcred_{}", std::process::id());
+        let _ = std::fs::remove_file(super::super::context::target_path_for_test(&machine));
+
+        let held = beat_every(
+            Duration::from_millis(10),
+            Creds::Fixed("T".into()),
+            &mock.base_url(),
+            &machine,
+            "evo",
+        );
+        until("several beats", || mock.requests().len() >= 3).await;
+        drop(held);
+
+        // Every request carried a bearer — none went out unauthenticated because a
+        // cached token had gone stale.
+        let reqs = mock.requests();
+        assert!(
+            reqs.iter().all(|r| r.header("authorization").as_deref() == Some("Bearer T")),
+            "a beat must carry a freshly-read credential",
+        );
         let _ = std::fs::remove_file(super::super::context::target_path_for_test(&machine));
     }
 
@@ -374,7 +450,7 @@ mod tests {
         let machine = format!("beatdrop_{}", std::process::id());
         let _ = std::fs::remove_file(super::super::context::target_path_for_test(&machine));
 
-        let held = beat_every(Duration::from_millis(10), &mock.base_url(), "T", &machine, "evo");
+        let held = beat_every(Duration::from_millis(10), Creds::Fixed("T".into()), &mock.base_url(), &machine, "evo");
         until("the first beat", || !mock.requests().is_empty()).await;
         drop(held);
         // A beat already in flight may still land, so settle before reading the mark.
