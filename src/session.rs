@@ -130,6 +130,24 @@ impl SessionClient {
         Ok(())
     }
 
+    /// Report where this session is working NOW.
+    ///
+    /// A linked shell is a place a person moves around in, not a directory a run
+    /// starts and ends in. `cwd` used to be captured once at register, so the
+    /// console kept naming the directory `hanzo link` happened to start in long
+    /// after the shell had walked away — the field answered "which work is this"
+    /// with an answer that was true once.
+    pub async fn set_cwd(&self, id: &str, cwd: &str) -> Result<()> {
+        let body = json!({ "cwd": cwd });
+        self.send(
+            reqwest::Method::PATCH,
+            &format!("/v1/agents/sessions/{id}"),
+            Some(&body),
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Fetch a session's current server-side status (for resume decisions).
     pub async fn get(&self, id: &str) -> Result<Info> {
         let v = self.send(reqwest::Method::GET, &format!("/v1/agents/sessions/{id}"), None).await?;
