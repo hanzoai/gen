@@ -46,9 +46,6 @@ struct Config {
     /// If set, GET /v1/agents/sessions/:id returns this status while register
     /// still succeeds — the shape of a real 403 (another org), 404 (gone) or 5xx.
     session_get_code: Option<u16>,
-    /// When true, POST /v1/billing/deposit answers commerce's VERBATIM
-    /// PlatformOnly refusal — the deposit-403 incident, reproduced.
-    deposit_refused: bool,
     /// Steering commands this mock hands back on the control drain, as
     /// `(seq, command, message)`. A drain returns those with `seq > after`,
     /// oldest first — the same cursor contract as cloud's `drainControl`.
@@ -79,7 +76,6 @@ impl Default for Config {
             get_status: "paused".into(),
             targets_missing: false,
             session_get_code: None,
-            deposit_refused: false,
             control: Vec::new(),
             owned: None,
             control_delay_polls: 0,
@@ -119,13 +115,6 @@ impl MockCloud {
     /// deleted one (404), or a control-plane blip (5xx).
     pub async fn start_session_get_failing(code: u16) -> MockCloud {
         Self::with(Config { session_get_code: Some(code), ..Config::default() }).await
-    }
-
-    /// A mock that refuses a deposit exactly as commerce's `PlatformOnly` gate
-    /// does for a caller who is neither the internal service token nor a
-    /// SuperAdmin — the incident, on the wire.
-    pub async fn start_deposit_refused() -> MockCloud {
-        Self::with(Config { deposit_refused: true, ..Config::default() }).await
     }
 
     /// A mock whose control drain hands back `cmds` as `(seq, command, message)`.
@@ -396,23 +385,6 @@ fn respond(cfg: &Config, method: &str, path: &str) -> (String, String) {
             r#"{"balance":125000,"holds":0,"available":125000}"#.to_string(),
         );
     }
-    // POST deposit -> commerce's 201 receipt (api/billing/deposit.go), or the
-    // VERBATIM PlatformOnly 403 envelope (middleware/platformonly.go →
-    // util/json/http.Fail, which nests the message under `error`).
-    if method == "POST" && path == "/v1/billing/deposit" {
-        if cfg.deposit_refused {
-            return (
-                "403 Forbidden".into(),
-                r#"{"error":{"type":"api-error","message":"This operation requires platform-administrator or internal-service credentials."}}"#
-                    .to_string(),
-            );
-        }
-        return (
-            "201 Created".into(),
-            r#"{"transactionId":"txn_mock","user":"hanzo","amount":5000,"currency":"usd","type":"deposit","tags":""}"#.to_string(),
-        );
-    }
-
     // events -> 201, patch/control -> 200
     if method == "POST" && path.ends_with("/events") {
         return ("201 Created".into(), r#"{"id":"evt_mock"}"#.to_string());
