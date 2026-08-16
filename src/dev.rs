@@ -120,10 +120,14 @@ impl Backend for Agent {
                 cmd.env("HANZO_USER_KEY", token);
                 args.push("-c".into());
                 args.push(cfg_string("model", model));
-                // Name the model's REAL window so codex doesn't clamp a custom id to
-                // its 272K fallback — the true-1M path. A `model_catalog_json` (which
-                // we control) declares it; applied at startup via `-c`.
-                if *context_window > CODEX_FALLBACK_WINDOW {
+                // Name the model's REAL window so the agent doesn't clamp a custom
+                // id to its 272K fallback — the true-1M path. `dev` takes it as
+                // its `model_context_window` setting; codex reads a
+                // `model_catalog_json` (which we control), applied at startup via `-c`.
+                if *context_window > CODEX_FALLBACK_WINDOW && self.program == Agent::DEV.program {
+                    args.push("-c".into());
+                    args.push(format!("model_context_window={context_window}"));
+                } else if *context_window > CODEX_FALLBACK_WINDOW {
                     let mut file = tempfile::Builder::new()
                         .prefix("hanzo-codex-catalog-")
                         .suffix(".json")
@@ -409,10 +413,10 @@ mod tests {
         assert!(args.iter().any(|a| a == r#"approval_policy="never""#));
         assert!(args.iter().any(|a| a == r#"sandbox_mode="workspace-write""#));
         assert!(!args.iter().any(|a| a.contains("yolo") || a.contains("dangerously-bypass")));
-        // The gateway model's real (1M) window is named via a model catalog (the
-        // true-1M path), since the default window exceeds codex's 272K fallback.
-        assert!(args.iter().any(|a| a.starts_with("model_catalog_json=")), "gateway route must name the model window: {args:?}");
-        assert_eq!(l.cleanup.len(), 1, "the catalog temp file must outlive the child");
+        // The gateway model's real (1M) window is named as dev's own setting
+        // (the true-1M path), since the default window exceeds the 272K fallback.
+        assert!(args.iter().any(|a| a.starts_with("model_context_window=")), "gateway route must name the model window: {args:?}");
+        assert!(l.cleanup.is_empty(), "dev takes the window as a setting, not a file");
     }
 
     #[test]
@@ -604,8 +608,8 @@ mod tests {
     /// stands and a temp file is never created.
     #[test]
     fn gateway_route_names_the_model_window_via_catalog() {
-        // Default 1M window -> catalog written + declared 1M.
-        let l = Agent::DEV.build(&spec(Mode::Headless, "https://api.hanzo.ai")).unwrap();
+        // Default 1M window -> codex gets a catalog written + declared 1M.
+        let l = Agent::CODEX.build(&spec(Mode::Headless, "https://api.hanzo.ai")).unwrap();
         let path = argv(&l)
             .into_iter()
             .find_map(|a| a.strip_prefix("model_catalog_json=").map(str::to_string))
@@ -647,8 +651,15 @@ mod tests {
         // A standard window (<= codex's fallback) writes NO catalog.
         let mut s = spec(Mode::Headless, "https://api.hanzo.ai");
         s.routing = Route::Via(Routing::Gateway { api: "https://api.hanzo.ai".into(), token: "JWT".into(), model: "enso".into(), small_fast_model: "enso-flash".into(), context_window: 200_000 });
-        let l = Agent::DEV.build(&s).unwrap();
+        let l = Agent::CODEX.build(&s).unwrap();
         assert!(!argv(&l).iter().any(|a| a.starts_with("model_catalog_json=")), "no catalog below codex's fallback");
+        assert!(l.cleanup.is_empty());
+
+        // dev has the setting itself: the window rides in as `model_context_window`,
+        // and no file is written for it.
+        let l = Agent::DEV.build(&spec(Mode::Headless, "https://api.hanzo.ai")).unwrap();
+        assert!(argv(&l).iter().any(|a| a == "model_context_window=1000000"), "{:?}", argv(&l));
+        assert!(!argv(&l).iter().any(|a| a.starts_with("model_catalog_json=")));
         assert!(l.cleanup.is_empty());
     }
 }
