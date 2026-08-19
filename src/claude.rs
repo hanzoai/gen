@@ -361,7 +361,7 @@ mod tests {
             mode,
             task: Some("do it".into()),
             cwd: PathBuf::from("/tmp/proj"),
-            routing: Route::Via(Routing::Gateway { api: "https://api.hanzo.ai".into(), token: "JWT".into(), model: "enso".into(), small_fast_model: "enso-flash".into(), context_window: 1_000_000 }),
+            routing: Route::Via(Routing::Gateway { api: "https://api.hanzo.ai".into(), token: "JWT".into(), model: crate::commands::code::DEFAULT_MODEL.into(), small_fast_model: crate::commands::code::DEFAULT_SMALL_FAST_MODEL.into(), context_window: 1_000_000 }),
             // The default is auto-approve ON (the confirmed default).
             approval: Approval::Auto,
             mcp: Some(McpAttach { program: "hanzo-mcp".into(), args: vec!["--project-dir".into(), "/tmp/proj".into()] }),
@@ -439,8 +439,8 @@ mod tests {
     /// A gateway-routed run NAMES the model in the child env — Claude's built-in
     /// default (`claude-fable-5`) is not in the gateway catalog and would 400. The
     /// routing decision already resolved a valid catalog id; here it is the
-    /// built-in default (`enso`), carrying the `[1m]` extended-context suffix (the
-    /// default window is 1M and `enso` is a large-context model). The small/fast
+    /// built-in default, carrying the `[1m]` extended-context suffix (the default
+    /// window is 1M and the default SKU is a large-context model). The small/fast
     /// model rides the CURRENT var (`ANTHROPIC_DEFAULT_HAIKU_MODEL`), never the
     /// deprecated `ANTHROPIC_SMALL_FAST_MODEL`, which is cleared.
     #[test]
@@ -452,8 +452,17 @@ mod tests {
             .get_envs()
             .filter_map(|(k, v)| Some((k.to_string_lossy().to_string(), v?.to_string_lossy().to_string())))
             .collect();
-        assert_eq!(env.get("ANTHROPIC_MODEL").map(String::as_str), Some("enso[1m]"));
-        assert_eq!(env.get("ANTHROPIC_DEFAULT_HAIKU_MODEL").map(String::as_str), Some("enso-flash"));
+        // Read the constants rather than repeating their values: the family was
+        // renamed once already (`enso` -> `enso-auto`), and a literal here is a
+        // second place for the default to be stated and therefore to go stale.
+        assert_eq!(
+            env.get("ANTHROPIC_MODEL").map(String::as_str),
+            Some(format!("{}[1m]", crate::commands::code::DEFAULT_MODEL).as_str())
+        );
+        assert_eq!(
+            env.get("ANTHROPIC_DEFAULT_HAIKU_MODEL").map(String::as_str),
+            Some(crate::commands::code::DEFAULT_SMALL_FAST_MODEL)
+        );
         // The deprecated var is cleared so a stale shell export can't shadow it.
         assert!(cleared(&l, "ANTHROPIC_SMALL_FAST_MODEL"), "deprecated small/fast var must be cleared");
         // Gateway model discovery is enabled so the picker can surface the catalog.

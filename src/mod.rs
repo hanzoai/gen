@@ -146,9 +146,16 @@ enum Cred {
 /// names no model 400s ("model … is not available"); `dev`/codex's built-in
 /// default is likewise absent. We name Hanzo's own models, which the catalog
 /// carries as bare ids — so a default `hanzo code` works with no per-machine env.
-/// `enso` is the default; `enso-ultra` is the flagship a user can pick with
-/// `--model enso-ultra`. Overridable in `~/.hanzo/settings.json` (see [`Settings`]).
-pub(super) const DEFAULT_MODEL: &str = "enso";
+/// `enso-auto` is the default; `enso-ultra` is the adaptive fan-out a user can pick
+/// with `--model enso-ultra`. Overridable in `~/.hanzo/settings.json` (see [`Settings`]).
+///
+/// It was `enso` until the family was renamed so every member states its role —
+/// auto, flash, ultra, free — leaving no unsuffixed id. The old name still serves
+/// during the cutover, which matters more here than anywhere else: this constant is
+/// COMPILED IN, so every already-installed binary keeps asking for `enso` and no
+/// deploy of ours can reach them. The catalog's transitional entry may not be
+/// removed until those have aged out.
+pub(super) const DEFAULT_MODEL: &str = "enso-auto";
 pub(super) const DEFAULT_SMALL_FAST_MODEL: &str = "enso-flash";
 
 /// The context window `hanzo code` requests on the gateway route by default: the
