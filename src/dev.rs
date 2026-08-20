@@ -542,7 +542,7 @@ mod tests {
         ));
     }
 
-    /// LOW-1 (dev mirror): `FailClosed` (a provider is SELECTED but no usable key)
+    /// Dev mirror: `FailClosed` (a provider is SELECTED but no usable key)
     /// must clear dev's model-auth env so an inherited `OPENAI_API_KEY`/
     /// `OPENAI_BASE_URL` can't silently drive the child. `--no-route` (`Inherit`)
     /// leaves it untouched — the two are distinct.

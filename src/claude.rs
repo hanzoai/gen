@@ -641,7 +641,7 @@ mod tests {
             .collect()
     }
 
-    /// HIGH-1: a hostile repo shipping a `.mcp.json` (that would exfiltrate the
+    /// A hostile repo shipping a `.mcp.json` (that would exfiltrate the
     /// model key) must NOT be loaded by default. We pass `--strict-mcp-config`
     /// so Claude ignores every auto-discovered source, and we never hand the
     /// repo file to `--mcp-config` — so the hostile server is never spawned and
@@ -734,7 +734,7 @@ mod tests {
             .and_then(|i| args.get(i + 1).cloned())
     }
 
-    /// HIGH-1 (reopened): a hostile repo's `.claude/settings.json` can declare a
+    /// A hostile repo's `.claude/settings.json` can declare a
     /// `SessionStart` hook (or `statusLine` / project plugin) that auto-runs a
     /// shell command inheriting our env — where the routing bearer lives. In the
     /// default headless `-p` path the trust dialog is skipped, so those repo
@@ -976,7 +976,7 @@ mod tests {
         l.command.as_std().get_envs().any(|(k, _)| k.to_string_lossy() == var)
     }
 
-    /// LOW-1: `FailClosed` (a provider is SELECTED but no usable key resolved) must
+    /// `FailClosed` (a provider is SELECTED but no usable key resolved) must
     /// clear ALL of Claude's model-auth env. Otherwise a hostile shell
     /// `ANTHROPIC_BASE_URL` would silently redirect prompts+code — the exact
     /// fail-open the finding flagged. The run denies the route, never inherits it.

@@ -133,7 +133,7 @@ fn cwd_or_friendly(r: std::io::Result<PathBuf>) -> Result<PathBuf> {
 enum Cred {
     /// The active identity's hanzo.id bearer — already in hand, no Vault read.
     Bearer,
-    /// A stored `hk-` Hanzo gateway key.
+    /// A stored `sk-` Hanzo gateway key.
     HanzoKey,
     /// A stored `sk-ant-` Anthropic key (direct to api.anthropic.com).
     AnthropicKey,
@@ -241,7 +241,7 @@ fn gateway_models(backend: BackendKind, model_flag: Option<&str>, settings: &Set
 /// exactly one place.
 ///
 /// A DIRECT provider is tried ONLY when it matches the backend it can drive
-/// (Anthropic↔Claude, OpenAI↔dev); the Hanzo gateway (bearer, then `hk-` key) is
+/// (Anthropic↔Claude, OpenAI↔dev); the Hanzo gateway (bearer, then `sk-` key) is
 /// always the fallback, so a signed-in user keeps routing even if a direct key
 /// is absent or paired with the wrong backend.
 fn route_plan(backend: BackendKind, provider: Option<&str>, has_bearer: bool) -> Vec<Cred> {
@@ -1517,7 +1517,7 @@ mod tests {
         assert!(mock.requests().iter().any(|r| r.method == "POST" && r.path == "/v1/agents/sessions"));
     }
 
-    /// MED-2: lineage is only written for a session we VERIFIED.
+    /// Lineage is only written for a session we VERIFIED.
     ///
     /// Every `GET` failure — 403 (another org), 404 (gone), 5xx/timeout/DNS —
     /// leaves us unable to say the id is ours or even real, so we must register
@@ -1722,7 +1722,7 @@ mod tests {
             model: None,
             passthrough: vec![],
         };
-        // Routing ON (gateway), stream OFF — the exact case LOW-1 flagged:
+        // Routing ON (gateway), stream OFF — the case that regressed:
         // --no-link but model calls still ship code to the gateway.
         let gw = Routing::Gateway { api: "https://api.hanzo.ai".into(), token: "T".into(), model: "enso".into(), small_fast_model: "enso-flash".into(), context_window: 1_000_000 };
         let (route, stream) = status_lines(&opts, Some(&gw), true, None);
@@ -1787,7 +1787,7 @@ mod tests {
     }
 
     /// The routing precedence: a direct provider is preferred ONLY when it can
-    /// drive the backend, and the gateway (bearer, then hk-) is always the tail.
+    /// drive the backend, and the gateway (bearer, then sk-) is always the tail.
     #[test]
     fn route_plan_prefers_a_matching_direct_provider_else_the_gateway() {
         use BackendKind::{Claude, Dev};
@@ -1896,7 +1896,7 @@ mod tests {
         std::env::remove_var("ANTHROPIC_SMALL_FAST_MODEL");
     }
 
-    /// LOW-1: when the credential plan resolves NOTHING, a SELECTED provider fails
+    /// When the credential plan resolves NOTHING, a SELECTED provider fails
     /// closed (the backend then clears its model-auth env, and `run` warns), while
     /// an unconfigured/signed-out run inherits the backend's own account —
     /// unchanged, so "continuing locally" still works with a user's own key.

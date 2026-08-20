@@ -130,7 +130,7 @@ pub enum Mode {
 /// has exactly one place it is answered for routing:
 /// - `Gateway` — the Hanzo gateway (api.hanzo.ai). Metered into cloud_usage/o11y
 ///   regardless of account/machine; the credential is the hanzo.id bearer (or a
-///   stored `hk-` gateway key). The recommended path.
+///   stored `sk-` gateway key). The recommended path.
 /// - `Anthropic` / `OpenAI` — the vendor's own API, reached directly with the
 ///   user's own key. Not metered by Hanzo; billed by the vendor.
 ///
@@ -139,7 +139,7 @@ pub enum Mode {
 /// bearer — only the non-secret `api` survives.
 #[derive(Clone)]
 pub enum Routing {
-    /// Route through the Hanzo gateway; `token` is the hanzo.id bearer / `hk-` key.
+    /// Route through the Hanzo gateway; `token` is the hanzo.id bearer / `sk-` key.
     Gateway {
         /// The active network's api origin (e.g. https://api.hanzo.ai).
         api: String,
@@ -420,14 +420,14 @@ mod tests {
         assert!(BackendKind::parse("gpt").is_err());
     }
 
-    /// LOW-2: `Routing`'s `Debug` must REDACT the secret. No path prints it today,
+    /// `Routing`'s `Debug` must REDACT the secret. No path prints it today,
     /// but `-vvv` wires `trace!`, so a future `trace!(?routing)` would otherwise
     /// leak an `sk-ant-…`/`hk-…`/bearer. The non-secret `api` stays for debugging.
     #[test]
     fn routing_debug_redacts_the_secret() {
-        let g = Routing::Gateway { api: "https://api.hanzo.ai".into(), token: "hk-SECRET-TOKEN".into(), model: "enso".into(), small_fast_model: "enso-flash".into(), context_window: 1_000_000 };
+        let g = Routing::Gateway { api: "https://api.hanzo.ai".into(), token: "sk-SECRET-TOKEN".into(), model: "enso".into(), small_fast_model: "enso-flash".into(), context_window: 1_000_000 };
         let s = format!("{g:?}");
-        assert!(!s.contains("hk-SECRET-TOKEN"), "token leaked in Debug: {s}");
+        assert!(!s.contains("sk-SECRET-TOKEN"), "token leaked in Debug: {s}");
         assert!(s.contains("***"), "expected a redaction marker: {s}");
         assert!(s.contains("api.hanzo.ai"), "the non-secret api should survive: {s}");
 
@@ -435,8 +435,8 @@ mod tests {
         assert!(!format!("{:?}", Routing::OpenAI { key: "sk-proj-SECRET".into() }).contains("sk-proj-SECRET"));
 
         // `Route` composes the redacting `Debug`, so wrapping never re-exposes it.
-        let r = Route::Via(Routing::Gateway { api: "x".into(), token: "hk-INNER".into(), model: "enso".into(), small_fast_model: "enso-flash".into(), context_window: 1_000_000 });
-        assert!(!format!("{r:?}").contains("hk-INNER"), "Route::Via leaked the inner secret");
+        let r = Route::Via(Routing::Gateway { api: "x".into(), token: "sk-INNER".into(), model: "enso".into(), small_fast_model: "enso-flash".into(), context_window: 1_000_000 });
+        assert!(!format!("{r:?}").contains("sk-INNER"), "Route::Via leaked the inner secret");
     }
 
     /// `Route::via()` yields the credential only for `Via`; the two no-credential
