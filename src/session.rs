@@ -7,7 +7,7 @@
 //! at the gateway, not trusted from here. See `cloud/clients/agents/sessions.go`.
 
 use anyhow::{Context, Result};
-use reqwest::Client;
+use hanzo_client::{Http, Method, Request, Transport};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -16,7 +16,7 @@ use super::event::{Kind, Status};
 
 #[derive(Clone)]
 pub struct SessionClient {
-    http: Client,
+    wire: Http,
     api: String, // base origin, no trailing slash (e.g. https://api.hanzo.ai)
     token: String,
 }
@@ -43,12 +43,12 @@ impl Info {
 
 impl SessionClient {
     pub fn new(api: &str, token: &str) -> Result<Self> {
-        let http = Client::builder()
+        let wire = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
             .context("building session http client")?;
         Ok(Self {
-            http,
+            wire: Http::new(wire),
             api: api.trim_end_matches('/').to_string(),
             token: token.to_string(),
         })
@@ -75,7 +75,7 @@ impl SessionClient {
             "agent": agent, "title": title, "host": host, "cwd": cwd,
             "status": Status::Running.as_str(),
         });
-        let v = self.send(reqwest::Method::POST, "/v1/agents/sessions", Some(&body)).await?;
+        let v = self.send(Method::POST, "/v1/agents/sessions", Some(&body)).await?;
         let id = v
             .get("id")
             .and_then(Value::as_str)
@@ -87,7 +87,7 @@ impl SessionClient {
     /// Append one event to a session's ordered log.
     pub async fn event(&self, id: &str, kind: Kind, payload: Value) -> Result<()> {
         let body = json!({ "kind": kind.as_str(), "payload": payload });
-        self.send(reqwest::Method::POST, &format!("/v1/agents/sessions/{id}/events"), Some(&body))
+        self.send(Method::POST, &format!("/v1/agents/sessions/{id}/events"), Some(&body))
             .await?;
         Ok(())
     }
@@ -106,7 +106,7 @@ impl SessionClient {
         if status.is_terminal() {
             body["terminal"] = json!("");
         }
-        self.send(reqwest::Method::PATCH, &format!("/v1/agents/sessions/{id}"), Some(&body))
+        self.send(Method::PATCH, &format!("/v1/agents/sessions/{id}"), Some(&body))
             .await?;
         Ok(())
     }
@@ -122,7 +122,7 @@ impl SessionClient {
     pub async fn publish_terminal(&self, id: &str, url: &str) -> Result<()> {
         let body = json!({ "terminal": url });
         self.send(
-            reqwest::Method::PATCH,
+            Method::PATCH,
             &format!("/v1/agents/sessions/{id}"),
             Some(&body),
         )
@@ -140,7 +140,7 @@ impl SessionClient {
     pub async fn set_cwd(&self, id: &str, cwd: &str) -> Result<()> {
         let body = json!({ "cwd": cwd });
         self.send(
-            reqwest::Method::PATCH,
+            Method::PATCH,
             &format!("/v1/agents/sessions/{id}"),
             Some(&body),
         )
@@ -150,7 +150,7 @@ impl SessionClient {
 
     /// Fetch a session's current server-side status (for resume decisions).
     pub async fn get(&self, id: &str) -> Result<Info> {
-        let v = self.send(reqwest::Method::GET, &format!("/v1/agents/sessions/{id}"), None).await?;
+        let v = self.send(Method::GET, &format!("/v1/agents/sessions/{id}"), None).await?;
         serde_json::from_value(v).context("parsing session info")
     }
 
@@ -165,13 +165,22 @@ impl SessionClient {
     /// someone else's commands.
     pub async fn drain_control(&self, id: &str, after: i64) -> Result<super::control::Page> {
         let path = format!("/v1/agents/sessions/{id}/control?after={after}");
-        let v = self.send(reqwest::Method::GET, &path, None).await?;
+        let v = self.send(Method::GET, &path, None).await?;
         serde_json::from_value(v).context("parsing control page")
     }
 
-    async fn send(&self, method: reqwest::Method, path: &str, body: Option<&Value>) -> Result<Value> {
-        let url = format!("{}{}", self.api, path);
-        crate::http::send_json(&self.http, method, &url, &self.token, body).await
+    async fn send(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&Value>,
+    ) -> Result<Value> {
+        let mut request =
+            Request::new(method, format!("{}{}", self.api, path)).token(&self.token);
+        if let Some(body) = body {
+            request = request.body(body.clone());
+        }
+        Ok(self.wire.send(request).await?.ok()?)
     }
 }
 

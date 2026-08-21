@@ -13,19 +13,18 @@
 //! `cloud/clients/agents/targets.go`.
 
 use anyhow::{Context, Result};
-use reqwest::{Client, Method};
+use hanzo_client::{Http, Method, Request, Transport};
 use serde::Serialize;
 use serde_json::Value;
 use std::time::Duration;
 
 use super::context::{Machine, Metrics, Spec, TargetRecord};
 use crate::config::Config;
-use crate::http::send_json;
 use crate::iam::{paths, store};
 
 #[derive(Clone)]
 pub struct TargetClient {
-    http: Client,
+    wire: Http,
     api: String, // base origin, no trailing slash
     token: String,
 }
@@ -65,11 +64,15 @@ impl Register {
 
 impl TargetClient {
     pub fn new(api: &str, token: &str) -> Result<Self> {
-        let http = Client::builder()
+        let wire = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
             .context("building target http client")?;
-        Ok(Self { http, api: api.trim_end_matches('/').to_string(), token: token.to_string() })
+        Ok(Self {
+            wire: Http::new(wire),
+            api: api.trim_end_matches('/').to_string(),
+            token: token.to_string(),
+        })
     }
 
     /// Register-or-upsert this machine's target (`POST /v1/agents/targets`).
@@ -89,8 +92,12 @@ impl TargetClient {
     }
 
     async fn send(&self, method: Method, path: &str, body: Option<&Register>) -> Result<Value> {
-        let url = format!("{}{}", self.api, path);
-        send_json(&self.http, method, &url, &self.token, body).await
+        let mut request =
+            Request::new(method, format!("{}{}", self.api, path)).token(&self.token);
+        if let Some(body) = body {
+            request = request.body(serde_json::to_value(body).context("encoding the target")?);
+        }
+        Ok(self.wire.send(request).await?.ok()?)
     }
 }
 
