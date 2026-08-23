@@ -36,6 +36,16 @@ impl BackendKind {
         }
     }
 
+    /// The canonical spelling, which is the one [`BackendKind::parse`] accepts
+    /// first. Kept beside that table so a name can be written and read back.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BackendKind::Dev => "dev",
+            BackendKind::Claude => "claude",
+            BackendKind::Codex => "codex",
+        }
+    }
+
     /// Does this operand NAME a backend (as opposed to being a task)? Reads the
     /// same table [`BackendKind::parse`] does, so the two can never disagree.
     pub fn names(s: &str) -> bool {
@@ -47,7 +57,7 @@ impl BackendKind {
 const EXPECTED: &str = "dev | claude | codex";
 
 /// The default backend when no spelling names one: OUR agent.
-const DEFAULT: BackendKind = BackendKind::Dev;
+pub const DEFAULT: BackendKind = BackendKind::Dev;
 
 /// How a backend was named on the command line. The CLI offers several spellings
 /// —
@@ -74,6 +84,11 @@ pub struct Selection {
     /// `--backend X`, or whichever of `--claude` / `--codex` / `--dev` was set.
     /// clap's arg group guarantees at most one of those reaches us.
     pub named: Option<String>,
+    /// `agent` from `~/.hanzo/settings.json`, if the reader set one. Passed IN
+    /// rather than read here so this stays a pure function of the command line
+    /// plus one value — the file is the caller's business, and every case below
+    /// is testable without a `$HOME`.
+    pub configured: Option<String>,
 }
 
 /// Resolve `(backend, task)` from every spelling at once.
@@ -108,9 +123,16 @@ pub fn select(sel: Selection) -> Result<(BackendKind, Option<String>)> {
         );
     }
 
-    let kind = match sel.named.as_deref() {
-        Some(name) => BackendKind::parse(name)?,
-        None => DEFAULT,
+    // Most specific first: a name on the command line, then the reader's
+    // configured agent, then ours. A bad value in the file is an ERROR, not a
+    // fallback — the three are different products, and quietly running `dev` for
+    // someone who asked for `codex` is the failure this ordering exists to avoid.
+    let kind = match (sel.named.as_deref(), sel.configured.as_deref()) {
+        (Some(name), _) => BackendKind::parse(name)?,
+        (None, Some(agent)) => BackendKind::parse(agent).map_err(|e| {
+            anyhow::anyhow!("{e} — from `agent` in ~/.hanzo/settings.json")
+        })?,
+        (None, None) => DEFAULT,
     };
     Ok((kind, sel.positional))
 }
@@ -355,7 +377,50 @@ mod tests {
             positional: positional.map(String::from),
             tail: tail.map(String::from),
             named: named.map(String::from),
+            configured: None,
         }
+    }
+
+    /// Same, with an agent configured in `~/.hanzo/settings.json`.
+    fn sel_cfg(named: Option<&str>, configured: &str) -> Selection {
+        Selection {
+            positional: None,
+            tail: None,
+            named: named.map(String::from),
+            configured: Some(configured.to_string()),
+        }
+    }
+
+    #[test]
+    fn a_configured_agent_runs_when_nothing_names_one() {
+        let (kind, _) = select(sel_cfg(None, "claude")).unwrap();
+        assert_eq!(kind, BackendKind::Claude);
+        let (kind, _) = select(sel_cfg(None, "codex")).unwrap();
+        assert_eq!(kind, BackendKind::Codex);
+    }
+
+    #[test]
+    fn naming_one_beats_the_configured_agent() {
+        // An invocation is more specific than a default, in both directions.
+        let (kind, _) = select(sel_cfg(Some("dev"), "claude")).unwrap();
+        assert_eq!(kind, BackendKind::Dev);
+        let (kind, _) = select(sel_cfg(Some("codex"), "claude")).unwrap();
+        assert_eq!(kind, BackendKind::Codex);
+    }
+
+    #[test]
+    fn an_unreadable_configured_agent_is_refused_not_ignored() {
+        // Falling back to ours would run a different product than the reader
+        // asked for, and say nothing about it.
+        let err = select(sel_cfg(None, "clod")).unwrap_err().to_string();
+        assert!(err.contains("clod"), "{err}");
+        assert!(err.contains("settings.json"), "{err}");
+    }
+
+    #[test]
+    fn no_agent_configured_is_still_ours() {
+        let (kind, _) = select(sel(None, None, None)).unwrap();
+        assert_eq!(kind, DEFAULT);
     }
 
     /// The point of [`select`]: every spelling is the SAME resolution. If these

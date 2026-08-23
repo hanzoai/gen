@@ -37,6 +37,16 @@ pub struct Settings {
     /// still forces it off regardless.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mcp: Option<bool>,
+    /// Which coding agent a bare `hanzo code` runs: `dev`, `claude` or `codex`.
+    /// Unset ⇒ [`super::backend::DEFAULT`] (`dev`, ours). Naming one on the
+    /// command line — `hanzo code claude`, `--claude`, `--backend claude` — wins
+    /// over this, because an invocation is more specific than a default.
+    ///
+    /// The three are separate products, so an unreadable value is REFUSED rather
+    /// than silently falling back to ours: a reader who set `codex` and got `dev`
+    /// would be told nothing while a different agent read their repository.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
     /// The context window (in tokens) `hanzo code` requests on the GATEWAY route.
     /// Unset ⇒ [`super::DEFAULT_CONTEXT_WINDOW`] (1M). Hanzo's frontier models are
     /// natively 1M, but a coding backend pointed at a custom gateway can't verify
@@ -82,6 +92,7 @@ fn defaults_document() -> Settings {
         auto_approve: Some(true),
         mcp: Some(true),
         context_window: Some(super::DEFAULT_CONTEXT_WINDOW),
+        agent: Some(super::backend::DEFAULT.as_str().to_string()),
     }
 }
 

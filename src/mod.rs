@@ -215,6 +215,14 @@ struct GatewayModels {
 /// the Claude backend, whose model auth reads them; `dev`/codex reads neither, so
 /// its model is `--model` > settings > built-in default (and it has no small/fast
 /// model at all).
+/// The reader's configured coding agent, for resolving a bare `hanzo code`.
+///
+/// A narrow door rather than a public settings module: the caller needs exactly
+/// this one value, and `select` is a pure function that takes it as an argument.
+pub fn configured_agent() -> Option<String> {
+    Settings::load().agent
+}
+
 fn gateway_models(backend: BackendKind, model_flag: Option<&str>, settings: &Settings) -> GatewayModels {
     let claude = backend == BackendKind::Claude;
     let env = |k: &str| claude.then(|| std::env::var(k).ok()).flatten();
