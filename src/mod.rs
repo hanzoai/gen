@@ -217,7 +217,7 @@ struct GatewayModels {
 /// model at all).
 /// The reader's configured coding agent, for resolving a bare `hanzo code`.
 ///
-/// A narrow door rather than a public settings module: the caller needs exactly
+/// A narrow accessor rather than a public settings module: the caller needs exactly
 /// this one value, and `select` is a pure function that takes it as an argument.
 pub fn configured_agent() -> Option<String> {
     Settings::load().agent
