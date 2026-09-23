@@ -29,6 +29,7 @@ mod dev;
 // must be able to name the value it is setting.
 pub mod event;
 mod home;
+pub mod sample;
 pub mod session;
 mod settings;
 pub mod target;

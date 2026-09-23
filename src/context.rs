@@ -88,7 +88,7 @@ impl Snapshot {
     }
 }
 
-// ---- machine capability plane (the cloud run-target: /v1/agents/targets) ----
+// ---- machine capability plane (the cloud run-target: /v1/agent/targets) ----
 //
 // A linked machine reports what it IS (Spec) and what it is DOING now (Metrics) so
 // mission-control can show which computer a session runs on and whether it can take
@@ -110,9 +110,10 @@ pub struct Gpu {
     pub memory: i64,
 }
 
-/// A machine's STATIC capability — what it IS. Matches cloud's `agents.Spec`.
+/// A machine's STATIC capability — what it IS. Matches cloud's `agent.Spec`.
 /// Every field is best-effort; an unknown value stays 0 / empty.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Spec {
     pub os: String,
     pub arch: String,
@@ -123,20 +124,80 @@ pub struct Spec {
     pub gpus: Vec<Gpu>,
 }
 
-/// A machine's LIVE sample — what it is DOING now. Matches cloud's `agents.Metrics`
+/// A machine's LIVE sample — what it is DOING now. Matches cloud's `agent.Metrics`
 /// MINUS `at`: the server owns the staleness clock and stamps it, so a client can
-/// never forge or backdate a heartbeat. The field names ARE the wire names.
+/// never forge or backdate a heartbeat. The field names ARE the wire names, and the
+/// console reads targets back into this same type, so an absent field is `None`
+/// (unknown), never a zero.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct Metrics {
     pub load1: f64,
     pub load5: f64,
     pub load15: f64,
-    #[serde(rename = "memUsed")]
     pub mem_used: i64,
-    #[serde(rename = "memFree")]
     pub mem_free: i64,
-    #[serde(rename = "gpuUtil")]
     pub gpu_util: f64,
+    /// Busy fraction of all cores over the sample window, 0..1.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_util: Option<f64>,
+    /// CPU package temperature, °C.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_temp: Option<f64>,
+    /// Hottest GPU, °C.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_temp: Option<f64>,
+    /// Total GPU power draw, W.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_power: Option<f64>,
+    /// Total enforced GPU power limit, W.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_power_limit: Option<f64>,
+    /// Memory held by GPU processes, bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_mem_used: Option<i64>,
+    /// Dedicated VRAM, bytes; `None` when the GPU shares system memory (unified).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_mem_total: Option<i64>,
+    /// Used bytes across local block filesystems.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_used: Option<i64>,
+    /// Used plus available bytes on those filesystems (df's size, less reserved blocks).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_total: Option<i64>,
+    /// Block-device read rate, bytes/s.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_read: Option<f64>,
+    /// Block-device write rate, bytes/s.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_write: Option<f64>,
+    /// Receive rate over physical interfaces, bytes/s.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub net_rx: Option<f64>,
+    /// Transmit rate over physical interfaces, bytes/s.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub net_tx: Option<f64>,
+    /// Model id(s) served on this machine, comma-separated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Generation throughput over the sample window, tokens/s.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decode: Option<f64>,
+    /// Prompt (prefill) throughput over the sample window, tokens/s.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefill: Option<f64>,
+    /// Mean time to first token of requests that started in the window, seconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttft: Option<f64>,
+    /// Requests being served now.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub running: Option<i64>,
+    /// Requests queued.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waiting: Option<i64>,
+    /// KV-cache occupancy, 0..1.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kv_cache: Option<f64>,
 }
 
 /// The machine a coding session runs on: its static capability (`spec`) and its
@@ -152,10 +213,10 @@ impl Machine {
     /// that is absent, fails, or times out yields 0/empty; NONE can block or fail
     /// the caller. Reads only explicit system sources — never the environment.
     pub async fn capture() -> Machine {
-        let (gpus, gpu_util) = gpus().await;
+        let (gpus, gpu_util, board) = gpus().await;
         let (total, used, free) = memory().await;
         let (load1, load5, load15) = loadavg().await;
-        Machine {
+        let mut machine = Machine {
             spec: Spec {
                 os: std::env::consts::OS.to_string(),
                 arch: std::env::consts::ARCH.to_string(),
@@ -170,8 +231,11 @@ impl Machine {
                 mem_used: used,
                 mem_free: free,
                 gpu_util: finite(gpu_util),
+                ..Default::default()
             },
-        }
+        };
+        board.apply(&mut machine.metrics);
+        machine
     }
 }
 
@@ -248,20 +312,41 @@ async fn loadavg() -> (f64, f64, f64) {
     }
 }
 
-/// Best-effort accelerators + aggregate utilization (0..1). Tries nvidia-smi first
-/// (name + VRAM + util in one shot); on Linux falls back to lspci (name only) for
+/// The live readings nvidia-smi gives beside the inventory, aggregated across GPUs.
+/// `None` is a reading the driver did not give (a GB10 has no `memory.total`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct Board {
+    pub temp: Option<f64>,
+    pub power: Option<f64>,
+    pub limit: Option<f64>,
+    pub vram_used: Option<i64>,
+    pub vram_total: Option<i64>,
+}
+
+impl Board {
+    fn apply(&self, m: &mut Metrics) {
+        m.gpu_temp = self.temp;
+        m.gpu_power = self.power;
+        m.gpu_power_limit = self.limit;
+        m.gpu_mem_used = self.vram_used;
+        m.gpu_mem_total = self.vram_total;
+    }
+}
+
+/// The nvidia-smi query: inventory, utilization and the board readings in one run.
+const NVIDIA_QUERY: &str =
+    "--query-gpu=name,memory.total,utilization.gpu,temperature.gpu,power.draw,power.limit,memory.used";
+
+/// Best-effort accelerators + aggregate utilization (0..1) + board readings. Tries
+/// nvidia-smi first (one query); on Linux falls back to lspci (name only) for
 /// AMD/Intel/other, on macOS to system_profiler. Bounded to `MAX_GPUS`.
-async fn gpus() -> (Vec<Gpu>, f64) {
-    if let Some(out) = probe(
-        "nvidia-smi",
-        &["--query-gpu=name,memory.total,utilization.gpu", "--format=csv,noheader,nounits"],
-        PROBE_TIMEOUT,
-    )
-    .await
+async fn gpus() -> (Vec<Gpu>, f64, Board) {
+    if let Some(out) =
+        probe("nvidia-smi", &[NVIDIA_QUERY, "--format=csv,noheader,nounits"], PROBE_TIMEOUT).await
     {
-        let (gpus, util) = parse_nvidia(&out);
+        let (gpus, util, board) = parse_nvidia(&out);
         if !gpus.is_empty() {
-            return (gpus, util);
+            return (gpus, util, board);
         }
     }
     let gpus = match std::env::consts::OS {
@@ -272,7 +357,7 @@ async fn gpus() -> (Vec<Gpu>, f64) {
             .unwrap_or_default(),
         _ => Vec::new(),
     };
-    (gpus, 0.0)
+    (gpus, 0.0, Board::default())
 }
 
 /// Run a read-only system probe with a hard deadline, returning trimmed stdout on a
@@ -281,7 +366,7 @@ async fn gpus() -> (Vec<Gpu>, f64) {
 /// The child gets a MINIMAL environment (PATH only): no other environment value can
 /// influence a probe or round-trip into captured data — the SAME privacy hard-line
 /// the git probe holds. `kill_on_drop` guarantees a timed-out probe is reaped.
-async fn probe(program: &str, args: &[&str], timeout: Duration) -> Option<String> {
+pub(crate) async fn probe(program: &str, args: &[&str], timeout: Duration) -> Option<String> {
     let mut cmd = tokio::process::Command::new(program);
     cmd.args(args)
         .env_clear()
@@ -358,39 +443,58 @@ fn parse_vm_stat(s: &str) -> (i64, i64) {
     (nonneg(used), nonneg(free))
 }
 
-/// Parse `nvidia-smi --query-gpu=name,memory.total,utilization.gpu
-/// --format=csv,noheader,nounits`: one row per GPU ("NVIDIA GB10, 98304, 40"),
-/// memory in MiB, utilization in percent. Returns the GPUs + the mean util (0..1).
-fn parse_nvidia(csv: &str) -> (Vec<Gpu>, f64) {
+/// Parse `nvidia-smi --query-gpu=name,memory.total,utilization.gpu,temperature.gpu,
+/// power.draw,power.limit,memory.used --format=csv,noheader,nounits`: one row per
+/// GPU ("NVIDIA GB10, [N/A], 40, 54, 16.52, [N/A], [N/A]"), memory in MiB,
+/// utilization in percent. Returns the GPUs, the mean util (0..1) and the board
+/// readings: the hottest temperature, summed power, and VRAM summed only when every
+/// GPU reports it — a unified GPU reports none, and a partial sum would lie.
+fn parse_nvidia(csv: &str) -> (Vec<Gpu>, f64, Board) {
     let mut gpus = Vec::new();
     let mut util_sum = 0.0;
     let mut util_n = 0u32;
+    let mut board = Board::default();
+    let (mut used, mut total, mut rows) = (Some(0i64), Some(0i64), 0);
     for line in csv.lines() {
         let cols: Vec<&str> = line.split(',').map(str::trim).collect();
         let model = cols.first().copied().unwrap_or("");
         if model.is_empty() {
             continue;
         }
-        let memory = cols
-            .get(1)
-            .and_then(|s| s.parse::<i64>().ok())
-            .map(|mib| mib.saturating_mul(1024 * 1024))
-            .unwrap_or(0);
-        if let Some(u) = cols.get(2).and_then(|s| s.parse::<f64>().ok()) {
+        let num = |i: usize| cols.get(i).and_then(|s| s.parse::<f64>().ok()).filter(|f| f.is_finite() && *f >= 0.0);
+        let mib = |i: usize| num(i).map(|m| nonneg((m * 1048576.0) as i64));
+        if let Some(u) = num(2) {
             util_sum += u;
             util_n += 1;
         }
+        if let Some(t) = num(3) {
+            board.temp = Some(board.temp.map_or(t, |b: f64| b.max(t)));
+        }
+        if let Some(p) = num(4) {
+            board.power = Some(board.power.unwrap_or(0.0) + p);
+        }
+        if let Some(l) = num(5) {
+            board.limit = Some(board.limit.unwrap_or(0.0) + l);
+        }
+        let vram = mib(1);
+        total = total.zip(vram).map(|(a, b)| a + b);
+        used = used.zip(mib(6)).map(|(a, b)| a + b);
+        rows += 1;
         gpus.push(Gpu {
             vendor: "nvidia".to_string(),
             model: clamp_model(model.strip_prefix("NVIDIA ").unwrap_or(model)),
-            memory: nonneg(memory),
+            memory: vram.unwrap_or(0),
         });
         if gpus.len() >= MAX_GPUS {
             break;
         }
     }
+    if rows > 0 {
+        board.vram_total = total.filter(|t| *t > 0);
+        board.vram_used = used.filter(|_| board.vram_total.is_some());
+    }
     let util = if util_n > 0 { (util_sum / util_n as f64) / 100.0 } else { 0.0 };
-    (gpus, util)
+    (gpus, util, board)
 }
 
 /// Parse `lspci` output for display controllers (name only — no VRAM/util). The
@@ -945,14 +1049,34 @@ mod tests {
         assert_eq!(spec["memory"], serde_json::json!(137438953472i64));
         assert_eq!(gpu["memory"], serde_json::json!(103079215104i64));
 
-        let m = Metrics { load1: 1.5, load5: 1.2, load15: 0.9, mem_used: 42, mem_free: 7, gpu_util: 0.4 };
+        let m = Metrics { load1: 1.5, load5: 1.2, load15: 0.9, mem_used: 42, mem_free: 7, gpu_util: 0.4, ..Default::default() };
         let mv = serde_json::to_value(&m).unwrap();
         let mkeys: std::collections::HashSet<&str> = mv.as_object().unwrap().keys().map(String::as_str).collect();
         // The camelCase names the server reads — and NO `at` (server-stamped only).
+        // An unknown reading is absent, never a zero.
         assert_eq!(mkeys, ["load1", "load5", "load15", "memUsed", "memFree", "gpuUtil"].into_iter().collect());
         assert!(mv.get("at").is_none(), "client must never send the metrics timestamp");
         assert_eq!(mv["memUsed"], serde_json::json!(42));
         assert_eq!(mv["gpuUtil"], serde_json::json!(0.4));
+
+        let full = Metrics {
+            cpu_util: Some(0.5), cpu_temp: Some(80.0), gpu_temp: Some(54.0), gpu_power: Some(16.5),
+            gpu_power_limit: Some(120.0), gpu_mem_used: Some(1), gpu_mem_total: Some(2), disk_used: Some(3),
+            disk_total: Some(4), disk_read: Some(5.0), disk_write: Some(6.0), net_rx: Some(7.0), net_tx: Some(8.0),
+            model: Some("m".into()), decode: Some(40.0), prefill: Some(900.0), ttft: Some(0.2),
+            running: Some(1), waiting: Some(0), kv_cache: Some(0.1), ..m.clone()
+        };
+        let fv = serde_json::to_value(&full).unwrap();
+        let fkeys: std::collections::HashSet<&str> = fv.as_object().unwrap().keys().map(String::as_str).collect();
+        let wire = [
+            "load1", "load5", "load15", "memUsed", "memFree", "gpuUtil", "cpuUtil", "cpuTemp", "gpuTemp",
+            "gpuPower", "gpuPowerLimit", "gpuMemUsed", "gpuMemTotal", "diskUsed", "diskTotal", "diskRead",
+            "diskWrite", "netRx", "netTx", "model", "decode", "prefill", "ttft", "running", "waiting", "kvCache",
+        ];
+        assert_eq!(fkeys, wire.into_iter().collect());
+        // What the cloud hands back reads into the same type, `at` and all.
+        let back: Metrics = serde_json::from_value(serde_json::json!({"memUsed": 9, "gpuTemp": 61.5, "at": 1789444766})).unwrap();
+        assert_eq!((back.mem_used, back.gpu_temp, back.decode), (9, Some(61.5), None));
     }
 
     /// Capture on THIS machine returns a sane spec (cpus > 0) and reports live
@@ -1000,21 +1124,38 @@ mod tests {
     #[test]
     fn parse_nvidia_handles_real_empty_and_garbage() {
         // Empty input -> no GPUs, zero util.
-        let (g, u) = parse_nvidia("");
+        let (g, u, b) = parse_nvidia("");
         assert!(g.is_empty() && u == 0.0);
+        assert_eq!(b, Board::default());
 
-        // A real two-GPU sample: MiB memory, percent util, "NVIDIA " prefix trimmed.
-        let (g, u) = parse_nvidia("NVIDIA GB10, 98304, 40\nNVIDIA GB10, 98304, 60");
+        // Two discrete GPUs: MiB memory, percent util, "NVIDIA " prefix trimmed,
+        // the hottest temperature, summed power and summed VRAM.
+        let (g, u, b) = parse_nvidia(
+            "NVIDIA RTX 4090, 24564, 40, 61, 210.5, 450.00, 12000\nNVIDIA RTX 4090, 24564, 60, 70, 300, 450, 4000",
+        );
         assert_eq!(g.len(), 2);
         assert_eq!(g[0].vendor, "nvidia");
-        assert_eq!(g[0].model, "GB10");
-        assert_eq!(g[0].memory, 103079215104); // 98304 MiB
+        assert_eq!(g[0].model, "RTX 4090");
+        assert_eq!(g[0].memory, 24564 * 1048576);
         assert!((u - 0.5).abs() < 1e-9, "mean of 40% and 60% is 0.5, got {u}");
+        assert_eq!(b.temp, Some(70.0));
+        assert_eq!(b.power, Some(510.5));
+        assert_eq!(b.limit, Some(900.0));
+        assert_eq!(b.vram_total, Some(2 * 24564 * 1048576));
+        assert_eq!(b.vram_used, Some(16000 * 1048576));
 
-        // Garbage never panics; a missing memory/util degrades to 0.
-        let (g, _) = parse_nvidia("weird-line-no-commas\n, , ");
+        // A GB10 shares system memory: no memory.total, no memory.used, no limit.
+        let (g, u, b) = parse_nvidia("NVIDIA GB10, [N/A], 15, 54, 16.52, [N/A], [N/A]");
+        assert_eq!((g[0].model.as_str(), g[0].memory), ("GB10", 0));
+        assert!((u - 0.15).abs() < 1e-9);
+        assert_eq!((b.temp, b.power, b.limit), (Some(54.0), Some(16.52), None));
+        assert_eq!((b.vram_total, b.vram_used), (None, None), "unified: no VRAM to report");
+
+        // Garbage never panics; a missing memory/util degrades to 0 / unknown.
+        let (g, _, b) = parse_nvidia("weird-line-no-commas\n, , ");
         assert_eq!(g.len(), 1);
         assert_eq!(g[0].memory, 0);
+        assert_eq!(b, Board::default());
     }
 
     #[test]

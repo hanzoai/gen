@@ -1,4 +1,4 @@
-//! The cloud run-target registry client: `/v1/agents/targets`.
+//! The cloud run-target registry client: `/v1/agent/targets`.
 //!
 //! A linked machine registers what it IS (`spec`) and what it is DOING now
 //! (`metrics`) so mission-control can show which computer an agent runs on and
@@ -19,6 +19,7 @@ use serde_json::Value;
 use std::time::Duration;
 
 use super::context::{Machine, Metrics, Spec, TargetRecord};
+use super::sample::Sampler;
 use crate::config::Config;
 use crate::iam::{paths, store};
 
@@ -75,19 +76,19 @@ impl TargetClient {
         })
     }
 
-    /// Register-or-upsert this machine's target (`POST /v1/agents/targets`).
+    /// Register-or-upsert this machine's target (`POST /v1/agent/targets`).
     /// Returns the target id cloud minted (201) or refreshed by host (200).
     pub async fn register(&self, body: &Register) -> Result<String> {
-        let v = self.send(Method::POST, "/v1/agents/targets", Some(body)).await?;
+        let v = self.send(Method::POST, "/v1/agent/targets", Some(body)).await?;
         id_of(&v)
     }
 
-    /// Refresh an existing target by id (`PATCH /v1/agents/targets/:id`). Sending
+    /// Refresh an existing target by id (`PATCH /v1/agent/targets/:id`). Sending
     /// the full body updates the capability and IS a metrics heartbeat (the server
     /// stamps its time). Errors on a non-2xx — e.g. a 404 for a target that was
     /// deleted or belongs to another org — so the caller can fall back to register.
     pub async fn refresh(&self, id: &str, body: &Register) -> Result<String> {
-        let v = self.send(Method::PATCH, &format!("/v1/agents/targets/{id}"), Some(body)).await?;
+        let v = self.send(Method::PATCH, &format!("/v1/agent/targets/{id}"), Some(body)).await?;
         id_of(&v)
     }
 
@@ -242,12 +243,15 @@ fn beat_every(period: Duration, mut creds: Creds, api: &str, machine_id: &str, h
     let api = api.to_string();
     let (machine_id, host) = (machine_id.to_string(), host.to_string());
     Beat(tokio::spawn(async move {
+        // One sampler for the life of the beat, so every beat after the first
+        // carries the rates over the window since the one before it.
+        let mut sampler = Sampler::new();
         loop {
             // A beat with no credential is a beat that cannot land, so skip the
             // capture too rather than probe the machine for nothing.
             match creds.bearer().await {
                 Some(token) => {
-                    let machine = Machine::capture().await;
+                    let machine = sampler.machine().await;
                     sync(&api, &token, &machine_id, &host, &machine).await;
                 }
                 None => tracing::debug!("no credential for this beat; the machine will read offline"),
@@ -272,7 +276,7 @@ mod tests {
                 memory: 137438953472,
                 gpus: vec![Gpu { vendor: "nvidia".into(), model: "GB10".into(), memory: 103079215104 }],
             },
-            metrics: Metrics { load1: 1.5, load5: 1.2, load15: 0.9, mem_used: 42, mem_free: 7, gpu_util: 0.4 },
+            metrics: Metrics { load1: 1.5, load5: 1.2, load15: 0.9, mem_used: 42, mem_free: 7, gpu_util: 0.4, ..Default::default() },
         }
     }
 
@@ -316,7 +320,7 @@ mod tests {
         assert_eq!(id, "tgt_mock");
 
         let reqs = mock.requests();
-        let r = reqs.iter().find(|r| r.method == "POST" && r.path == "/v1/agents/targets").unwrap();
+        let r = reqs.iter().find(|r| r.method == "POST" && r.path == "/v1/agent/targets").unwrap();
         assert_eq!(r.header("authorization").as_deref(), Some("Bearer TOK"));
         assert!(r.header("x-org-id").is_none(), "CLI must not send X-Org-Id");
         assert_eq!(r.json()["host"], "evo");
@@ -332,7 +336,7 @@ mod tests {
         let id = client.refresh("tgt_1", &Register::from_machine("evo", &gpu_machine())).await.unwrap();
         assert_eq!(id, "tgt_1");
         let reqs = mock.requests();
-        assert!(reqs.iter().any(|r| r.method == "PATCH" && r.path == "/v1/agents/targets/tgt_1"));
+        assert!(reqs.iter().any(|r| r.method == "PATCH" && r.path == "/v1/agent/targets/tgt_1"));
     }
 
     /// Fresh machine (no stored id) registers, then persists the id it got back.
@@ -343,7 +347,7 @@ mod tests {
         let _ = std::fs::remove_file(super::super::context::target_path_for_test(&machine));
         sync(&mock.base_url(), "T", &machine, "evo", &gpu_machine()).await;
 
-        assert!(mock.requests().iter().any(|r| r.method == "POST" && r.path == "/v1/agents/targets"));
+        assert!(mock.requests().iter().any(|r| r.method == "POST" && r.path == "/v1/agent/targets"));
         let rec = TargetRecord::load(&machine).unwrap().unwrap();
         assert_eq!(rec.id, "tgt_mock");
         assert_eq!(rec.host, "evo");
@@ -370,8 +374,8 @@ mod tests {
         sync(&mock.base_url(), "T", &machine, "evo", &gpu_machine()).await;
 
         let reqs = mock.requests();
-        assert!(reqs.iter().any(|r| r.method == "PATCH" && r.path == "/v1/agents/targets/tgt_stale"), "tries the heartbeat first");
-        assert!(reqs.iter().any(|r| r.method == "POST" && r.path == "/v1/agents/targets"), "falls back to register");
+        assert!(reqs.iter().any(|r| r.method == "PATCH" && r.path == "/v1/agent/targets/tgt_stale"), "tries the heartbeat first");
+        assert!(reqs.iter().any(|r| r.method == "POST" && r.path == "/v1/agent/targets"), "falls back to register");
         // The freshly registered id replaced the stale one.
         assert_eq!(TargetRecord::load(&machine).unwrap().unwrap().id, "tgt_mock");
         let _ = std::fs::remove_file(super::super::context::target_path_for_test(&machine));
