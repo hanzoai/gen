@@ -396,9 +396,11 @@ mod tests {
 
     /// Wait until `f` holds, or fail — polling, because what is being observed is
     /// another task making progress and a fixed sleep would encode this machine's
-    /// speed as the contract.
+    /// speed as the contract. The ceiling is thirty seconds for the same reason:
+    /// at six, `make test` on a host at a load average past a hundred timed out
+    /// here with the beat still running, and that run gates the release.
     async fn until(what: &str, f: impl Fn() -> bool) {
-        for _ in 0..600 {
+        for _ in 0..3000 {
             if f() {
                 return;
             }
