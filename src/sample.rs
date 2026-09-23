@@ -348,6 +348,7 @@ fn local_mounts(mounts: &str) -> Vec<(&str, &str)> {
 }
 
 /// `(used, available)` bytes of the filesystem at `dir`.
+#[cfg(unix)]
 fn statvfs(dir: &str) -> Option<(i64, i64)> {
     let c = std::ffi::CString::new(dir.replace("\\040", " ")).ok()?;
     let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
@@ -357,6 +358,12 @@ fn statvfs(dir: &str) -> Option<(i64, i64)> {
     let frag = st.f_frsize as i64;
     let used = (st.f_blocks as i64 - st.f_bfree as i64) * frag;
     Some((used.max(0), st.f_bavail as i64 * frag))
+}
+
+/// Windows has no statvfs, and no /proc/mounts to name a filesystem either.
+#[cfg(not(unix))]
+fn statvfs(_dir: &str) -> Option<(i64, i64)> {
+    None
 }
 
 /// Whether a block device is hardware: the kernel links `device` only for those,
