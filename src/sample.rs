@@ -258,7 +258,7 @@ fn sorted(dir: &str) -> Vec<std::path::PathBuf> {
     let mut v: Vec<_> = std::fs::read_dir(dir)
         .map(|it| it.flatten().map(|e| e.path()).collect())
         .unwrap_or_default();
-    v.sort_by(|a, b| natural(a).cmp(&natural(b)));
+    v.sort_by_key(|p| natural(p));
     v
 }
 
