@@ -938,6 +938,9 @@ async fn run_turn(
     } else {
         command.stdout(Stdio::inherit());
     }
+    if control.is_some() {
+        control::hear(&mut command);
+    }
     let mut child = command.spawn().map_err(spawn_err(backend.label()))?;
     let pid = child.id();
     let mut acted: Option<Act> = None;
@@ -2070,6 +2073,19 @@ mod control_tests {
             b.push((spec.resume.clone(), spec.task.clone()));
             let mut command = tokio::process::Command::new("sh");
             command.arg("-c").arg(self.scripts[idx]);
+            // Every turn starts with both control signals ignored, as a
+            // supervisor launched in the background hands them down, so these
+            // tests prove the child hears a command on every machine and not
+            // only on one whose shell left SIGINT alone.
+            // SAFETY: signal(2) is async-signal-safe, which is all pre_exec asks.
+            #[cfg(unix)]
+            unsafe {
+                command.pre_exec(|| {
+                    libc::signal(libc::SIGINT, libc::SIG_IGN);
+                    libc::signal(libc::SIGTERM, libc::SIG_IGN);
+                    Ok(())
+                });
+            }
             Ok(Launch { command, cleanup: Vec::new() })
         }
         /// The real Claude parser — so these tests exercise the SAME mapping the

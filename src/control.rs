@@ -81,7 +81,7 @@ const POLL: Duration = Duration::from_millis(1000);
 
 /// The signal a command delivers. An enum rather than a raw `libc::c_int` so the
 /// decision ([`Command::act`]) stays pure and testable on any platform, and only
-/// [`send`] touches libc.
+/// [`send`] and [`hear`] touch libc.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Signal {
     /// Graceful abort — Claude flushes the transcript and exits 0.
@@ -236,7 +236,28 @@ pub(crate) fn drain(
     rx
 }
 
-/// Deliver `sig` to `pid`. The ONLY place this module touches the OS.
+/// Make a child hear what [`send`] delivers. An ignored signal survives `exec`,
+/// so a supervisor started with SIGINT ignored — POSIX gives every background
+/// job of a non-interactive shell exactly that — would pass it on, and a
+/// `pause` would land on a child that cannot hear it. Both signals go back to
+/// their default in the child alone, between fork and exec.
+#[cfg(unix)]
+pub(crate) fn hear(command: &mut tokio::process::Command) {
+    // SAFETY: signal(2) is async-signal-safe, which is all pre_exec asks.
+    unsafe {
+        command.pre_exec(|| {
+            libc::signal(libc::SIGINT, libc::SIG_DFL);
+            libc::signal(libc::SIGTERM, libc::SIG_DFL);
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn hear(_command: &mut tokio::process::Command) {}
+
+/// Deliver `sig` to `pid`. With [`hear`], the only place this module touches
+/// the OS.
 #[cfg(unix)]
 pub(crate) fn send(pid: u32, sig: Signal) -> Result<()> {
     let raw = match sig {
