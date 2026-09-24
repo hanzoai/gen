@@ -57,6 +57,10 @@ pub(crate) struct Serve {
 /// period; the first call has no rates, every later one does.
 pub struct Sampler {
     last: Option<(Instant, Counters)>,
+    /// Ports a model server was last found listening on. Discovery rides on
+    /// nvidia-smi's answer, which runs to its timeout when the GPU is saturated,
+    /// so a blank answer is a gap in the reading and not evidence the server moved.
+    ports: Vec<u16>,
     http: reqwest::Client,
 }
 
@@ -69,7 +73,7 @@ impl Default for Sampler {
 impl Sampler {
     pub fn new() -> Sampler {
         let http = reqwest::Client::builder().timeout(SERVE_TIMEOUT).build().unwrap_or_default();
-        Sampler { last: None, http }
+        Sampler { last: None, ports: Vec::new(), http }
     }
 
     /// Capture the machine and fill in everything that needs a window.
@@ -98,7 +102,11 @@ impl Sampler {
         next.disk = read("/proc/diskstats").map(|s| parse_diskstats(&s, physical_block));
         next.net = read("/proc/net/dev").map(|s| parse_netdev(&s, physical_net));
 
-        let mut ports: Vec<u16> = listeners(&apps.iter().map(|a| a.0).collect::<Vec<_>>());
+        let found = listeners(&apps.iter().map(|a| a.0).collect::<Vec<_>>());
+        if !found.is_empty() {
+            self.ports = found;
+        }
+        let mut ports = self.ports.clone();
         ports.extend(SERVE_PORTS);
         ports.sort_unstable();
         ports.dedup();
@@ -110,8 +118,18 @@ impl Sampler {
 
         let prev = self.last.as_ref().map(|(at, c)| (now.duration_since(*at).as_secs_f64(), c));
         rates(m, &next, prev);
-        self.last = Some((now, next));
+        self.commit(now, next);
         machine
+    }
+
+    /// Commit a reading as the window the next one is diffed against. A reading
+    /// that carried no server counters says nothing about the interval, so it
+    /// must not replace it: that would cost the next reading its `prev` and lose
+    /// every rate for a tick on top of the one that just failed.
+    fn commit(&mut self, now: Instant, next: Counters) {
+        if !next.serve.is_empty() {
+            self.last = Some((now, next));
+        }
     }
 
     /// Read one model server's `/metrics`. Only a vLLM or SGLang exposition counts:
@@ -567,6 +585,30 @@ process_resident_memory_bytes 1.9e9
     }
 
     #[test]
+    fn a_failed_reading_keeps_the_window_and_the_ports() {
+        let mut s = Sampler::new();
+        let mut good = Counters::default();
+        good.serve.insert(18300, parse_serve(VLLM).unwrap());
+        s.ports = vec![18300];
+        s.commit(Instant::now(), good.clone());
+
+        // nvidia-smi timed out: no pids, no discovery, nothing scraped.
+        s.commit(Instant::now(), Counters::default());
+        assert_eq!(s.ports, vec![18300], "a blank discovery is not an empty machine");
+        assert_eq!(s.last.as_ref().unwrap().1.serve[&18300].generated, good.serve[&18300].generated);
+
+        // The reading after it still has a prev, so the rates still land.
+        let mut later = good.clone();
+        if let Some(g) = later.serve.get_mut(&18300).and_then(|v| v.generated.as_mut()) {
+            *g += 100.0;
+        }
+        let prev = s.last.as_ref().map(|(at, c)| (at.elapsed().as_secs_f64().max(2.0), c));
+        let mut m = Metrics::default();
+        rates(&mut m, &later, prev);
+        assert!(m.decode.unwrap() > 0.0, "a failed tick must not cost two ticks of rates");
+    }
+
+    #[test]
     fn rates_fill_the_window_and_gauges_land_without_one() {
         let mut next = Counters { cpu: Some((1000, 600)), disk: Some((4096, 8192)), net: Some((100, 50)), ..Default::default() };
         next.serve.insert(18300, parse_serve(VLLM).unwrap());
@@ -620,3 +662,4 @@ process_resident_memory_bytes 1.9e9
         }
     }
 }
+
