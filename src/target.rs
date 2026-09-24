@@ -18,7 +18,7 @@ use serde::Serialize;
 use serde_json::Value;
 use std::time::Duration;
 
-use super::context::{Machine, Metrics, Spec, TargetRecord};
+use super::context::{hostname, machine_id, Machine, Metrics, Spec, TargetRecord};
 use super::sample::Sampler;
 use crate::config::Config;
 use crate::iam::{paths, store};
@@ -234,6 +234,28 @@ impl Creds {
             Creds::Fixed(t) => Some(t.clone()),
         }
     }
+}
+
+/// `hanzo beat` — hold this machine in the fleet with no session attached.
+///
+/// A target is live only while something beats. [`beat`] is held by `hanzo code`
+/// and by `hanzo link`, and both end when the work they host ends — so a machine
+/// sitting at an idle prompt reads OFFLINE to the console and to whoever is
+/// choosing where the next session lands, while being the least loaded box in the
+/// lab. This is the beat on its own: the same refreshed-credential loop, the same
+/// sampler, nothing else. Foreground until interrupted, so a service manager owns
+/// the lifetime; dropping the guard aborts it and the row goes stale on its own,
+/// which is how cloud decides a machine left.
+pub async fn present(cfg: &Config) -> Result<()> {
+    let api = crate::commands::network::active(cfg).api;
+    let host = hostname();
+    let _beat = beat(cfg, api.trim_end_matches('/'), &machine_id(), &host);
+    println!(
+        "● {host} present in the fleet — one beat every {}s, no shell, no session. Ctrl-C leaves.",
+        BEAT.as_secs()
+    );
+    tokio::signal::ctrl_c().await.context("waiting for Ctrl-C")?;
+    Ok(())
 }
 
 /// [`beat`] with the period as a parameter, so a test can watch the loop repeat
