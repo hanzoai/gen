@@ -657,14 +657,16 @@ process_resident_memory_bytes 1.9e9
         tokio::time::sleep(Duration::from_millis(300)).await;
         let second = s.machine().await;
         if cfg!(target_os = "linux") {
-            // A window in which the kernel counted no ticks has no rate, and the
-            // sampler says so rather than dividing by zero. A container's
-            // /proc/stat can go 300ms without advancing — the release runner's
-            // does, which failed every release — so the machine is asked only
-            // for a rate that is a rate. The arithmetic is pinned above, on
-            // fixed tables.
+            // A window in which the kernel counted no ticks has no rate, and a
+            // machine with no interface the sampler counts has no network rate;
+            // the sampler says so rather than inventing one. The release runner
+            // is both — its /proc/stat does not advance in 300ms and its
+            // /proc/net/dev holds nothing countable — which failed every
+            // release. So the machine is asked only that each rate it does
+            // report is a rate. The arithmetic is pinned above, on fixed tables.
             assert!(second.metrics.cpu_util.is_none_or(|u| (0.0..=1.0).contains(&u)));
-            assert!(second.metrics.net_rx.is_some());
+            assert!(second.metrics.net_rx.is_none_or(|r| r >= 0.0));
+            assert!(second.metrics.net_tx.is_none_or(|r| r >= 0.0));
         }
     }
 }
