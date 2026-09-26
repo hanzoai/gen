@@ -657,7 +657,13 @@ process_resident_memory_bytes 1.9e9
         tokio::time::sleep(Duration::from_millis(300)).await;
         let second = s.machine().await;
         if cfg!(target_os = "linux") {
-            assert!(second.metrics.cpu_util.is_some_and(|u| (0.0..=1.0).contains(&u)));
+            // A window in which the kernel counted no ticks has no rate, and the
+            // sampler says so rather than dividing by zero. A container's
+            // /proc/stat can go 300ms without advancing — the release runner's
+            // does, which failed every release — so the machine is asked only
+            // for a rate that is a rate. The arithmetic is pinned above, on
+            // fixed tables.
+            assert!(second.metrics.cpu_util.is_none_or(|u| (0.0..=1.0).contains(&u)));
             assert!(second.metrics.net_rx.is_some());
         }
     }
