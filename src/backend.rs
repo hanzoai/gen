@@ -1,7 +1,7 @@
 //! The coding-backend seam: ONE trait every backend satisfies, so the
 //! orchestrator (register → spawn → stream → finalize) is identical for all of
-//! them. Three backends today — our own `dev` (the default), `claude` and
-//! `codex` — and they are distinct products, never aliases of one another.
+//! them. Five backends today — our own `dev` (the default), `claude`, `codex`,
+//! Antigravity (`agy`) and Cursor (`agent`) — and they are distinct products, never aliases of one another.
 //!
 //! Each backend owns only what genuinely differs: how it is invoked (argv +
 //! env), how its native MCP + model-routing are wired, and how one line of its
@@ -14,8 +14,9 @@ use std::path::{Path, PathBuf};
 use super::claude::Claude;
 use super::dev::Agent;
 use super::event::Mapped;
+use super::external::External;
 
-/// Which coding agent to wrap. Three distinct products — never aliases of each
+/// Which coding agent to wrap. Five distinct products — never aliases of each
 /// other: a user who names one gets THAT agent, or a clear failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendKind {
@@ -23,6 +24,10 @@ pub enum BackendKind {
     Dev,
     Claude,
     Codex,
+    /// Google Antigravity (`agy`).
+    Agy,
+    /// Cursor's agent CLI.
+    Cursor,
 }
 
 impl BackendKind {
@@ -32,6 +37,8 @@ impl BackendKind {
             "dev" => Ok(BackendKind::Dev),
             "claude" | "claude-code" | "cc" => Ok(BackendKind::Claude),
             "codex" => Ok(BackendKind::Codex),
+            "agy" | "antigravity" => Ok(BackendKind::Agy),
+            "cursor" | "agent" | "cursor-agent" => Ok(BackendKind::Cursor),
             other => anyhow::bail!("unknown backend '{other}' (expected: {EXPECTED})"),
         }
     }
@@ -43,6 +50,8 @@ impl BackendKind {
             BackendKind::Dev => "dev",
             BackendKind::Claude => "claude",
             BackendKind::Codex => "codex",
+            BackendKind::Agy => "agy",
+            BackendKind::Cursor => "cursor",
         }
     }
 
@@ -54,7 +63,7 @@ impl BackendKind {
 }
 
 /// The backend names offered in help text and in the "unknown backend" error.
-const EXPECTED: &str = "dev | claude | codex";
+const EXPECTED: &str = "dev | claude | codex | agy | cursor";
 
 /// The default backend when no spelling names one: OUR agent.
 pub const DEFAULT: BackendKind = BackendKind::Dev;
@@ -66,6 +75,8 @@ pub const DEFAULT: BackendKind = BackendKind::Dev;
 /// hanzo code dev         hanzo code --dev      hanzo code --backend dev
 /// hanzo code claude      hanzo code --claude
 /// hanzo code codex       hanzo code --codex
+/// hanzo code agy         hanzo code --agy
+/// hanzo code cursor      hanzo code --cursor      hanzo code --agent
 /// hanzo dev              (top-level shorthand for `hanzo code dev`)
 /// hanzo code             (default backend: dev)
 /// hanzo "fix the test"   (bare session, default backend)
@@ -129,9 +140,8 @@ pub fn select(sel: Selection) -> Result<(BackendKind, Option<String>)> {
     // someone who asked for `codex` is the failure this ordering exists to avoid.
     let kind = match (sel.named.as_deref(), sel.configured.as_deref()) {
         (Some(name), _) => BackendKind::parse(name)?,
-        (None, Some(agent)) => BackendKind::parse(agent).map_err(|e| {
-            anyhow::anyhow!("{e} — from `agent` in ~/.hanzo/settings.json")
-        })?,
+        (None, Some(agent)) => BackendKind::parse(agent)
+            .map_err(|e| anyhow::anyhow!("{e} — from `agent` in ~/.hanzo/settings.json"))?,
         (None, None) => DEFAULT,
     };
     Ok((kind, sel.positional))
@@ -194,9 +204,11 @@ impl std::fmt::Debug for Routing {
     /// reason `Spec` omits `Debug` entirely.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Routing::Gateway { api, .. } => {
-                f.debug_struct("Gateway").field("api", api).field("token", &"***").finish()
-            }
+            Routing::Gateway { api, .. } => f
+                .debug_struct("Gateway")
+                .field("api", api)
+                .field("token", &"***")
+                .finish(),
             Routing::Anthropic { .. } => f.debug_struct("Anthropic").field("key", &"***").finish(),
             Routing::OpenAI { .. } => f.debug_struct("OpenAI").field("key", &"***").finish(),
         }
@@ -325,7 +337,12 @@ pub trait Backend {
     /// The route is what decides which config home the run wrote it in, so it must
     /// be the SAME value [`Backend::build`] launched with — a path resolved against
     /// the other home names a file that never exists.
-    fn transcript_path(&self, route: &Route, cwd: &Path, backend_session_id: &str) -> Option<PathBuf>;
+    fn transcript_path(
+        &self,
+        route: &Route,
+        cwd: &Path,
+        backend_session_id: &str,
+    ) -> Option<PathBuf>;
 }
 
 /// Resolve a backend kind to its implementation.
@@ -334,6 +351,8 @@ pub fn resolve(kind: BackendKind) -> Box<dyn Backend> {
         BackendKind::Dev => Box::new(Agent::DEV),
         BackendKind::Claude => Box::new(Claude),
         BackendKind::Codex => Box::new(Agent::CODEX),
+        BackendKind::Agy => Box::new(External::AGY),
+        BackendKind::Cursor => Box::new(External::CURSOR),
     }
 }
 
@@ -360,12 +379,18 @@ pub fn resolve_mcp(cwd: &Path) -> Option<McpAttach> {
 
 /// Best-effort `<bin> --version` (first line), for the context snapshot.
 pub fn backend_version(bin: &str) -> Option<String> {
-    let out = std::process::Command::new(bin).arg("--version").output().ok()?;
+    let out = std::process::Command::new(bin)
+        .arg("--version")
+        .output()
+        .ok()?;
     if !out.status.success() {
         return None;
     }
     let s = String::from_utf8_lossy(&out.stdout);
-    s.lines().next().map(|l| l.trim().to_string()).filter(|l| !l.is_empty())
+    s.lines()
+        .next()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
 }
 
 #[cfg(test)]
@@ -433,10 +458,16 @@ mod tests {
             assert_eq!(task, None);
         }
         for (positional, named) in [(Some("claude"), None), (None, Some("claude"))] {
-            assert_eq!(select(sel(positional, None, named)).unwrap().0, BackendKind::Claude);
+            assert_eq!(
+                select(sel(positional, None, named)).unwrap().0,
+                BackendKind::Claude
+            );
         }
         for (positional, named) in [(Some("codex"), None), (None, Some("codex"))] {
-            assert_eq!(select(sel(positional, None, named)).unwrap().0, BackendKind::Codex);
+            assert_eq!(
+                select(sel(positional, None, named)).unwrap().0,
+                BackendKind::Codex
+            );
         }
     }
 
@@ -451,7 +482,11 @@ mod tests {
     #[test]
     fn a_lone_operand_is_a_task_unless_it_names_a_backend() {
         let (kind, task) = select(sel(Some("fix the failing test"), None, None)).unwrap();
-        assert_eq!(kind, BackendKind::Dev, "an unrecognised operand must not change the backend");
+        assert_eq!(
+            kind,
+            BackendKind::Dev,
+            "an unrecognised operand must not change the backend"
+        );
         assert_eq!(task.as_deref(), Some("fix the failing test"));
 
         // `hanzo code claude "fix it"` — backend positionally, task after it.
@@ -465,12 +500,19 @@ mod tests {
     /// name is worse than refusing.
     #[test]
     fn naming_the_backend_twice_is_an_error() {
-        let err = select(sel(Some("claude"), None, Some("codex"))).unwrap_err().to_string();
+        let err = select(sel(Some("claude"), None, Some("codex")))
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("named twice"), "got: {err}");
-        assert!(err.contains("claude") && err.contains("codex"), "both spellings named: {err}");
+        assert!(
+            err.contains("claude") && err.contains("codex"),
+            "both spellings named: {err}"
+        );
 
         // An unquoted multi-word task is a mistake worth catching, not a silent join.
-        let err = select(sel(Some("fix"), Some("it"), None)).unwrap_err().to_string();
+        let err = select(sel(Some("fix"), Some("it"), None))
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("unexpected argument"), "got: {err}");
     }
 
@@ -482,6 +524,14 @@ mod tests {
         // `codex` is its OWN backend. Aliasing it to `dev` would silently run a
         // different agent than the one the user named.
         assert_eq!(BackendKind::parse("codex").unwrap(), BackendKind::Codex);
+        assert_eq!(BackendKind::parse("agy").unwrap(), BackendKind::Agy);
+        assert_eq!(BackendKind::parse("antigravity").unwrap(), BackendKind::Agy);
+        assert_eq!(BackendKind::parse("cursor").unwrap(), BackendKind::Cursor);
+        assert_eq!(BackendKind::parse("agent").unwrap(), BackendKind::Cursor);
+        assert_eq!(
+            BackendKind::parse("cursor-agent").unwrap(),
+            BackendKind::Cursor
+        );
         assert!(BackendKind::parse("gpt").is_err());
     }
 
@@ -490,25 +540,57 @@ mod tests {
     /// leak an `sk-ant-…`/`hk-…`/bearer. The non-secret `api` stays for debugging.
     #[test]
     fn routing_debug_redacts_the_secret() {
-        let g = Routing::Gateway { api: "https://api.hanzo.ai".into(), token: "sk-SECRET-TOKEN".into(), model: "enso".into(), small_fast_model: "enso-flash".into(), context_window: 1_000_000 };
+        let g = Routing::Gateway {
+            api: "https://api.hanzo.ai".into(),
+            token: "sk-SECRET-TOKEN".into(),
+            model: "enso".into(),
+            small_fast_model: "enso-flash".into(),
+            context_window: 1_000_000,
+        };
         let s = format!("{g:?}");
         assert!(!s.contains("sk-SECRET-TOKEN"), "token leaked in Debug: {s}");
         assert!(s.contains("***"), "expected a redaction marker: {s}");
-        assert!(s.contains("api.hanzo.ai"), "the non-secret api should survive: {s}");
+        assert!(
+            s.contains("api.hanzo.ai"),
+            "the non-secret api should survive: {s}"
+        );
 
-        assert!(!format!("{:?}", Routing::Anthropic { key: "sk-ant-SECRET".into() }).contains("sk-ant-SECRET"));
-        assert!(!format!("{:?}", Routing::OpenAI { key: "sk-proj-SECRET".into() }).contains("sk-proj-SECRET"));
+        assert!(!format!(
+            "{:?}",
+            Routing::Anthropic {
+                key: "sk-ant-SECRET".into()
+            }
+        )
+        .contains("sk-ant-SECRET"));
+        assert!(!format!(
+            "{:?}",
+            Routing::OpenAI {
+                key: "sk-proj-SECRET".into()
+            }
+        )
+        .contains("sk-proj-SECRET"));
 
         // `Route` composes the redacting `Debug`, so wrapping never re-exposes it.
-        let r = Route::Via(Routing::Gateway { api: "x".into(), token: "sk-INNER".into(), model: "enso".into(), small_fast_model: "enso-flash".into(), context_window: 1_000_000 });
-        assert!(!format!("{r:?}").contains("sk-INNER"), "Route::Via leaked the inner secret");
+        let r = Route::Via(Routing::Gateway {
+            api: "x".into(),
+            token: "sk-INNER".into(),
+            model: "enso".into(),
+            small_fast_model: "enso-flash".into(),
+            context_window: 1_000_000,
+        });
+        assert!(
+            !format!("{r:?}").contains("sk-INNER"),
+            "Route::Via leaked the inner secret"
+        );
     }
 
     /// `Route::via()` yields the credential only for `Via`; the two no-credential
     /// outcomes both read as `None` (what the banner/status line consume).
     #[test]
     fn route_via_exposes_only_the_resolved_credential() {
-        assert!(Route::Via(Routing::OpenAI { key: "sk-x".into() }).via().is_some());
+        assert!(Route::Via(Routing::OpenAI { key: "sk-x".into() })
+            .via()
+            .is_some());
         assert!(Route::Inherit.via().is_none());
         assert!(Route::FailClosed.via().is_none());
     }

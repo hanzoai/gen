@@ -37,16 +37,23 @@ pub struct Settings {
     /// still forces it off regardless.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mcp: Option<bool>,
-    /// Which coding agent a bare `hanzo code` runs: `dev`, `claude` or `codex`.
-    /// Unset ⇒ [`super::backend::DEFAULT`] (`dev`, ours). Naming one on the
-    /// command line — `hanzo code claude`, `--claude`, `--backend claude` — wins
-    /// over this, because an invocation is more specific than a default.
+    /// Which coding agent a bare `hanzo code` runs: `dev`, `claude`, `codex`,
+    /// `agy` or `cursor`. Unset ⇒ [`super::backend::DEFAULT`] (`dev`, ours).
+    /// Naming one on the command line — `hanzo code claude`, `--claude`,
+    /// `--backend claude` — wins over this, because an invocation is more
+    /// specific than a default.
     ///
     /// The three are separate products, so an unreadable value is REFUSED rather
     /// than silently falling back to ours: a reader who set `codex` and got `dev`
     /// would be told nothing while a different agent read their repository.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
+    /// Which connected account the harness uses when the command line does not
+    /// name one: `claude`, `codex`, `agy`, `cursor`, or `hanzo` (the gateway,
+    /// and every `hanzo:{owner}/{name}` identity). `HANZO_HARNESS_ACCOUNT`
+    /// overrides this for one run. Unset ⇒ `agent` above.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
     /// The context window (in tokens) `hanzo code` requests on the GATEWAY route.
     /// Unset ⇒ [`super::DEFAULT_CONTEXT_WINDOW`] (1M). Hanzo's frontier models are
     /// natively 1M, but a coding backend pointed at a custom gateway can't verify
@@ -71,7 +78,9 @@ impl Settings {
     /// unreadable or malformed file degrades to defaults WITHOUT clobbering it —
     /// a parse slip must never destroy a user's hand-edit.
     pub fn load() -> Settings {
-        let Some(path) = Self::path() else { return Settings::default() };
+        let Some(path) = Self::path() else {
+            return Settings::default();
+        };
         match std::fs::read_to_string(&path) {
             Ok(body) => serde_json::from_str(&body).unwrap_or_default(),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -80,6 +89,67 @@ impl Settings {
             }
             Err(_) => Settings::default(),
         }
+    }
+
+    /// Remember which coding agent a bare `hanzo` should launch. Sets `agent`
+    /// on the existing document and leaves every other key alone, including
+    /// ones this struct does not know.
+    pub fn remember_agent(agent: &str) -> anyhow::Result<()> {
+        use serde_json::Value;
+        let path = Self::path().ok_or_else(|| {
+            anyhow::anyhow!("no home directory — cannot remember the coding agent")
+        })?;
+        let mut doc = match std::fs::read_to_string(&path) {
+            Ok(body) => serde_json::from_str::<Value>(&body).map_err(|e| {
+                anyhow::anyhow!("~/.hanzo/settings.json could not be read ({e}) — the coding agent was not changed")
+            })?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                serde_json::to_value(defaults_document()).unwrap_or_else(|_| Value::Object(Default::default()))
+            }
+            Err(e) => anyhow::bail!("could not read ~/.hanzo/settings.json ({e})"),
+        };
+        if !doc.is_object() {
+            anyhow::bail!(
+                "~/.hanzo/settings.json is not an object — the coding agent was not changed"
+            );
+        }
+        doc["agent"] = Value::String(agent.to_string());
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let body = serde_json::to_string_pretty(&doc)?;
+        crate::private::write(&path, format!("{body}\n").as_bytes())
+            .map_err(|e| anyhow::anyhow!("could not write ~/.hanzo/settings.json ({e})"))
+    }
+
+    /// Pin which connected account the harness uses (`harness` in the same
+    /// document). Other keys, including ones this struct does not know, stay.
+    pub fn pin_account(account: &str) -> anyhow::Result<()> {
+        use serde_json::Value;
+        let path = Self::path().ok_or_else(|| {
+            anyhow::anyhow!("no home directory — cannot pin the harness account")
+        })?;
+        let mut doc = match std::fs::read_to_string(&path) {
+            Ok(body) => serde_json::from_str::<Value>(&body).map_err(|e| {
+                anyhow::anyhow!("~/.hanzo/settings.json could not be read ({e}) — the harness account was not changed")
+            })?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                serde_json::to_value(defaults_document()).unwrap_or_else(|_| Value::Object(Default::default()))
+            }
+            Err(e) => anyhow::bail!("could not read ~/.hanzo/settings.json ({e})"),
+        };
+        if !doc.is_object() {
+            anyhow::bail!(
+                "~/.hanzo/settings.json is not an object — the harness account was not changed"
+            );
+        }
+        doc["harness"] = Value::String(account.to_string());
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let body = serde_json::to_string_pretty(&doc)?;
+        crate::private::write(&path, format!("{body}\n").as_bytes())
+            .map_err(|e| anyhow::anyhow!("could not write ~/.hanzo/settings.json ({e})"))
     }
 }
 
@@ -93,6 +163,7 @@ fn defaults_document() -> Settings {
         mcp: Some(true),
         context_window: Some(super::DEFAULT_CONTEXT_WINDOW),
         agent: Some(super::backend::DEFAULT.as_str().to_string()),
+        harness: None,
     }
 }
 
@@ -146,11 +217,17 @@ mod tests {
         // (`enso` -> `enso-auto`) and a literal here is a second statement of the
         // default, which is exactly what goes stale.
         assert!(
-            doc.contains(&format!("\"model\":\"{}\"", crate::commands::code::DEFAULT_MODEL)),
+            doc.contains(&format!(
+                "\"model\":\"{}\"",
+                crate::commands::code::DEFAULT_MODEL
+            )),
             "got {doc}"
         );
         assert!(
-            doc.contains(&format!("\"smallFastModel\":\"{}\"", crate::commands::code::DEFAULT_SMALL_FAST_MODEL)),
+            doc.contains(&format!(
+                "\"smallFastModel\":\"{}\"",
+                crate::commands::code::DEFAULT_SMALL_FAST_MODEL
+            )),
             "got {doc}"
         );
         assert!(doc.contains("\"autoApprove\":true"), "got {doc}");

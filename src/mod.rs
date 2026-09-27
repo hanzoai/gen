@@ -28,10 +28,12 @@ mod dev;
 // so anything that can hold a session — `hanzo link` as much as `hanzo code` —
 // must be able to name the value it is setting.
 pub mod event;
+mod external;
+pub(crate) mod harness;
 mod home;
 pub mod sample;
 pub mod session;
-mod settings;
+pub(crate) mod settings;
 pub mod target;
 mod theme;
 mod tier;
@@ -221,7 +223,12 @@ struct GatewayModels {
 /// A narrow accessor rather than a public settings module: the caller needs exactly
 /// this one value, and `select` is a pure function that takes it as an argument.
 pub fn configured_agent() -> Option<String> {
-    Settings::load().agent
+    let from_env = std::env::var("HANZO_HARNESS_ACCOUNT").ok();
+    let settings = Settings::load();
+    harness::agent_for(
+        from_env.as_deref().or(settings.harness.as_deref()),
+        settings.agent.as_deref(),
+    )
 }
 
 fn gateway_models(backend: BackendKind, model_flag: Option<&str>, settings: &Settings) -> GatewayModels {
@@ -267,6 +274,23 @@ fn route_plan(backend: BackendKind, provider: Option<&str>, has_bearer: bool) ->
     plan
 }
 
+/// True when this run should use the coding agent's own stored login rather
+/// than the Hanzo gateway. That is the account the person chose at
+/// `hanzo auth login`.
+fn prefers_own_account(own: bool, configured: Option<&str>, backend: BackendKind) -> bool {
+    if !own {
+        return false;
+    }
+    let Some(name) = configured else {
+        return false;
+    };
+    BackendKind::parse(name).ok() == Some(backend)
+        && matches!(
+            backend,
+            BackendKind::Claude | BackendKind::Codex | BackendKind::Agy | BackendKind::Cursor
+        )
+}
+
 /// Resolve the routing for this run by walking [`route_plan`] and taking the
 /// first credential actually held. Provider keys are read from the Vault LAZILY
 /// (only as the plan reaches them), so the common gateway path (bearer in hand)
@@ -287,6 +311,14 @@ fn resolve_routing(
 ) -> Result<Route> {
     if !route {
         // `--no-route`: the backend uses its OWN account; we touch no env.
+        return Ok(Route::Inherit);
+    }
+    // A native agent login keeps that agent's own stored session, even when a
+    // Hanzo bearer is also on the machine. Antigravity and Cursor have no
+    // gateway wire, so they always keep their own login.
+    if prefers_own_account(cfg.code.own_account, settings.agent.as_deref(), backend)
+        || matches!(backend, BackendKind::Agy | BackendKind::Cursor)
+    {
         return Ok(Route::Inherit);
     }
     // The model rides ONLY the gateway route (resolved once here). Both gateway
@@ -510,6 +542,26 @@ pub async fn run(cfg: &mut Config, opts: Options) -> Result<()> {
     // credential — the Hanzo gateway (metered) for a Hanzo login, or a provider's
     // OWN API for a stored OpenAI/Anthropic key. `--no-route` opts out entirely.
     let routing = resolve_routing(cfg, &settings, opts.route, kind, &api, bearer.as_deref(), opts.model.as_deref())?;
+    // Local usage, one line per session, for whichever connected account this
+    // run actually used. A missing home does not stop the session.
+    let used = harness::used_account(
+        kind,
+        matches!(routing, Route::Inherit),
+        identity.as_ref().map(|id| (id.owner.as_str(), id.name.as_str())),
+    );
+    let pin = std::env::var("HANZO_HARNESS_ACCOUNT")
+        .ok()
+        .or_else(|| settings.harness.clone());
+    let active = identity.as_ref().map(|id| format!("{}/{}", id.owner, id.name));
+    let ids: Vec<(&str, &str)> = cfg
+        .auth
+        .identities
+        .iter()
+        .map(|id| (id.owner.as_str(), id.name.as_str()))
+        .collect();
+    if let Err(e) = harness::track(&ids, active.as_deref(), pin.as_deref(), &used) {
+        crate::warn(&e.to_string());
+    }
     // A SELECTED provider with no usable key fails closed: the backend clears its
     // model-auth env (below), and we say WHY rather than let the route silently
     // vanish into an inherited endpoint. `provider` is always `Some` here — it is
@@ -1284,7 +1336,7 @@ fn spawn_err(program: &str) -> impl Fn(std::io::Error) -> anyhow::Error + '_ {
             anyhow!(
                 "the `{program}` coding agent is not installed (not on PATH) — \
                  install it, or name another backend: `hanzo code dev`, \
-                 `hanzo code claude`, `hanzo code codex`"
+                 `hanzo code claude`, `hanzo code codex`, `hanzo code agy`, `hanzo code cursor`"
             )
         } else {
             anyhow!("failed to launch the `{program}` coding agent: {e}")
@@ -1816,6 +1868,20 @@ mod tests {
         assert_eq!(route_plan(Claude, None, false), vec![Cred::HanzoKey]);
         // Explicit "hanzo" behaves like the gateway default.
         assert_eq!(route_plan(Claude, Some("hanzo"), true), vec![Cred::Bearer, Cred::HanzoKey]);
+    }
+
+    #[test]
+    fn a_native_login_keeps_that_agents_own_account() {
+        use BackendKind::{Agy, Claude, Codex, Cursor, Dev};
+        assert!(prefers_own_account(true, Some("claude"), Claude));
+        assert!(prefers_own_account(true, Some("codex"), Codex));
+        assert!(prefers_own_account(true, Some("agy"), Agy));
+        assert!(prefers_own_account(true, Some("cursor"), Cursor));
+        assert!(prefers_own_account(true, Some("agent"), Cursor));
+        assert!(!prefers_own_account(false, Some("claude"), Claude));
+        assert!(!prefers_own_account(true, Some("claude"), Dev));
+        assert!(!prefers_own_account(true, Some("claude"), Codex));
+        assert!(!prefers_own_account(true, None, Claude));
     }
 
     /// The model precedence — `--model` flag, then exported env, then
