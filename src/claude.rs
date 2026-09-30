@@ -1,7 +1,8 @@
 //! The Claude Code backend.
 //!
 //! Headless runs stream JSONL via `-p … --output-format stream-json --verbose`;
-//! MCP is layered with `--mcp-config` (Hanzo's server added on top, the repo's
+//! MCP is layered with `--mcp-config` (Hanzo's server and the caller's cloud tools
+//! added on top, the repo's
 //! own `.mcp.json` only under `--trust-project`); settings come from the USER
 //! scope only (`--setting-sources user`) unless the repo is trusted, so a
 //! hostile repo's `.claude/settings*.json` hooks / statusLine / plugins never
@@ -29,7 +30,7 @@ use serde_json::{json, Value};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use super::backend::{Approval, Backend, Launch, Mode, Route, Routing, Spec};
+use super::backend::{Approval, Backend, Launch, McpAttach, Mode, Remote, Route, Routing, Spec};
 use super::event::{Mapped, Usage};
 use super::{home, tier};
 
@@ -110,17 +111,21 @@ impl Backend for Claude {
                 cmd.arg("--mcp-config").arg(&project_cfg);
             }
         }
-        if let Some(mcp) = &spec.mcp {
+        if let Some(doc) = mcp_config(spec.mcp.as_ref(), spec.cloud()) {
             let mut file = tempfile::Builder::new()
                 .prefix("hanzo-mcp-")
                 .suffix(".json")
                 .tempfile()
                 .context("creating mcp-config temp file")?;
-            file.write_all(mcp_config(mcp).as_bytes())
+            file.write_all(doc.as_bytes())
                 .context("writing mcp-config")?;
             let path = file.into_temp_path();
             cmd.arg("--mcp-config").arg(&*path);
             cleanup.push(path);
+        }
+        // The cloud server's bearer: in the env, which the document above NAMES.
+        if let Some(remote) = spec.cloud() {
+            cmd.env(Remote::TOKEN, &remote.token);
         }
 
         // Route model calls (credential via env, never argv). In every routed
@@ -235,20 +240,30 @@ impl Backend for Claude {
     }
 }
 
-/// The `--mcp-config` document adding Hanzo's stdio server (Claude requires an
-/// explicit `type`).
-fn mcp_config(mcp: &super::backend::McpAttach) -> String {
-    json!({
-        "mcpServers": {
-            "hanzo": {
-                "type": "stdio",
-                "command": mcp.program,
-                "args": mcp.args,
-                "env": {},
-            }
-        }
-    })
-    .to_string()
+/// The `--mcp-config` document: Hanzo's stdio server and the caller's cloud tools
+/// over HTTP, whichever this run carries, in ONE file (Claude requires an explicit
+/// `type`). The cloud server's header is `${HANZO_MCP_TOKEN}`, which Claude expands
+/// from its environment, so the bearer is never written to disk. `None` when there
+/// is neither.
+fn mcp_config(mcp: Option<&McpAttach>, remote: Option<&Remote>) -> Option<String> {
+    let mut servers = serde_json::Map::new();
+    if let Some(mcp) = mcp {
+        servers.insert(
+            "hanzo".into(),
+            json!({ "type": "stdio", "command": mcp.program, "args": mcp.args, "env": {} }),
+        );
+    }
+    if let Some(remote) = remote {
+        servers.insert(
+            Remote::NAME.into(),
+            json!({
+                "type": "http",
+                "url": remote.url,
+                "headers": { "Authorization": format!("Bearer ${{{}}}", Remote::TOKEN) },
+            }),
+        );
+    }
+    (!servers.is_empty()).then(|| json!({ "mcpServers": servers }).to_string())
 }
 
 fn system_event(v: &Value) -> Vec<Mapped> {
@@ -352,7 +367,6 @@ fn stringify_content(c: Option<&Value>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::code::backend::McpAttach;
     use crate::commands::code::event::Kind;
     use std::path::PathBuf;
 
@@ -365,6 +379,7 @@ mod tests {
             // The default is auto-approve ON (the confirmed default).
             approval: Approval::Auto,
             mcp: Some(McpAttach { program: "hanzo-mcp".into(), args: vec!["--project-dir".into(), "/tmp/proj".into()] }),
+            remote: None,
             structured: true,
             preset_session: None,
             trust_project: false,
@@ -697,6 +712,74 @@ mod tests {
         let args = argv(&l);
         assert!(args.iter().any(|a| a == "--strict-mcp-config"));
         assert!(mcp_config_paths(&args).is_empty(), "no config layered when --no-mcp and repo untrusted");
+    }
+
+    /// The caller's cloud tools ride in the SAME document as hanzo-mcp, as an HTTP
+    /// server whose Authorization header names `${HANZO_MCP_TOKEN}`. The bearer is
+    /// in the child's env — never in argv, never in the file on disk.
+    #[test]
+    fn the_cloud_tools_ride_in_the_one_config_with_a_named_bearer() {
+        let mut s = spec(Mode::Headless);
+        s.remote = Some(Remote { url: "https://api.hanzo.ai/v1/mcp".into(), token: "IAM-BEARER".into() });
+        let l = Claude.build(&s).unwrap();
+        let args = argv(&l);
+
+        assert!(args.iter().any(|a| a == "--strict-mcp-config"), "strict MCP holds with the cloud server too");
+        let cfgs = mcp_config_paths(&args);
+        assert_eq!(cfgs.len(), 1, "one document, both servers: {cfgs:?}");
+        let body = std::fs::read_to_string(&cfgs[0]).unwrap();
+        let doc: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(doc["mcpServers"]["hanzo"]["type"], "stdio");
+        let cloud = &doc["mcpServers"]["cloud"];
+        assert_eq!(cloud["type"], "http");
+        assert_eq!(cloud["url"], "https://api.hanzo.ai/v1/mcp");
+        assert_eq!(cloud["headers"]["Authorization"], "Bearer ${HANZO_MCP_TOKEN}");
+        assert!(!body.contains("IAM-BEARER"), "the bearer must never be written to disk");
+        assert!(!args.iter().any(|a| a.contains("IAM-BEARER")), "the bearer must not be in argv");
+        let env: std::collections::HashMap<_, _> = l
+            .command
+            .as_std()
+            .get_envs()
+            .filter_map(|(k, v)| Some((k.to_string_lossy().to_string(), v?.to_string_lossy().to_string())))
+            .collect();
+        assert_eq!(env.get("HANZO_MCP_TOKEN").map(String::as_str), Some("IAM-BEARER"));
+
+        // hanzo-mcp not installed, kit present: the cloud server is layered alone.
+        let mut s = spec(Mode::Headless);
+        s.mcp = None;
+        s.remote = Some(Remote { url: "https://api.hanzo.ai/v1/mcp".into(), token: "T".into() });
+        let l = Claude.build(&s).unwrap();
+        let cfgs = mcp_config_paths(&argv(&l));
+        let doc: Value = serde_json::from_str(&std::fs::read_to_string(&cfgs[0]).unwrap()).unwrap();
+        assert!(doc["mcpServers"].get("hanzo").is_none(), "only what the run carries is layered");
+        assert_eq!(doc["mcpServers"]["cloud"]["type"], "http");
+    }
+
+    /// Off the Hanzo route — `--no-route`, direct Anthropic, a route that failed
+    /// closed — the IAM bearer never enters Claude's env, and no cloud server is
+    /// in its MCP document: Claude runs shell commands unasked.
+    #[test]
+    fn the_iam_bearer_is_absent_off_the_hanzo_route() {
+        let mut built = 0;
+        for routing in [Route::Via(Routing::Anthropic { key: "sk-ant-x".into() }), Route::Inherit, Route::FailClosed] {
+            let mut s = spec(Mode::Headless);
+            s.routing = routing.clone();
+            s.remote = Some(Remote { url: "https://api.hanzo.ai/v1/mcp".into(), token: "IAM-BEARER".into() });
+            let Ok(l) = Claude.build(&s) else { continue };
+            built += 1;
+            let env: Vec<(String, String)> = l
+                .command
+                .as_std()
+                .get_envs()
+                .filter_map(|(k, v)| Some((k.to_string_lossy().to_string(), v?.to_string_lossy().to_string())))
+                .collect();
+            assert!(!env.iter().any(|(k, v)| k == "HANZO_MCP_TOKEN" || v.contains("IAM-BEARER")), "{routing:?}");
+            for cfg in mcp_config_paths(&argv(&l)) {
+                let body = std::fs::read_to_string(&cfg).unwrap();
+                assert!(!body.contains("\"cloud\""), "{routing:?}: {body}");
+            }
+        }
+        assert!(built >= 2, "only {built} routes built");
     }
 
     /// Explicit trust (`--trust-project`) DOES load the repo's own `.mcp.json`,

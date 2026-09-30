@@ -235,6 +235,13 @@ pub enum Route {
 }
 
 impl Route {
+    /// Whether model calls go through the Hanzo gateway: the one route on which the
+    /// child already holds the IAM bearer, so the only one that may carry the
+    /// cloud's tools ([`Spec::cloud`]).
+    pub fn hanzo(&self) -> bool {
+        matches!(self, Route::Via(Routing::Gateway { .. }))
+    }
+
     /// The resolved credential+destination, if one was found. `Inherit` and
     /// `FailClosed` carry none, so both read as `None` — what the banner + status
     /// line want (they only distinguish "routing on → where" from "off").
@@ -274,6 +281,32 @@ pub struct McpAttach {
     pub args: Vec<String>,
 }
 
+/// The caller's tools on the cloud, as ONE streamable-HTTP MCP server at
+/// `{api}/v1/mcp` ([`super::kit`]). The IAM bearer reaches the child only in its
+/// environment, as [`Remote::TOKEN`], which each backend's MCP configuration names
+/// and never spells — the same rule the routing credential follows — and only on
+/// a Hanzo-routed run ([`Spec::cloud`]).
+#[derive(Clone)]
+pub struct Remote {
+    pub url: String,
+    pub token: String,
+}
+
+impl Remote {
+    /// The server's key in every backend's MCP configuration. `hanzo` is the local
+    /// hanzo-mcp and `run` is the cloud agent's ask server, so this is neither.
+    pub const NAME: &'static str = "cloud";
+    /// The environment variable the bearer rides in.
+    pub const TOKEN: &'static str = "HANZO_MCP_TOKEN";
+}
+
+impl std::fmt::Debug for Remote {
+    /// Redacted, for the reason [`Routing`]'s is.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Remote").field("url", &self.url).field("token", &"***").finish()
+    }
+}
+
 /// Everything a backend needs to construct its invocation.
 pub struct Spec {
     pub mode: Mode,
@@ -288,6 +321,8 @@ pub struct Spec {
     /// not where model calls go. Each backend maps it to its own flags.
     pub approval: Approval,
     pub mcp: Option<McpAttach>,
+    /// The caller's cloud tools, attached beside `mcp` when the org's kit answered.
+    pub remote: Option<Remote>,
     /// Emit the machine-readable event stream (only when we actually stream to
     /// cloud). When false, a headless run keeps the backend's native output and
     /// the wrapper never parses it — the privacy gate is structural.
@@ -308,6 +343,17 @@ pub struct Spec {
     pub resume: Option<String>,
     /// Extra args forwarded verbatim to the backend (never widened by us).
     pub passthrough: Vec<String>,
+}
+
+impl Spec {
+    /// The cloud tools this run attaches, and so whether the IAM bearer enters
+    /// the child's environment: only when model calls route through the Hanzo
+    /// gateway, where the child already holds that bearer. A `--no-route` or
+    /// direct-provider run never receives it, whatever `remote` says — its agent
+    /// runs shell commands without asking, and any of them could read the env.
+    pub fn cloud(&self) -> Option<&Remote> {
+        self.remote.as_ref().filter(|_| self.routing.hanzo())
+    }
 }
 
 /// A ready-to-spawn command plus temp files that must outlive the child (e.g. a

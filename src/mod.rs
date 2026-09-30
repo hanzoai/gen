@@ -9,7 +9,9 @@
 //!      default when signed in (streams the user's OWN session to their OWN org,
 //!      derived server-side from the JWT `owner`); `--no-link`, or a persisted
 //!      `code.link = false`, opts out. Structurally silent when unauthenticated.
-//!   2. Hanzo MCP — attached in-session (Claude `--mcp-config`, `dev` `-c`).
+//!   2. Hanzo MCP — attached in-session (Claude `--mcp-config`, `dev` `-c`),
+//!      with the org's kit beside it: its skills written where the backend reads
+//!      them, and the caller's cloud tools as one MCP server (see [`kit`]).
 //!   3. hanzo.id auth + universal usage — model calls route through
 //!      api.hanzo.ai so tokens/cost meter into cloud_usage/o11y regardless of
 //!      which account/machine the dev is on.
@@ -31,6 +33,7 @@ pub mod event;
 mod external;
 pub(crate) mod harness;
 mod home;
+mod kit;
 pub mod sample;
 pub mod session;
 pub(crate) mod settings;
@@ -444,7 +447,10 @@ pub async fn run(cfg: &mut Config, opts: Options) -> Result<()> {
     let kind = opts.backend;
     let backend = resolve(kind);
     let mode = if opts.task.is_some() { Mode::Headless } else { Mode::Interactive };
-    let api = network::active(cfg).api;
+    let net = network::active(cfg);
+    let api = net.api;
+    // The one network whose api may be plain http (the kit's bearer check).
+    let local = net.name == "local";
 
     // Auth: the ACTIVE identity's hanzo.id bearer from the OS keychain (never
     // argv/logged). The identity rides along because the cloud session this run
@@ -527,8 +533,9 @@ pub async fn run(cfg: &mut Config, opts: Options) -> Result<()> {
 
     // MCP: attach hanzo-mcp by default. `--no-mcp` forces it off (flag wins);
     // otherwise `~/.hanzo/settings.json` `mcp` decides, defaulting ON. A missing
-    // server warns but never blocks.
-    let mcp = if opts.mcp && settings.mcp.unwrap_or(true) {
+    // server warns but never blocks. The same switch governs the cloud's tools.
+    let mcp_on = opts.mcp && settings.mcp.unwrap_or(true);
+    let mcp = if mcp_on {
         let m = resolve_mcp(&cwd);
         if m.is_none() {
             crate::warn("hanzo-mcp not found (install `hanzo-mcp` or `uv`) — continuing without the Hanzo toolset.");
@@ -584,6 +591,26 @@ pub async fn run(cfg: &mut Config, opts: Options) -> Result<()> {
     if kind == BackendKind::Claude {
         home::prepare(&routing);
     }
+
+    // The org's kit, as the cloud coding agent carries it: the skills an admin
+    // activated (and the person left on) written where THIS backend reads them —
+    // which for Claude is the home the route just chose — and the caller's tools
+    // as one MCP server on the IAM bearer. Read on every run through a short cache;
+    // no kit never stops a run, and the banner says so once.
+    let equipped = match (kit::root(kind, &routing), kit::cache()) {
+        (Some(skills), Some(cache)) => {
+            let caller = identity.as_ref().zip(bearer.as_deref()).map(|(_, token)| kit::Caller {
+                api: &api,
+                who: &who,
+                token,
+                local,
+            });
+            // The cloud's tools ride only a Hanzo-routed run (Spec::cloud), so the
+            // banner never claims a server the backend will not be handed.
+            Some(kit::equip(&cache, &skills, caller.as_ref(), mcp_on && routing.hanzo()).await)
+        }
+        _ => None,
+    };
 
     // For a linked interactive Claude run, pre-set the session id so its
     // transcript can be tailed; otherwise the resume handle names it.
@@ -648,7 +675,7 @@ pub async fn run(cfg: &mut Config, opts: Options) -> Result<()> {
         routing.via(),
         bearer.is_some(),
         session_id.as_deref(),
-        None,
+        equipped.as_ref().map(|e| (e.line.as_str(), e.on)),
     );
 
     let structured = client.is_some() && session_id.is_some();
@@ -659,6 +686,7 @@ pub async fn run(cfg: &mut Config, opts: Options) -> Result<()> {
         routing,
         approval,
         mcp,
+        remote: equipped.and_then(|e| e.remote),
         structured,
         preset_session: preset_session.clone(),
         // The `--project-mcp` / `--trust-project` opt-in trusts the repo: it both
@@ -1194,9 +1222,9 @@ fn banner(
     routing: Option<&Routing>,
     signed_in: bool,
     session: Option<&str>,
-    theme: Option<&str>,
+    kit: Option<(&str, bool)>,
 ) {
-    let _ = (theme, api); // theme applied silently; the route line carries its own host
+    let _ = api; // the route line carries its own host
     println!(
         "{} {} · {} · {}",
         "hanzo code".bold(),
@@ -1209,6 +1237,9 @@ fn banner(
     let stream_line = if session.is_some() { stream_line.green() } else { stream_line.dimmed() };
     println!("  {route_line}");
     println!("  {stream_line}");
+    if let Some((line, on)) = kit {
+        println!("  {}", if on { line.green() } else { line.dimmed() });
+    }
 }
 
 /// The two status lines — model-routing and session-stream — as PLAIN text.
@@ -1732,6 +1763,7 @@ mod tests {
             routing: Route::Inherit,
             approval: Approval::Auto,
             mcp: None,
+            remote: None,
             structured: true,
             preset_session: None,
             trust_project: false,
@@ -2172,6 +2204,7 @@ mod control_tests {
             routing: Route::Inherit,
             approval: Approval::Auto,
             mcp: None,
+            remote: None,
             structured: true,
             preset_session: None,
             trust_project: false,

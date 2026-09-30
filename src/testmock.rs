@@ -65,6 +65,9 @@ struct Config {
     control_delay_polls: usize,
     /// Polls observed so far, shared across connections.
     polls: Arc<std::sync::atomic::AtomicUsize>,
+    /// The body `GET /v1/tool/kit` answers. `None` is a cloud that serves no kit
+    /// yet: a 404, as any unregistered `/v1` route is.
+    kit: Option<String>,
 }
 
 /// The ordinary control plane: everything succeeds. Each constructor below
@@ -80,6 +83,7 @@ impl Default for Config {
             owned: None,
             control_delay_polls: 0,
             polls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            kit: None,
         }
     }
 }
@@ -139,6 +143,12 @@ impl MockCloud {
         let control =
             cmds.iter().map(|(s, c, m)| (*s, (*c).to_string(), (*m).to_string())).collect();
         Self::with(Config { control, owned: Some(owner.to_string()), ..Config::default() }).await
+    }
+
+    /// A cloud serving `kit` at `GET /v1/tool/kit`, and an MCP server at
+    /// `POST /v1/mcp` that answers only a caller with a bearer.
+    pub async fn start_kit(kit: &str) -> MockCloud {
+        Self::with(Config { kit: Some(kit.to_string()), ..Config::default() }).await
     }
 
     async fn with(cfg: Config) -> MockCloud {
@@ -219,6 +229,9 @@ async fn serve_conn(
         let body = String::from_utf8_lossy(&buf[body_start..(body_start + content_length).min(buf.len())])
             .to_string();
 
+        let bearer = headers
+            .iter()
+            .any(|(k, v)| k.eq_ignore_ascii_case("authorization") && v.starts_with("Bearer ") && v.len() > 7);
         reqs.lock().unwrap().push(Recorded {
             method: method.clone(),
             path: path.clone(),
@@ -226,7 +239,7 @@ async fn serve_conn(
             body,
         });
 
-        let (status, payload) = respond(&cfg, &method, &path);
+        let (status, payload) = respond(&cfg, &method, &path, bearer);
         let resp = format!(
             "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{payload}",
             payload.len()
@@ -242,9 +255,27 @@ async fn serve_conn(
     }
 }
 
-fn respond(cfg: &Config, method: &str, path: &str) -> (String, String) {
+fn respond(cfg: &Config, method: &str, path: &str, bearer: bool) -> (String, String) {
     if let Some(code) = cfg.force_status {
         return (format!("{code} Error"), r#"{"error":"forced"}"#.to_string());
+    }
+    // The org's kit, as the caller reads it.
+    if method == "GET" && path == "/v1/tool/kit" {
+        return match &cfg.kit {
+            Some(body) => ("200 OK".into(), body.clone()),
+            None => ("404 Not Found".into(), r#"{"error":"not found"}"#.to_string()),
+        };
+    }
+    // The caller's MCP server: an `initialize` answered for a bearer, refused
+    // without one, the way the edge challenges an anonymous call.
+    if method == "POST" && path == "/v1/mcp" {
+        if !bearer {
+            return ("401 Unauthorized".into(), r#"{"error":"a bearer is required"}"#.to_string());
+        }
+        return (
+            "200 OK".into(),
+            r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"mock","version":"0"}}}"#.to_string(),
+        );
     }
     // register -> 201 with a minted id
     if method == "POST" && path == "/v1/agents/sessions" {

@@ -5,7 +5,8 @@
 //! config home.
 //!
 //! Headless runs stream the v2 `ThreadEvent` JSONL via `<agent> exec --json`; MCP is
-//! attached with `-c mcp_servers.hanzo.*` overrides (ADDITIVE — the user's own
+//! attached with `-c mcp_servers.hanzo.*` overrides, and the caller's cloud tools
+//! with `-c mcp_servers.cloud.*` (ADDITIVE — the user's own
 //! servers, config and `dev login` are untouched, since we never repoint
 //! `CODEX_HOME`); model calls route through the native `hanzo` provider
 //! (`api.hanzo.ai/v1`) with the bearer supplied as `HANZO_USER_KEY`.
@@ -27,7 +28,7 @@ use serde_json::{json, Value};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use super::backend::{Approval, Backend, Launch, Mode, Route, Routing, Spec};
+use super::backend::{Approval, Backend, Launch, Mode, Remote, Route, Routing, Spec};
 use super::event::{cap, clamp, Mapped, Usage};
 
 /// The driver for the two agents that speak this protocol: our own `dev`
@@ -105,6 +106,16 @@ impl Backend for Agent {
             args.push(cfg_string("mcp_servers.hanzo.command", &mcp.program));
             args.push("-c".into());
             args.push(cfg_array("mcp_servers.hanzo.args", &mcp.args));
+        }
+        // The caller's cloud tools: a streamable-HTTP server whose bearer the agent
+        // reads from the variable it is NAMED — the value never reaches argv.
+        if let Some(remote) = spec.cloud() {
+            let key = |field: &str| format!("mcp_servers.{}.{field}", Remote::NAME);
+            cmd.env(Remote::TOKEN, &remote.token);
+            args.push("-c".into());
+            args.push(cfg_string(&key("url"), &remote.url));
+            args.push("-c".into());
+            args.push(cfg_string(&key("bearer_token_env_var"), Remote::TOKEN));
         }
 
         // Routing (credential via env, never argv):
@@ -375,6 +386,7 @@ mod tests {
             // The default is auto-approve ON (the confirmed default).
             approval: Approval::Auto,
             mcp: Some(McpAttach { program: "hanzo-mcp".into(), args: vec!["--project-dir".into(), "/tmp/proj".into()] }),
+            remote: None,
             structured: true,
             preset_session: None,
             trust_project: false,
@@ -417,6 +429,54 @@ mod tests {
         // (the true-1M path), since the default window exceeds the 272K fallback.
         assert!(args.iter().any(|a| a.starts_with("model_context_window=")), "gateway route must name the model window: {args:?}");
         assert!(l.cleanup.is_empty(), "dev takes the window as a setting, not a file");
+    }
+
+    /// The caller's cloud tools ride as ONE streamable-HTTP server beside hanzo-mcp:
+    /// its url, and the NAME of the variable holding the bearer. The bearer itself is
+    /// in the env and nowhere in argv — and only on the Hanzo-routed path, where the
+    /// child already holds it.
+    #[test]
+    fn the_cloud_tools_are_one_http_server_whose_bearer_is_named_not_spelled() {
+        let mut s = spec(Mode::Headless, "https://api.hanzo.ai");
+        s.routing = Route::Via(Routing::Gateway { api: "https://api.hanzo.ai".into(), token: "JWT".into(), model: "enso".into(), small_fast_model: "enso-flash".into(), context_window: 1_000_000 });
+        s.remote = Some(Remote { url: "https://api.hanzo.ai/v1/mcp".into(), token: "IAM-BEARER".into() });
+        let l = Agent::DEV.build(&s).unwrap();
+        let args = argv(&l);
+        assert!(args.iter().any(|a| a == r#"mcp_servers.cloud.url="https://api.hanzo.ai/v1/mcp""#), "{args:?}");
+        assert!(args.iter().any(|a| a == r#"mcp_servers.cloud.bearer_token_env_var="HANZO_MCP_TOKEN""#), "{args:?}");
+        // hanzo-mcp is still attached: the cloud server is beside it, not instead.
+        assert!(args.iter().any(|a| a == r#"mcp_servers.hanzo.command="hanzo-mcp""#));
+        assert_eq!(envmap(&l).get("HANZO_MCP_TOKEN").map(String::as_str), Some("IAM-BEARER"));
+        assert!(!args.iter().any(|a| a.contains("IAM-BEARER")), "the bearer must not be in argv");
+        // The server's options precede the prompt, so none can be read as it.
+        let last = args.iter().rposition(|a| a.starts_with("mcp_servers.cloud.")).unwrap();
+        assert!(last < args.iter().position(|a| a == "do it").unwrap());
+    }
+
+    /// `--no-route`, a direct provider, or a route that failed closed: the agent
+    /// runs shell commands unasked, so the IAM bearer never enters its env and no
+    /// cloud server is configured, whatever the kit answered.
+    #[test]
+    fn the_iam_bearer_is_absent_off_the_hanzo_route() {
+        let mut built = 0;
+        for routing in [Route::Via(Routing::OpenAI { key: "sk-openai".into() }), Route::Inherit, Route::FailClosed] {
+            let mut s = spec(Mode::Headless, "https://api.hanzo.ai");
+            s.routing = routing.clone();
+            s.remote = Some(Remote { url: "https://api.hanzo.ai/v1/mcp".into(), token: "IAM-BEARER".into() });
+            let Ok(l) = Agent::DEV.build(&s) else { continue };
+            built += 1;
+            assert!(!envmap(&l).contains_key("HANZO_MCP_TOKEN"), "{routing:?}");
+            assert!(!envmap(&l).values().any(|v| v.contains("IAM-BEARER")), "{routing:?}");
+            assert!(!argv(&l).iter().any(|a| a.contains("mcp_servers.cloud.") || a.contains("IAM-BEARER")), "{routing:?}");
+        }
+        assert!(built >= 2, "only {built} routes built");
+    }
+
+    #[test]
+    fn the_cloud_server_is_absent_without_a_kit() {
+        let l = Agent::DEV.build(&spec(Mode::Headless, "https://api.hanzo.ai")).unwrap();
+        assert!(!argv(&l).iter().any(|a| a.contains("mcp_servers.cloud.")));
+        assert!(!envmap(&l).contains_key("HANZO_MCP_TOKEN"));
     }
 
     #[test]
