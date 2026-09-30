@@ -85,7 +85,30 @@ fn sweep(path: &Path) {
     }
 }
 
+/// Create `path` holding `bytes`, owner-only, only if nothing is there yet;
+/// `AlreadyExists` otherwise. For a value made once and read ever after, such as
+/// a key: concurrent creators race to one winner and each reads that one back,
+/// where `write` would let the last writer replace what the first already handed
+/// out. The staged temp is hard-linked into place, which publishes a complete
+/// file or nothing, like `rename`, and unlike it never replaces one.
+pub fn create(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let tmp = tmp_path(path);
+    let out = stage(&tmp, bytes).and_then(|()| std::fs::hard_link(&tmp, path));
+    let _ = std::fs::remove_file(&tmp);
+    out
+}
+
 fn publish(tmp: &Path, path: &Path, bytes: &[u8]) -> io::Result<()> {
+    stage(tmp, bytes)?;
+    // The rename carries the temp's inode — and therefore its 0600 — onto the
+    // target. This is why the mode is set on the temp rather than afterwards:
+    // a `chmod` after the rename would be a second window, and a `set_permissions`
+    // on the TARGET would be undone by the next write.
+    std::fs::rename(tmp, path)
+}
+
+/// Write `bytes` to a fresh owner-only `tmp`, durably, and close it.
+fn stage(tmp: &Path, bytes: &[u8]) -> io::Result<()> {
     use std::io::Write;
 
     let mut opts = std::fs::OpenOptions::new();
@@ -112,12 +135,7 @@ fn publish(tmp: &Path, path: &Path, bytes: &[u8]) -> io::Result<()> {
     // with unflushed content, i.e. an atomically-published empty file.
     f.sync_all()?;
     drop(f); // Windows will not rename an open file.
-
-    // The rename carries the temp's inode — and therefore its 0600 — onto the
-    // target. This is why the mode is set on the temp rather than afterwards:
-    // a `chmod` after the rename would be a second window, and a `set_permissions`
-    // on the TARGET would be undone by the next write.
-    std::fs::rename(tmp, path)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -243,6 +261,24 @@ mod tests {
             .filter(|n| n.starts_with(&base) && n.ends_with(".tmp"))
             .collect();
         assert!(leftovers.is_empty(), "temps orphaned by a clean run: {leftovers:?}");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// `create` is write-once: the first value stands, a second create is
+    /// `AlreadyExists` and changes nothing, and the file is owner-only.
+    #[test]
+    fn create_never_replaces() {
+        let p = scratch("create");
+        create(&p, b"first").unwrap();
+        let again = create(&p, b"second").unwrap_err();
+        assert_eq!(again.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "first");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "must be owner-only, got {mode:o}");
+        }
         let _ = std::fs::remove_file(&p);
     }
 }
