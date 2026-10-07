@@ -6,9 +6,11 @@
 //! The register upserts by `host`: re-linking the same machine refreshes ONE target
 //! row instead of piling up duplicates.
 //!
-//! Org-scoped SERVER-SIDE — the gateway injects the org from the validated JWT
-//! `owner`, so this client sends only the hanzo.id bearer and can neither send nor
-//! forge an org. Everything here is BEST-EFFORT: a register/heartbeat failure is the
+//! Org-scoped SERVER-SIDE — the gateway takes the org from the validated token. The
+//! one thing this client adds is the `--org` selection, as `X-Org-Id`, which the
+//! gateway checks against the token's signed membership and discards when it is
+//! not one of the caller's orgs: a selection, never an assertion. Without one the
+//! machine lands in the caller's home org. Everything here is BEST-EFFORT: a register/heartbeat failure is the
 //! caller's to swallow, and it NEVER blocks or fails the coding session. See
 //! `cloud/clients/agents/targets.go`.
 
@@ -28,6 +30,10 @@ pub struct TargetClient {
     wire: Http,
     api: String, // base origin, no trailing slash
     token: String,
+    /// The org selected with `--org`, sent as `X-Org-Id` — the selection every
+    /// cloud call carries (`Config::org`), so a machine lands in the org the rest
+    /// of the command acts in.
+    org: Option<String>,
 }
 
 /// The register / refresh body. `label` + `host` are the hostname; `host` is the
@@ -73,7 +79,14 @@ impl TargetClient {
             wire: Http::new(wire),
             api: api.trim_end_matches('/').to_string(),
             token: token.to_string(),
+            org: None,
         })
+    }
+
+    /// Act in `org` when one was selected (`--org`); `None` is the bearer's own.
+    pub fn with_org(mut self, org: Option<&str>) -> Self {
+        self.org = org.map(str::to_string);
+        self
     }
 
     /// Register-or-upsert this machine's target (`POST /v1/agent/targets`).
@@ -95,6 +108,9 @@ impl TargetClient {
     async fn send(&self, method: Method, path: &str, body: Option<&Register>) -> Result<Value> {
         let mut request =
             Request::new(method, format!("{}{}", self.api, path)).token(&self.token);
+        if let Some(org) = &self.org {
+            request = request.org(org);
+        }
         if let Some(body) = body {
             request = request.body(serde_json::to_value(body).context("encoding the target")?);
         }
@@ -116,9 +132,9 @@ fn id_of(v: &Value) -> Result<String> {
 /// failure is logged at debug and swallowed — the coding session never depends on
 /// this. The caller runs it detached so neither the capture nor the cloud write is
 /// on the session's critical path.
-pub async fn sync(api: &str, token: &str, machine_id: &str, host: &str, machine: &Machine) {
+pub async fn sync(api: &str, token: &str, org: Option<&str>, machine_id: &str, host: &str, machine: &Machine) {
     let client = match TargetClient::new(api, token) {
-        Ok(c) => c,
+        Ok(c) => c.with_org(org),
         Err(e) => {
             tracing::debug!("run-target client unavailable ({e}); skipping target register");
             return;
@@ -207,7 +223,7 @@ impl Drop for Beat {
 /// shared state, not the struct, and its writes are already serialized under the
 /// credential lock.
 pub fn beat(cfg: &Config, api: &str, machine_id: &str, host: &str) -> Beat {
-    beat_every(BEAT, Creds::Refreshing(Box::new(cfg.clone())), api, machine_id, host)
+    beat_every(BEAT, Creds::Refreshing(Box::new(cfg.clone())), cfg.org.clone(), api, machine_id, host)
 }
 
 /// Where a beat gets its bearer.
@@ -261,7 +277,7 @@ pub async fn present(cfg: &Config) -> Result<()> {
 /// [`beat`] with the period as a parameter, so a test can watch the loop repeat
 /// without waiting minutes for it. `BEAT` is the ONE period production uses — this
 /// is the mechanism, not a setting.
-fn beat_every(period: Duration, mut creds: Creds, api: &str, machine_id: &str, host: &str) -> Beat {
+fn beat_every(period: Duration, mut creds: Creds, org: Option<String>, api: &str, machine_id: &str, host: &str) -> Beat {
     let api = api.to_string();
     let (machine_id, host) = (machine_id.to_string(), host.to_string());
     Beat(tokio::spawn(async move {
@@ -274,7 +290,7 @@ fn beat_every(period: Duration, mut creds: Creds, api: &str, machine_id: &str, h
             match creds.bearer().await {
                 Some(token) => {
                     let machine = sampler.machine().await;
-                    sync(&api, &token, &machine_id, &host, &machine).await;
+                    sync(&api, &token, org.as_deref(), &machine_id, &host, &machine).await;
                 }
                 None => tracing::debug!("no credential for this beat; the machine will read offline"),
             }
@@ -344,11 +360,26 @@ mod tests {
         let reqs = mock.requests();
         let r = reqs.iter().find(|r| r.method == "POST" && r.path == "/v1/agent/targets").unwrap();
         assert_eq!(r.header("authorization").as_deref(), Some("Bearer TOK"));
-        assert!(r.header("x-org-id").is_none(), "CLI must not send X-Org-Id");
+        assert!(r.header("x-org-id").is_none(), "with no --org selected, the CLI sends no X-Org-Id");
         assert_eq!(r.json()["host"], "evo");
         assert_eq!(r.json()["kind"], "gpu");
         assert_eq!(r.json()["spec"]["cpus"], 20);
         assert_eq!(r.json()["metrics"]["gpuUtil"], 0.4);
+    }
+
+    #[tokio::test]
+    async fn a_selected_org_rides_every_target_call() {
+        let mock = MockCloud::start().await;
+        let client = TargetClient::new(&mock.base_url(), "T").unwrap().with_org(Some("acme"));
+        let body = Register::from_machine("evo", &gpu_machine());
+        let id = client.register(&body).await.unwrap();
+        let _ = client.refresh(&id, &body).await;
+        let reqs = mock.requests();
+        let calls: Vec<_> = reqs.iter().filter(|r| r.path.starts_with("/v1/agent/targets")).collect();
+        assert!(calls.len() >= 2, "register and refresh both reached cloud");
+        for r in calls {
+            assert_eq!(r.header("x-org-id").as_deref(), Some("acme"), "{} {} lost the selected org", r.method, r.path);
+        }
     }
 
     #[tokio::test]
@@ -367,7 +398,7 @@ mod tests {
         let mock = MockCloud::start().await;
         let machine = format!("syncfresh_{}", std::process::id());
         let _ = std::fs::remove_file(super::super::context::target_path_for_test(&machine));
-        sync(&mock.base_url(), "T", &machine, "evo", &gpu_machine()).await;
+        sync(&mock.base_url(), "T", None, &machine, "evo", &gpu_machine()).await;
 
         assert!(mock.requests().iter().any(|r| r.method == "POST" && r.path == "/v1/agent/targets"));
         let rec = TargetRecord::load(&machine).unwrap().unwrap();
@@ -393,7 +424,7 @@ mod tests {
         .save()
         .unwrap();
 
-        sync(&mock.base_url(), "T", &machine, "evo", &gpu_machine()).await;
+        sync(&mock.base_url(), "T", None, &machine, "evo", &gpu_machine()).await;
 
         let reqs = mock.requests();
         assert!(reqs.iter().any(|r| r.method == "PATCH" && r.path == "/v1/agent/targets/tgt_stale"), "tries the heartbeat first");
@@ -439,7 +470,7 @@ mod tests {
         let machine = format!("beat_{}", std::process::id());
         let _ = std::fs::remove_file(super::super::context::target_path_for_test(&machine));
 
-        let held = beat_every(Duration::from_millis(10), Creds::Fixed("T".into()), &mock.base_url(), &machine, "evo");
+        let held = beat_every(Duration::from_millis(10), Creds::Fixed("T".into()), None, &mock.base_url(), &machine, "evo");
         until("a machine to keep beating", || mock.requests().len() >= 3).await;
         drop(held);
 
@@ -460,6 +491,7 @@ mod tests {
         let held = beat_every(
             Duration::from_millis(10),
             Creds::Fixed("T".into()),
+            None,
             &mock.base_url(),
             &machine,
             "evo",
@@ -485,7 +517,7 @@ mod tests {
         let machine = format!("beatdrop_{}", std::process::id());
         let _ = std::fs::remove_file(super::super::context::target_path_for_test(&machine));
 
-        let held = beat_every(Duration::from_millis(10), Creds::Fixed("T".into()), &mock.base_url(), &machine, "evo");
+        let held = beat_every(Duration::from_millis(10), Creds::Fixed("T".into()), None, &mock.base_url(), &machine, "evo");
         until("the first beat", || !mock.requests().is_empty()).await;
         drop(held);
         // A beat already in flight may still land, so settle before reading the mark.

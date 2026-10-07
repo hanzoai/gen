@@ -2,9 +2,10 @@
 //!
 //! One concern — talk to cloud's live agent-session registry over HTTPS with the
 //! CLI's hanzo.id bearer. The session is org-scoped SERVER-SIDE: the gateway
-//! validates the JWT and injects the `owner` claim as the org, so this client
-//! never sends (and cannot forge) an org — cross-tenant attribution is refused
-//! at the gateway, not trusted from here. See `cloud/clients/agents/sessions.go`.
+//! validates the token and decides the org. This client adds only the `--org`
+//! selection as `X-Org-Id`, which the gateway honors only within the token's
+//! signed membership — cross-tenant attribution is refused at the gateway, not
+//! trusted from here. See `cloud/clients/agents/sessions.go`.
 
 use anyhow::{Context, Result};
 use hanzo_client::{Http, Method, Request, Transport};
@@ -19,6 +20,8 @@ pub struct SessionClient {
     wire: Http,
     api: String, // base origin, no trailing slash (e.g. https://api.hanzo.ai)
     token: String,
+    /// The org selected with `--org`, sent as `X-Org-Id` (`Config::org`).
+    org: Option<String>,
 }
 
 /// The result of registering a session — cloud mints the id.
@@ -51,7 +54,14 @@ impl SessionClient {
             wire: Http::new(wire),
             api: api.trim_end_matches('/').to_string(),
             token: token.to_string(),
+            org: None,
         })
+    }
+
+    /// Act in `org` when one was selected (`--org`); `None` is the bearer's own.
+    pub fn with_org(mut self, org: Option<&str>) -> Self {
+        self.org = org.map(str::to_string);
+        self
     }
 
     /// Register a new root session. `title` is truncated server-side; `actor` is
@@ -177,6 +187,9 @@ impl SessionClient {
     ) -> Result<Value> {
         let mut request =
             Request::new(method, format!("{}{}", self.api, path)).token(&self.token);
+        if let Some(org) = &self.org {
+            request = request.org(org);
+        }
         if let Some(body) = body {
             request = request.body(body.clone());
         }
@@ -203,12 +216,22 @@ mod tests {
         assert_eq!(r.path, "/v1/agents/sessions");
         // Bearer carries the credential; the org is derived server-side.
         assert_eq!(r.header("authorization").as_deref(), Some("Bearer TOK123"));
-        assert!(r.header("x-org-id").is_none(), "CLI must not send X-Org-Id");
+        assert!(r.header("x-org-id").is_none(), "with no --org selected, the CLI sends no X-Org-Id");
         assert_eq!(r.json()["agent"], "claude");
         assert_eq!(r.json()["title"], "fix the bug");
         assert_eq!(r.json()["status"], "running");
         // actor is server-derived: the CLI must not attribute it.
         assert!(r.json().get("actor").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_selected_org_files_the_session_there() {
+        let mock = MockCloud::start().await;
+        let client = SessionClient::new(&mock.base_url(), "T").unwrap().with_org(Some("acme"));
+        client.register("tmux", "shell", "evo", "/w").await.unwrap();
+        let reqs = mock.requests();
+        let r = reqs.iter().find(|r| r.method == "POST").unwrap();
+        assert_eq!(r.header("x-org-id").as_deref(), Some("acme"), "the session row left the selected org");
     }
 
     /// EVERY session says which machine it is on. A row registered without a host

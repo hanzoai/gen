@@ -625,7 +625,7 @@ pub async fn run(cfg: &mut Config, opts: Options) -> Result<()> {
     // Cloud session (linked only). Resolve reuses a non-terminal resumed session
     // (same id) or forks a new one off a terminal / fresh session.
     let client = if do_link {
-        Some(SessionClient::new(&api, bearer.as_deref().unwrap())?)
+        Some(SessionClient::new(&api, bearer.as_deref().unwrap())?.with_org(cfg.org.as_deref()))
     } else {
         None
     };
