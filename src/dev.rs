@@ -13,7 +13,8 @@
 //!
 //! Auto-approve is ON by default (the confirmed default): `-c approval_policy="never"
 //! -c sandbox_mode="workspace-write"` — it stops asking but KEEPS the workspace
-//! sandbox. `--ask`/`--safe` (or `autoApprove: false`) hand back the user's own
+//! sandbox. Each of the two is added only when the user's own `config.toml` does
+//! not set it: their config wins unless they pass a flag. `--ask`/`--safe` (or `autoApprove: false`) hand back the user's own
 //! mode; `--no-sandbox` escalates to the full `--dangerously-bypass-approvals-and-sandbox`
 //! (a deliberate per-invocation act, never a persisted default). `dev` reads no
 //! repo-local MCP config, so it has no trust-gate vector.
@@ -90,12 +91,7 @@ impl Backend for Agent {
         // sandbox; `Bypass` (`--no-sandbox`) drops it entirely; `Ask` leaves the
         // user's own mode. codex 0.144.x has no `--full-auto`/`--yolo`.
         match spec.approval {
-            Approval::Auto => {
-                args.push("-c".into());
-                args.push(cfg_string("approval_policy", "never"));
-                args.push("-c".into());
-                args.push(cfg_string("sandbox_mode", "workspace-write"));
-            }
+            Approval::Auto => args.extend(auto_overrides(user_config(self.program).as_ref())),
             Approval::Bypass => args.push("--dangerously-bypass-approvals-and-sandbox".into()),
             Approval::Ask => {}
         }
@@ -159,8 +155,22 @@ impl Backend for Agent {
                     args.push(cfg_string("model_providers.hanzocode.base_url", &base));
                     args.push("-c".into());
                     args.push(cfg_string("model_providers.hanzocode.wire_api", "responses"));
-                    args.push("-c".into());
-                    args.push(cfg_string("model_providers.hanzocode.env_key", "HANZO_USER_KEY"));
+                    if is_session_token(token) {
+                        // A sign-in token ages out within the hour, so the agent asks
+                        // this CLI for it again rather than reading it once.
+                        let exe = std::env::current_exe()
+                            .map(|path| path.to_string_lossy().into_owned())
+                            .unwrap_or_else(|_| "hanzo".into());
+                        args.push("-c".into());
+                        args.push(cfg_string("model_providers.hanzocode.auth.command", &exe));
+                        args.push("-c".into());
+                        args.push(cfg_array("model_providers.hanzocode.auth.args", &["auth".into(), "token".into()]));
+                        args.push("-c".into());
+                        args.push(format!("model_providers.hanzocode.auth.refresh_interval_ms={TOKEN_REFRESH_MS}"));
+                    } else {
+                        args.push("-c".into());
+                        args.push(cfg_string("model_providers.hanzocode.env_key", "HANZO_USER_KEY"));
+                    }
                     args.push("-c".into());
                     args.push(cfg_string("model_provider", "hanzocode"));
                 }
@@ -357,6 +367,59 @@ fn model_catalog(model: &str, context_window: u64) -> String {
 }
 
 /// A `-c key=value` override where `value` is a TOML string literal.
+/// How often the agent asks for the sign-in token again: well inside the hour
+/// an IAM token lives.
+const TOKEN_REFRESH_MS: u64 = 600_000;
+
+/// An IAM sign-in token (a JWT, which ages out) rather than an API key.
+fn is_session_token(value: &str) -> bool {
+    value.starts_with("eyJ") && value.split('.').count() == 3
+}
+
+/// The auto-approve overrides, less any the user's own config already sets: the
+/// `approval_policy` and `sandbox_mode` they chose there stand. A key counts as
+/// set at the top level or in the profile the config selects.
+fn auto_overrides(user: Option<&toml::Table>) -> Vec<String> {
+    let sets = |key: &str| {
+        let Some(user) = user else { return false };
+        let profile = user
+            .get("profile")
+            .and_then(toml::Value::as_str)
+            .and_then(|name| user.get("profiles")?.get(name));
+        user.contains_key(key) || profile.is_some_and(|profile| profile.get(key).is_some())
+    };
+    let mut args = Vec::new();
+    for (key, value) in [("approval_policy", "never"), ("sandbox_mode", "workspace-write")] {
+        if !sets(key) {
+            args.push("-c".into());
+            args.push(cfg_string(key, value));
+        }
+    }
+    args
+}
+
+/// The agent's own `config.toml`, read from the home it reads: `DEV_HOME` (else
+/// `~/.hanzo/dev`) for `dev`, `CODEX_HOME` (else `~/.codex`) for `codex`.
+#[cfg(not(test))]
+fn user_config(program: &str) -> Option<toml::Table> {
+    let (var, default) = match program {
+        "dev" => ("DEV_HOME", ".hanzo/dev"),
+        _ => ("CODEX_HOME", ".codex"),
+    };
+    let home = std::env::var_os(var)
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(default)))?;
+    std::fs::read_to_string(home.join("config.toml")).ok()?.parse().ok()
+}
+
+/// Tests describe the user's config through [`auto_overrides`] directly, never
+/// through the machine running them.
+#[cfg(test)]
+fn user_config(_program: &str) -> Option<toml::Table> {
+    None
+}
+
 fn cfg_string(key: &str, val: &str) -> String {
     format!("{key}={}", toml_string(val))
 }
@@ -659,6 +722,50 @@ mod tests {
         for args in [auto, ask, bypass] {
             assert!(!args.iter().any(|a| a.contains("yolo") || a == "--full-auto"));
         }
+    }
+
+    /// The user's own `config.toml` wins: a key they set there is not overridden,
+    /// whether at the top level or in the profile their config selects.
+    #[test]
+    fn the_users_config_wins_over_auto_approve() {
+        let none = auto_overrides(None);
+        assert_eq!(none, vec!["-c", r#"approval_policy="never""#, "-c", r#"sandbox_mode="workspace-write""#]);
+
+        let theirs: toml::Table = r#"sandbox_mode = "danger-full-access""#.parse().unwrap();
+        assert_eq!(auto_overrides(Some(&theirs)), vec!["-c", r#"approval_policy="never""#]);
+
+        let both: toml::Table = "approval_policy = \"on-request\"\nsandbox_mode = \"read-only\"".parse().unwrap();
+        assert!(auto_overrides(Some(&both)).is_empty());
+
+        let profile: toml::Table =
+            "profile = \"work\"\n[profiles.work]\nsandbox_mode = \"danger-full-access\"".parse().unwrap();
+        assert_eq!(auto_overrides(Some(&profile)), vec!["-c", r#"approval_policy="never""#]);
+
+        // A profile the config does not select changes nothing.
+        let unused: toml::Table = "[profiles.work]\nsandbox_mode = \"read-only\"".parse().unwrap();
+        assert_eq!(auto_overrides(Some(&unused)), none);
+    }
+
+    /// On a custom gateway a sign-in token is asked of this CLI again before it
+    /// ages out; an API key, which never does, rides the environment as before.
+    #[test]
+    fn a_sign_in_token_is_refreshed_on_a_custom_gateway() {
+        let mut s = spec(Mode::Headless, "https://gw.example.com");
+        s.routing = Route::Via(Routing::Gateway {
+            api: "https://gw.example.com".into(),
+            token: "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ6In0.c2ln".into(),
+            model: "enso".into(),
+            small_fast_model: "enso-flash".into(),
+            context_window: 1_000_000,
+        });
+        let args = argv(&Agent::DEV.build(&s).unwrap());
+        assert!(args.iter().any(|a| a == r#"model_providers.hanzocode.auth.args=["auth","token"]"#));
+        assert!(args.iter().any(|a| a == "model_providers.hanzocode.auth.refresh_interval_ms=600000"));
+        assert!(!args.iter().any(|a| a.contains("model_providers.hanzocode.env_key")), "auth and env_key cannot both be set");
+
+        let key = argv(&Agent::DEV.build(&spec(Mode::Headless, "https://gw.example.com")).unwrap());
+        assert!(key.iter().any(|a| a == r#"model_providers.hanzocode.env_key="HANZO_USER_KEY""#));
+        assert!(!key.iter().any(|a| a.contains("hanzocode.auth")));
     }
 
     /// The gateway route names the model's REAL window through a `model_catalog_json`
