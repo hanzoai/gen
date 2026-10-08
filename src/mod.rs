@@ -1366,7 +1366,8 @@ fn spawn_err(program: &str) -> impl Fn(std::io::Error) -> anyhow::Error + '_ {
         if e.kind() == std::io::ErrorKind::NotFound {
             anyhow!(
                 "the `{program}` coding agent is not installed (not on PATH) — \
-                 install it, or name another backend: `hanzo code dev`, \
+                 install it (`curl -fsSL hanzo.sh | sh` installs `dev`), or name \
+                 another backend: `hanzo code dev`, \
                  `hanzo code claude`, `hanzo code codex`, `hanzo code agy`, `hanzo code cursor`"
             )
         } else {
