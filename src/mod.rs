@@ -37,6 +37,7 @@ mod kit;
 pub mod sample;
 pub mod session;
 pub(crate) mod settings;
+mod summary;
 pub mod target;
 mod theme;
 mod tier;
@@ -679,6 +680,7 @@ pub async fn run(cfg: &mut Config, opts: Options) -> Result<()> {
     );
 
     let structured = client.is_some() && session_id.is_some();
+    let spent = summary::Run::begin(&routing);
     let spec = Spec {
         mode,
         task: opts.task.clone(),
@@ -712,21 +714,24 @@ pub async fn run(cfg: &mut Config, opts: Options) -> Result<()> {
             let run =
                 supervise(&*backend, spec, launch, structured, client.clone(), session_id.clone())
                     .await;
+            // A run that could not COMPLETE still ended. Propagating the error
+            // straight out — which is what `?` here used to do — leaves the row
+            // this run registered claiming to be running for good, and the
+            // registry has no heartbeat to contradict it.
+            let (outcome, status) = match &run {
+                Ok((o, s)) => (o.clone(), *s),
+                Err(_) => (Outcome::default(), Status::Error),
+            };
             if let (Some(c), Some(id)) = (&client, &session_id) {
-                // A run that could not COMPLETE still ended. Propagating the error
-                // straight out — which is what `?` here used to do — leaves the row
-                // this run registered claiming to be running for good, and the
-                // registry has no heartbeat to contradict it.
-                let (outcome, status) = match &run {
-                    Ok((o, s)) => (o.clone(), *s),
-                    Err(_) => (Outcome::default(), Status::Error),
-                };
                 let transcript = outcome
                     .backend_session
                     .as_ref()
                     .and_then(|bs| backend.transcript_path(&route, &cwd, bs))
                     .map(|p| p.display().to_string());
                 finalize(c, id, &outcome, status, &snapshot, &api, &who, transcript).await;
+            }
+            spent.end(cfg, backend.label(), kind == BackendKind::Claude, &outcome.usage, session_id.as_deref()).await;
+            if let Some(id) = &session_id {
                 report_link(id);
             }
             run?;
@@ -752,6 +757,10 @@ pub async fn run(cfg: &mut Config, opts: Options) -> Result<()> {
                     _ => Status::Error,
                 };
                 finalize(c, id, &outcome, status, &snapshot, &api, &who, transcript).await;
+            }
+            // The tool's own screen was the stream, so nothing was reported here.
+            spent.end(cfg, backend.label(), kind == BackendKind::Claude, &Usage::default(), session_id.as_deref()).await;
+            if let Some(id) = &session_id {
                 report_link(id);
             }
             run?;
@@ -1277,7 +1286,7 @@ fn status_lines(
         None => "model routing: off".to_string(),
     };
     let stream = match session {
-        Some(id) => format!("session stream: on → https://hanzo.bot/sessions/{id}"),
+        Some(id) => format!("session stream: on → {}", summary::url(id)),
         None => "session stream: off (this session is not mirrored to cloud; pass --link to stream it)".to_string(),
     };
     (route, stream)
