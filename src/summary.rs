@@ -151,7 +151,7 @@ fn metered(e: &Ended, meter: Option<&Result<serde_json::Value, String>>) -> Vec<
             out
         }
         Some(Err(why)) => vec![row("usage", &format!("the api.hanzo.ai meter did not answer: {why}"))],
-        None => vec![row("usage", "not observed: this run's backend reported no tokens")],
+        None => vec![row("usage", "not asked: this run's backend reported no tokens, and the meter is read at a terminal")],
     }
 }
 
@@ -198,10 +198,6 @@ impl Run {
         session: Option<&str>,
     ) {
         use colored::Colorize;
-        let book = match self.book {
-            Some(handle) => tokio::time::timeout(PRICES_WAIT, handle).await.ok().and_then(Result::ok).flatten(),
-            None => None,
-        };
         let e = Ended {
             backend,
             took: self.at.elapsed(),
@@ -212,7 +208,15 @@ impl Run {
             routed: self.routed.as_deref(),
             session,
         };
-        let meter = if asks(&e) {
+        // The cloud is asked only for a person at a terminal. A script reads what the agent printed, and the
+        // process should end when the agent does: its block carries what the run reported and nothing it
+        // has to wait for.
+        let person = std::io::IsTerminal::is_terminal(&std::io::stdout());
+        let book = match self.book {
+            Some(handle) if person || e.tally().is_some() => tokio::time::timeout(PRICES_WAIT, handle).await.ok().and_then(Result::ok).flatten(),
+            _ => None,
+        };
+        let meter = if person && asks(&e) {
             Some(match tokio::time::timeout(METER_WAIT, savings::summary(cfg, &window(&e))).await {
                 Ok(m) => m,
                 Err(_) => Err(format!("the cloud did not answer in {}s", METER_WAIT.as_secs_f32())),
