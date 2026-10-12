@@ -342,7 +342,7 @@ pub fn sync(root: &Path, ledger: &Path, skills: &[Skill]) -> io::Result<Synced> 
 
 /// Create `dir` and its parents, owner-only where this creates them; an existing
 /// directory keeps its own mode.
-fn private_dir(dir: &Path) -> io::Result<()> {
+pub(crate) fn private_dir(dir: &Path) -> io::Result<()> {
     let mut b = std::fs::DirBuilder::new();
     b.recursive(true);
     #[cfg(unix)]

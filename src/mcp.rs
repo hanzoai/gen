@@ -123,14 +123,8 @@ fn load(dir: &Path, key: &str) -> Option<Manifest> {
 }
 
 fn store(dir: &Path, m: &Manifest) -> Result<()> {
-    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
-    let tmp = dir.join(format!("{}.{}.tmp", m.key, std::process::id()));
-    {
-        let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
-        std::io::Write::write_all(&mut f, &serde_json::to_vec(m)?)?;
-    }
-    std::fs::rename(&tmp, dir.join(format!("{}.json", m.key)))?;
+    super::kit::private_dir(dir)?;
+    crate::private::write(&dir.join(format!("{}.json", m.key)), &serde_json::to_vec(m)?)?;
     Ok(())
 }
 
