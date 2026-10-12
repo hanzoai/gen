@@ -46,7 +46,7 @@ use super::home;
 /// Seconds a fetched kit stands in for a fresh one.
 const TTL: i64 = 60;
 /// How long a run waits for the kit before it starts without one.
-const WAIT: Duration = Duration::from_secs(5);
+const WAIT: Duration = Duration::from_secs(2);
 /// The most skills, and bytes of them, one run carries: the tool app's bounds
 /// (apps/tools `maxSkillDocs`, `maxKitBytes`), held here too.
 const MAX_SKILLS: usize = 16;

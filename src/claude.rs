@@ -157,6 +157,13 @@ impl Backend for Claude {
                 // Surface the gateway's own catalog in `/model` (harmless when the
                 // gateway serves no `claude-*` ids; future-proof when it does).
                 cmd.env("CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY", "1");
+                // MCP tool definitions are read when a tool is searched for, not in every
+                // request: the toolset costs an agent that never calls it nothing, and the
+                // prompt the provider caches stays the size of the agent's own. Claude's tool
+                // search speaks the Anthropic wire, so it is asked for only on a model that does.
+                if (spec.mcp.is_some() || spec.cloud().is_some()) && lazy_tools(model) {
+                    cmd.env("ENABLE_TOOL_SEARCH", "true");
+                }
                 cmd.env_remove("ANTHROPIC_API_KEY");
                 // The carrier⇒zen map, as a per-RUN settings overlay. Claude budgets
                 // the context window from the carrier and sends the zen id, so the
@@ -264,6 +271,11 @@ fn mcp_config(mcp: Option<&McpAttach>, remote: Option<&Remote>) -> Option<String
         );
     }
     (!servers.is_empty()).then(|| json!({ "mcpServers": servers }).to_string())
+}
+
+/// Whether `model` is served on the Anthropic wire, which Claude's tool search needs.
+fn lazy_tools(model: &str) -> bool {
+    model.starts_with("anthropic/") || model.starts_with("claude-")
 }
 
 fn system_event(v: &Value) -> Vec<Mapped> {
@@ -391,6 +403,22 @@ mod tests {
     fn argv(launch: &Launch) -> Vec<String> {
         let std: &std::process::Command = launch.command.as_std();
         std.get_args().map(|a| a.to_string_lossy().to_string()).collect()
+    }
+
+    #[test]
+    fn the_toolset_is_searched_for_on_the_anthropic_wire_only() {
+        let env = |model: &str, mcp: bool| {
+            let mut s = spec(Mode::Headless);
+            s.routing = Route::Via(Routing::Gateway { api: "https://api.hanzo.ai".into(), token: "JWT".into(), model: model.into(), small_fast_model: "enso-flash".into(), context_window: 1_000_000 });
+            if !mcp {
+                s.mcp = None;
+            }
+            let l = Claude.build(&s).unwrap();
+            l.command.as_std().get_envs().find(|(k, _)| *k == "ENABLE_TOOL_SEARCH").and_then(|(_, v)| v.map(|v| v.to_string_lossy().to_string()))
+        };
+        assert_eq!(env("anthropic/claude-sonnet-5.5", true).as_deref(), Some("true"));
+        assert_eq!(env("enso-auto", true), None, "a model off the Anthropic wire keeps the client's default");
+        assert_eq!(env("anthropic/claude-sonnet-5.5", false), None, "no toolset, nothing to defer");
     }
 
     #[test]

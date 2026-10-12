@@ -408,19 +408,24 @@ pub fn resolve(kind: BackendKind) -> Box<dyn Backend> {
 /// the session (the caller warns and continues without it).
 pub fn resolve_mcp(cwd: &Path) -> Option<McpAttach> {
     let project = cwd.display().to_string();
-    if which::which("hanzo-mcp").is_ok() {
-        return Some(McpAttach {
-            program: "hanzo-mcp".into(),
-            args: vec!["--project-dir".into(), project],
-        });
-    }
-    if which::which("uvx").is_ok() {
-        return Some(McpAttach {
-            program: "uvx".into(),
-            args: vec!["hanzo-mcp".into(), "--project-dir".into(), project],
-        });
-    }
-    None
+    let direct = if which::which("hanzo-mcp").is_ok() {
+        McpAttach { program: "hanzo-mcp".into(), args: vec!["--project-dir".into(), project] }
+    } else if which::which("uvx").is_ok() {
+        McpAttach { program: "uvx".into(), args: vec!["hanzo-mcp".into(), "--project-dir".into(), project] }
+    } else {
+        return None;
+    };
+    Some(lazy(direct, std::env::current_exe().ok()))
+}
+
+/// The server behind this binary's own lazy proxy ([`super::mcp`]): the agent's wait
+/// for it to start is the proxy's, which answers from the last time the server spoke.
+/// Without a path to this binary the server is attached as it is.
+fn lazy(direct: McpAttach, exe: Option<std::path::PathBuf>) -> McpAttach {
+    let Some(exe) = exe else { return direct };
+    let mut args = vec!["__mcp".to_string(), "--".to_string(), direct.program];
+    args.extend(direct.args);
+    McpAttach { program: exe.display().to_string(), args }
 }
 
 /// Best-effort `<bin> --version` (first line), for the context snapshot.
@@ -442,6 +447,16 @@ pub fn backend_version(bin: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_toolset_is_attached_through_the_lazy_proxy() {
+        let direct = McpAttach { program: "hanzo-mcp".into(), args: vec!["--project-dir".into(), "/p".into()] };
+        let got = lazy(direct.clone(), Some("/opt/hanzo".into()));
+        assert_eq!(got.program, "/opt/hanzo");
+        assert_eq!(got.args, ["__mcp", "--", "hanzo-mcp", "--project-dir", "/p"]);
+        // No path to this binary: the server is attached as it is.
+        assert_eq!(lazy(direct, None).program, "hanzo-mcp");
+    }
 
     fn sel(positional: Option<&str>, tail: Option<&str>, named: Option<&str>) -> Selection {
         Selection {

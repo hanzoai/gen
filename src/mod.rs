@@ -34,6 +34,7 @@ mod external;
 pub(crate) mod harness;
 mod home;
 mod kit;
+pub mod mcp;
 pub mod sample;
 pub mod session;
 pub(crate) mod settings;
@@ -162,6 +163,9 @@ enum Cred {
 /// COMPILED IN, so every already-installed binary keeps asking for `enso` and no
 /// deploy of ours can reach them. The catalog's transitional entry may not be
 /// removed until those have aged out.
+/// The longest a run waits for the cloud to register its session before it starts unlinked.
+const LINK_WAIT: Duration = Duration::from_secs(2);
+
 pub(super) const DEFAULT_MODEL: &str = "enso-auto";
 pub(super) const DEFAULT_SMALL_FAST_MODEL: &str = "enso-flash";
 
@@ -593,26 +597,6 @@ pub async fn run(cfg: &mut Config, opts: Options) -> Result<()> {
         home::prepare(&routing);
     }
 
-    // The org's kit, as the cloud coding agent carries it: the skills an admin
-    // activated (and the person left on) written where THIS backend reads them —
-    // which for Claude is the home the route just chose — and the caller's tools
-    // as one MCP server on the IAM bearer. Read on every run through a short cache;
-    // no kit never stops a run, and the banner says so once.
-    let equipped = match (kit::root(kind, &routing), kit::cache()) {
-        (Some(skills), Some(cache)) => {
-            let caller = identity.as_ref().zip(bearer.as_deref()).map(|(_, token)| kit::Caller {
-                api: &api,
-                who: &who,
-                token,
-                local,
-            });
-            // The cloud's tools ride only a Hanzo-routed run (Spec::cloud), so the
-            // banner never claims a server the backend will not be handed.
-            Some(kit::equip(&cache, &skills, caller.as_ref(), mcp_on && routing.hanzo()).await)
-        }
-        _ => None,
-    };
-
     // For a linked interactive Claude run, pre-set the session id so its
     // transcript can be tailed; otherwise the resume handle names it.
     let preset_session = if do_link && mode == Mode::Interactive && kind == BackendKind::Claude && opts.resume.is_none() {
@@ -623,29 +607,66 @@ pub async fn run(cfg: &mut Config, opts: Options) -> Result<()> {
 
     let snapshot = Snapshot::capture(&cwd, backend.label(), backend.version());
 
-    // Cloud session (linked only). Resolve reuses a non-terminal resumed session
-    // (same id) or forks a new one off a terminal / fresh session.
     let client = if do_link {
         Some(SessionClient::new(&api, bearer.as_deref().unwrap())?.with_org(cfg.org.as_deref()))
     } else {
         None
     };
-    let mut session_id: Option<String> = None;
-    if let Some(c) = &client {
-        let title = session_title(&opts);
-        match resolve_cloud_session(c, &snapshot, &title, resume_from.as_deref()).await {
-            Ok((id, forked_from)) => {
-                // The "where it runs" context snapshot (no secrets).
-                let _ = c.event(&id, Kind::Status, snapshot.context_payload(forked_from.as_deref())).await;
-                session_id = Some(id);
+
+    // The org's kit and the cloud session are two reads of the cloud that nothing
+    // between them depends on, and the backend does not start until both are in:
+    // they are asked together, and the session only for as long as LINK_WAIT. A
+    // cloud that answers slowly costs a run its link and never its first model call.
+    //
+    // The kit is the skills an admin activated (and the person left on) written
+    // where THIS backend reads them — which for Claude is the home the route just
+    // chose — and the caller's tools as one MCP server on the IAM bearer. Read on
+    // every run through a short cache; no kit never stops a run, and the banner
+    // says so once.
+    let equip = async {
+        match (kit::root(kind, &routing), kit::cache()) {
+            (Some(skills), Some(cache)) => {
+                let caller = identity.as_ref().zip(bearer.as_deref()).map(|(_, token)| kit::Caller {
+                    api: &api,
+                    who: &who,
+                    token,
+                    local,
+                });
+                // The cloud's tools ride only a Hanzo-routed run (Spec::cloud), so the
+                // banner never claims a server the backend will not be handed.
+                Some(kit::equip(&cache, &skills, caller.as_ref(), mcp_on && routing.hanzo()).await)
             }
-            Err(e) => {
-                // Fail-open for availability: never block the dev's work on a
-                // cloud hiccup — degrade to a local (unlinked) run.
+            _ => None,
+        }
+    };
+
+    // Cloud session (linked only). Resolve reuses a non-terminal resumed session
+    // (same id) or forks a new one off a terminal / fresh session.
+    let link = async {
+        let c = client.as_ref()?;
+        let title = session_title(&opts);
+        let registered = tokio::time::timeout(LINK_WAIT, async {
+            let (id, forked_from) = resolve_cloud_session(c, &snapshot, &title, resume_from.as_deref()).await?;
+            // The "where it runs" context snapshot (no secrets).
+            let _ = c.event(&id, Kind::Status, snapshot.context_payload(forked_from.as_deref())).await;
+            Ok::<_, anyhow::Error>(id)
+        })
+        .await;
+        match registered {
+            Ok(Ok(id)) => Some(id),
+            // Fail-open for availability: never block the dev's work on a
+            // cloud hiccup — degrade to a local (unlinked) run.
+            Ok(Err(e)) => {
                 crate::warn(&format!("could not register session ({e}); continuing locally."));
+                None
+            }
+            Err(_) => {
+                crate::warn(&format!("the cloud did not register the session in {}s; continuing locally.", LINK_WAIT.as_secs()));
+                None
             }
         }
-    }
+    };
+    let (equipped, session_id) = tokio::join!(equip, link);
 
     // Register/refresh this machine as a cloud run-target so mission-control knows
     // WHICH computer the session runs on and whether it can take more work. DETACHED

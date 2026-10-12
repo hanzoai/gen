@@ -159,6 +159,11 @@ fn row(label: &str, value: &str) -> String {
     format!("  {label:<12}{value}")
 }
 
+/// The block is printed after the agent's work is done, and the process does not end
+/// until it is: it waits this long for the price list, and for the cloud's meter.
+const PRICES_WAIT: Duration = Duration::from_secs(1);
+const METER_WAIT: Duration = Duration::from_millis(1500);
+
 /// A session's clock and, on a routed run, the price list read while it ran.
 pub struct Run {
     from: DateTime<Utc>,
@@ -194,7 +199,7 @@ impl Run {
     ) {
         use colored::Colorize;
         let book = match self.book {
-            Some(handle) => tokio::time::timeout(Duration::from_secs(3), handle).await.ok().and_then(Result::ok).flatten(),
+            Some(handle) => tokio::time::timeout(PRICES_WAIT, handle).await.ok().and_then(Result::ok).flatten(),
             None => None,
         };
         let e = Ended {
@@ -207,7 +212,14 @@ impl Run {
             routed: self.routed.as_deref(),
             session,
         };
-        let meter = if asks(&e) { Some(savings::summary(cfg, &window(&e)).await) } else { None };
+        let meter = if asks(&e) {
+            Some(match tokio::time::timeout(METER_WAIT, savings::summary(cfg, &window(&e))).await {
+                Ok(m) => m,
+                Err(_) => Err(format!("the cloud did not answer in {}s", METER_WAIT.as_secs_f32())),
+            })
+        } else {
+            None
+        };
         println!();
         println!("{}", "hanzo code · session summary".bold());
         for line in lines(&e, book.as_ref(), meter.as_ref()) {
