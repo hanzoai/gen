@@ -10,7 +10,7 @@
 //! learns for the next one.
 //!
 //! The answer is kept in `~/.hanzo/mcp/<key>.json`, owner-only. `<key>` is the
-//! server's resolved path, its modification time and size, its arguments less the
+//! server's name, the size and modification time of the file it resolves to, its arguments less the
 //! project directory, and the protocol version the agent speaks, so a new server
 //! or a new client is never served an old answer. A server that does start is
 //! asked again and the file rewritten if it differs.
@@ -90,16 +90,12 @@ pub fn cache_dir() -> Option<PathBuf> {
 /// The identity of an answer: which server, how it is run, and which protocol the agent speaks.
 pub fn key(program: &str, args: &[String], version: &str) -> String {
     let mut h = Sha256::new();
-    h.update(format!("hanzo-mcp-shim/{FORMAT}\0{version}\0").as_bytes());
-    match which::which(program).ok().and_then(|p| std::fs::canonicalize(p).ok()) {
-        Some(path) => {
-            h.update(path.as_os_str().as_encoded_bytes());
-            if let Ok(m) = std::fs::metadata(&path) {
-                let secs = m.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
-                h.update(format!("\0{secs}\0{}", m.len()).as_bytes());
-            }
-        }
-        None => h.update(program.as_bytes()),
+    h.update(format!("hanzo-mcp-shim/{FORMAT}\0{version}\0{program}\0").as_bytes());
+    // The file the command resolves to, by its size and modification time and not its path: the same
+    // server reached through a link, a bind mount or another name is the same server.
+    if let Some(m) = which::which(program).ok().and_then(|p| std::fs::metadata(p).ok()) {
+        let secs = m.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
+        h.update(format!("{secs}\0{}", m.len()).as_bytes());
     }
     let mut skip = false;
     for a in args {
@@ -277,6 +273,21 @@ where
                         }
                     }
                     ("notifications/initialized", None) => {}
+                    // A client newer than the handshake probes with `server/discover` first and waits for
+                    // an answer before it falls back to `initialize`. The proxy speaks the handshake: it
+                    // says so at once, and starts nothing for a question it would not forward.
+                    ("server/discover", Some(id)) => {
+                        let reply = json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32601, "message": "Method not found" } });
+                        output.write_all(line(&reply).as_bytes()).await?;
+                        output.flush().await?;
+                    }
+                    // Nothing else is asked before `initialize`, and the real server cannot be started
+                    // without its parameters.
+                    (m, Some(id)) if backend.is_none() && version.is_empty() && m != "initialize" => {
+                        let reply = json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32002, "message": "Server not initialized" } });
+                        output.write_all(line(&reply).as_bytes()).await?;
+                        output.flush().await?;
+                    }
                     ("ping", Some(id)) if backend.is_none() => {
                         output.write_all(line(&result(id, json!({}))).as_bytes()).await?;
                         output.flush().await?;
@@ -577,6 +588,20 @@ mod tests {
         assert_eq!(started.load(Ordering::SeqCst), 2);
         assert_eq!(out[2]["id"], 3);
         assert_eq!(out[2]["result"]["content"][0]["text"], "ran read");
+    }
+
+    #[tokio::test]
+    async fn a_probe_before_the_handshake_is_answered_and_starts_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let started = Arc::new(AtomicUsize::new(0));
+        let spawn = fake(started.clone());
+        let probe = json!({ "jsonrpc": "2.0", "id": "p", "method": "server/discover", "params": {} });
+        let early = json!({ "jsonrpc": "2.0", "id": "q", "method": "tools/list" });
+        let out = session(spawn, dir.path(), &[probe, early, init(), initialized(), list()]).await;
+        assert_eq!(out[0]["error"]["code"], -32601);
+        assert_eq!(out[1]["error"]["code"], -32002);
+        assert_eq!(out[2]["result"]["serverInfo"]["name"], "fake");
+        assert_eq!(started.load(Ordering::SeqCst), 1, "started once, for the handshake of a cold session");
     }
 
     #[tokio::test]
