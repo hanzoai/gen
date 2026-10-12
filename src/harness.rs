@@ -48,7 +48,7 @@ const NATIVE: &[BackendKind] = &[
     BackendKind::Cursor,
 ];
 
-/// Which configured agent a bare `hanzo code` runs.
+/// Which configured agent a bare `hanzo` runs.
 ///
 /// A harness pin that names a native backend wins over `agent`. A pin of
 /// `hanzo` (the gateway) clears that default, so a later Hanzo login does not

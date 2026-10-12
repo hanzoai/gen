@@ -1,6 +1,6 @@
-//! `hanzo code`'s OWN Claude config home: `~/.hanzo/claude`.
+//! `hanzo dev`'s OWN Claude config home: `~/.hanzo/claude`.
 //!
-//! Claude Code and `hanzo code` are independent products that happen to share a
+//! Claude Code and `hanzo dev` are independent products that happen to share a
 //! binary. Sharing one mutable config braids them: the user's saved `/model`
 //! selection leaks in as this session's identity — and it OUTRANKS `ANTHROPIC_MODEL`,
 //! so a stale `fable` beats the resolved routing — while Hanzo's injected tiers leak

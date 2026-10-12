@@ -1,4 +1,4 @@
-//! Claude theme policy for `hanzo code claude` — NATIVE, no binary patching.
+//! Claude theme policy for `hanzo dev --claude` — NATIVE, no binary patching.
 //!
 //! Claude Code loads custom themes from `<config home>/themes/*.json` (its own
 //! `loadCustomThemes`) and selects one via `theme: "custom:<name>"` in

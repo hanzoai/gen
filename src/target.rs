@@ -254,7 +254,7 @@ impl Creds {
 
 /// `hanzo beat` — hold this machine in the fleet with no session attached.
 ///
-/// A target is live only while something beats. [`beat`] is held by `hanzo code`
+/// A target is live only while something beats. [`beat`] is held by `hanzo dev`
 /// and by `hanzo link`, and both end when the work they host ends — so a machine
 /// sitting at an idle prompt reads OFFLINE to the console and to whoever is
 /// choosing where the next session lands, while being the least loaded box in the

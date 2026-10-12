@@ -1,4 +1,4 @@
-//! `hanzo code` — wrap a local coding agent (Claude Code or `dev`) so a
+//! `hanzo dev` — wrap a local coding agent (Claude Code or `dev`) so a
 //! developer's terminal session is (opt-in) linked, live-streamed and tracked in
 //! Hanzo cloud, with the Hanzo MCP toolset attached and model usage metered
 //! universally through the Hanzo gateway.
@@ -27,7 +27,7 @@ pub mod context;
 mod control;
 mod dev;
 // The status vocabulary IS part of the session client's signature (`set_status`),
-// so anything that can hold a session — `hanzo link` as much as `hanzo code` —
+// so anything that can hold a session — `hanzo link` as much as `hanzo dev` —
 // must be able to name the value it is setting.
 pub mod event;
 mod external;
@@ -67,15 +67,18 @@ use event::{Kind, Mapped, Status, Usage};
 use session::SessionClient;
 use settings::Settings;
 
-/// Parsed `hanzo code` invocation.
+/// Parsed `hanzo dev` invocation.
 pub struct Options {
     /// The backend, ALREADY resolved by [`backend::select`] — the one place any
-    /// spelling (`code dev`, `code --dev`, `--backend dev`, `hanzo dev`) becomes
+    /// spelling (`dev --dev`, `--backend dev`, `hanzo dev`) becomes
     /// a backend. It arrives here as a value, not a string to be parsed again.
     pub backend: BackendKind,
     pub link: bool,
     pub no_link: bool,
-    pub route: bool,
+    /// Run on Hanzo's metered cloud models (`--cloud`). Off, a third-party tool
+    /// talks to its own account directly; `dev`, whose account is Hanzo's, routes
+    /// through the gateway either way.
+    pub cloud: bool,
     pub mcp: bool,
     pub project_mcp: bool,
     /// Opt OUT of auto-approve (`--ask` / `--safe`): the backend runs in its own
@@ -153,7 +156,7 @@ enum Cred {
 /// default (`claude-fable-5`) is NOT in the gateway catalog, so a routed run that
 /// names no model 400s ("model … is not available"); `dev`/codex's built-in
 /// default is likewise absent. We name Hanzo's own models, which the catalog
-/// carries as bare ids — so a default `hanzo code` works with no per-machine env.
+/// carries as bare ids — so a default `hanzo dev` works with no per-machine env.
 /// `enso-auto` is the default; `enso-ultra` is the adaptive fan-out a user can pick
 /// with `--model enso-ultra`. Overridable in `~/.hanzo/settings.json` (see [`Settings`]).
 ///
@@ -169,7 +172,7 @@ const LINK_WAIT: Duration = Duration::from_secs(2);
 pub(super) const DEFAULT_MODEL: &str = "enso-auto";
 pub(super) const DEFAULT_SMALL_FAST_MODEL: &str = "enso-flash";
 
-/// The context window `hanzo code` requests on the gateway route by default: the
+/// The context window `hanzo dev` requests on the gateway route by default: the
 /// real 1M window Hanzo's frontier models serve. A coding backend pointed at a
 /// custom gateway can't verify this and self-clamps to the standard 200K, so the
 /// gateway route NAMES the window (Claude `[1m]` suffix, `dev` `model_catalog_json`).
@@ -226,7 +229,7 @@ struct GatewayModels {
 /// the Claude backend, whose model auth reads them; `dev`/codex reads neither, so
 /// its model is `--model` > settings > built-in default (and it has no small/fast
 /// model at all).
-/// The reader's configured coding agent, for resolving a bare `hanzo code`.
+/// The reader's configured coding agent, for resolving a bare `hanzo`.
 ///
 /// A narrow accessor rather than a public settings module: the caller needs exactly
 /// this one value, and `select` is a pure function that takes it as an argument.
@@ -282,51 +285,32 @@ fn route_plan(backend: BackendKind, provider: Option<&str>, has_bearer: bool) ->
     plan
 }
 
-/// True when this run should use the coding agent's own stored login rather
-/// than the Hanzo gateway. That is the account the person chose at
-/// `hanzo auth login`.
-fn prefers_own_account(own: bool, configured: Option<&str>, backend: BackendKind) -> bool {
-    if !own {
-        return false;
-    }
-    let Some(name) = configured else {
-        return false;
-    };
-    BackendKind::parse(name).ok() == Some(backend)
-        && matches!(
-            backend,
-            BackendKind::Claude | BackendKind::Codex | BackendKind::Agy | BackendKind::Cursor
-        )
-}
-
 /// Resolve the routing for this run by walking [`route_plan`] and taking the
 /// first credential actually held. Provider keys are read from the Vault LAZILY
 /// (only as the plan reaches them), so the common gateway path (bearer in hand)
-/// does zero extra keychain reads, and `--no-route` does none at all.
+/// does zero extra keychain reads, and a direct run does none at all.
 ///
 /// Returns a [`Route`] — the three-way decision the backend needs to treat the
-/// child's model-auth env correctly. `--no-route` ⇒ `Inherit`; a resolved
+/// child's model-auth env correctly. A direct run ⇒ `Inherit`; a resolved
 /// credential ⇒ `Via`; nothing resolved ⇒ [`unresolved_route`] (fail closed iff a
 /// provider was selected, else inherit an unconfigured backend's own account).
 fn resolve_routing(
     cfg: &Config,
     settings: &Settings,
-    route: bool,
+    cloud: bool,
     backend: BackendKind,
     api: &str,
     bearer: Option<&str>,
     model_flag: Option<&str>,
 ) -> Result<Route> {
-    if !route {
-        // `--no-route`: the backend uses its OWN account; we touch no env.
+    // The default: a third-party tool talks straight to the account it is signed
+    // in to, and we touch no env. `dev` is ours, and its account IS Hanzo's.
+    if !cloud && backend != BackendKind::Dev {
         return Ok(Route::Inherit);
     }
-    // A native agent login keeps that agent's own stored session, even when a
-    // Hanzo bearer is also on the machine. Antigravity and Cursor have no
-    // gateway wire, so they always keep their own login.
-    if prefers_own_account(cfg.code.own_account, settings.agent.as_deref(), backend)
-        || matches!(backend, BackendKind::Agy | BackendKind::Cursor)
-    {
+    // Antigravity and Cursor have no gateway wire, so they always keep their
+    // own login, `--cloud` or not.
+    if matches!(backend, BackendKind::Agy | BackendKind::Cursor) {
         return Ok(Route::Inherit);
     }
     // The model rides ONLY the gateway route (resolved once here). Both gateway
@@ -552,8 +536,8 @@ pub async fn run(cfg: &mut Config, opts: Options) -> Result<()> {
 
     // Routing: which model endpoint this run's calls go to, and with what
     // credential — the Hanzo gateway (metered) for a Hanzo login, or a provider's
-    // OWN API for a stored OpenAI/Anthropic key. `--no-route` opts out entirely.
-    let routing = resolve_routing(cfg, &settings, opts.route, kind, &api, bearer.as_deref(), opts.model.as_deref())?;
+    // OWN API for a stored OpenAI/Anthropic key. A third-party tool is direct unless `--cloud`.
+    let routing = resolve_routing(cfg, &settings, opts.cloud, kind, &api, bearer.as_deref(), opts.model.as_deref())?;
     // Local usage, one line per session, for whichever connected account this
     // run actually used. A missing home does not stop the session.
     let used = harness::used_account(
@@ -581,8 +565,8 @@ pub async fn run(cfg: &mut Config, opts: Options) -> Result<()> {
     if matches!(routing, Route::FailClosed) {
         if let Some(p) = cfg.auth.provider.as_deref() {
             crate::warn(&format!(
-                "selected provider `{p}` has no usable key — run `hanzo auth login` (or pass `--no-route` \
-                 to use the backend's own account). Model calls will NOT route, and the child's \
+                "selected provider `{p}` has no usable key — run `hanzo auth login` (or run without `--cloud` \
+                 to use the tool's own account). Model calls will NOT route, and the child's \
                  inherited model credentials are cleared."
             ));
         }
@@ -590,7 +574,7 @@ pub async fn run(cfg: &mut Config, opts: Options) -> Result<()> {
 
     // Seed Hanzo's OWN Claude config home (`~/.hanzo/claude`) with the first-run
     // defaults a wrapped session needs — but only on a route that relocates it, so
-    // `--no-route` never writes Hanzo's defaults into the user's own install. This
+    // a direct run never writes Hanzo's defaults into the user's own install. This
     // is the one WRITE; `claude::build` and the transcript pointer only READ the
     // same pure function, so they cannot disagree about where the home is.
     if kind == BackendKind::Claude {
@@ -1257,7 +1241,7 @@ fn banner(
     let _ = api; // the route line carries its own host
     println!(
         "{} {} · {} · {}",
-        "hanzo code".bold(),
+        "hanzo dev".bold(),
         backend.cyan(),
         cwd.display().to_string().dimmed(),
         opts.resume.as_deref().map(|_| "resume").unwrap_or("start").dimmed(),
@@ -1290,7 +1274,7 @@ fn status_lines(
     let strip = |u: &str| u.trim_start_matches("https://").trim_start_matches("http://").trim_end_matches('/').to_string();
     let route = match routing {
         Some(Routing::Gateway { api, .. }) => {
-            format!("model routing: on → {} (prompts + code go here; usage metered to your org)", strip(api))
+            format!("model routing: Hanzo cloud → {} (prompts + code go here; usage metered to your org)", strip(api))
         }
         Some(Routing::Anthropic { .. }) => {
             "model routing: on → api.anthropic.com (your Anthropic key; usage billed by Anthropic)".to_string()
@@ -1298,13 +1282,10 @@ fn status_lines(
         Some(Routing::OpenAI { .. }) => {
             "model routing: on → api.openai.com (your OpenAI key; usage billed by OpenAI)".to_string()
         }
-        None if !opts.route => {
-            "model routing: off (--no-route; the backend's own model account, code stays with your provider)".to_string()
-        }
-        None if !signed_in => {
+        None if opts.backend == BackendKind::Dev && !signed_in => {
             "model routing: off (sign in with `hanzo auth login` to route + meter model calls)".to_string()
         }
-        None => "model routing: off".to_string(),
+        None => "model routing: your account, direct (code stays with your provider)".to_string(),
     };
     let stream = match session {
         Some(id) => format!("session stream: on → {}", summary::url(id)),
@@ -1397,8 +1378,8 @@ fn spawn_err(program: &str) -> impl Fn(std::io::Error) -> anyhow::Error + '_ {
             anyhow!(
                 "the `{program}` coding agent is not installed (not on PATH) — \
                  install it (`curl -fsSL hanzo.sh | sh` installs `dev`), or name \
-                 another backend: `hanzo code dev`, \
-                 `hanzo code claude`, `hanzo code codex`, `hanzo code agy`, `hanzo code cursor`"
+                 another tool: `hanzo dev`, \
+                 `hanzo dev --claude`, `--codex`, `--agy` or `--cursor`"
             )
         } else {
             anyhow!("failed to launch the `{program}` coding agent: {e}")
@@ -1837,7 +1818,7 @@ mod tests {
             backend: BackendKind::Claude,
             link: false,
             no_link: true,
-            route: true,
+            cloud: true,
             mcp: true,
             project_mcp: false,
             ask: false,
@@ -1853,7 +1834,7 @@ mod tests {
         // --no-link but model calls still ship code to the gateway.
         let gw = Routing::Gateway { api: "https://api.hanzo.ai".into(), token: "T".into(), model: "enso".into(), small_fast_model: "enso-flash".into(), context_window: 1_000_000 };
         let (route, stream) = status_lines(&opts, Some(&gw), true, None);
-        assert!(route.contains("model routing: on"), "got: {route}");
+        assert!(route.contains("model routing: Hanzo cloud"), "got: {route}");
         assert!(route.contains("api.hanzo.ai"));
         assert!(route.contains("prompts + code"));
         assert!(stream.contains("session stream: off"), "got: {stream}");
@@ -1861,12 +1842,16 @@ mod tests {
         assert!(!stream.to_lowercase().contains("local only"));
         assert!(!route.to_lowercase().contains("local only"));
 
-        // --no-route is explicit and distinct from "off because not signed in".
+        // The default says whose account it is, and is distinct from "off because
+        // not signed in" (which only `dev` can be).
         let mut o2 = opts;
-        o2.route = false;
+        o2.cloud = false;
         let (route2, _) = status_lines(&o2, None, true, None);
-        assert!(route2.contains("model routing: off"));
-        assert!(route2.contains("--no-route"));
+        assert!(route2.contains("model routing: your account, direct"), "got: {route2}");
+        o2.backend = BackendKind::Dev;
+        let (signed_out, _) = status_lines(&o2, None, false, None);
+        assert!(signed_out.contains("hanzo auth login"), "got: {signed_out}");
+        o2.backend = BackendKind::Claude;
 
         // Stream ON names the session id and mission-control, not "link".
         let (_, stream_on) = status_lines(&o2, None, true, Some("sess_x"));
@@ -1887,7 +1872,7 @@ mod tests {
             backend: BackendKind::Claude,
             link: false,
             no_link: true,
-            route: true,
+            cloud: true,
             mcp: true,
             project_mcp: false,
             ask: false,
@@ -1931,20 +1916,6 @@ mod tests {
         assert_eq!(route_plan(Claude, None, false), vec![Cred::HanzoKey]);
         // Explicit "hanzo" behaves like the gateway default.
         assert_eq!(route_plan(Claude, Some("hanzo"), true), vec![Cred::Bearer, Cred::HanzoKey]);
-    }
-
-    #[test]
-    fn a_native_login_keeps_that_agents_own_account() {
-        use BackendKind::{Agy, Claude, Codex, Cursor, Dev};
-        assert!(prefers_own_account(true, Some("claude"), Claude));
-        assert!(prefers_own_account(true, Some("codex"), Codex));
-        assert!(prefers_own_account(true, Some("agy"), Agy));
-        assert!(prefers_own_account(true, Some("cursor"), Cursor));
-        assert!(prefers_own_account(true, Some("agent"), Cursor));
-        assert!(!prefers_own_account(false, Some("claude"), Claude));
-        assert!(!prefers_own_account(true, Some("claude"), Dev));
-        assert!(!prefers_own_account(true, Some("claude"), Codex));
-        assert!(!prefers_own_account(true, None, Claude));
     }
 
     /// The model precedence — `--model` flag, then exported env, then

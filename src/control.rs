@@ -58,7 +58,7 @@
 //! Cloud's set has four verbs; a locally-running headless supervisor can act on
 //! three. `resume` means "start working again", and a session that is running has
 //! nothing to restart. A session that was PAUSED has no process at all — it is a
-//! transcript on disk — so resuming it is `hanzo code --resume <id>` on the
+//! transcript on disk — so resuming it is `hanzo dev --resume <id>` on the
 //! machine that holds it, which already exists. Rather than keep a daemon alive
 //! after `pause` purely to give `resume` something to do, we drain it, record it
 //! and move on. Saying so is better than a fourth code path that pretends.

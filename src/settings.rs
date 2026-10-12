@@ -1,4 +1,4 @@
-//! The native `hanzo code` settings home: `~/.hanzo/settings.json`.
+//! The native `hanzo dev` settings home: `~/.hanzo/settings.json`.
 //!
 //! ONE file configures the coding agent's defaults on a fresh machine — the model
 //! it names, whether it auto-approves the agent's actions, whether it attaches the
@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
-    /// The gateway model `hanzo code` names (`ANTHROPIC_MODEL` for Claude, codex's
+    /// The gateway model `hanzo dev` names (`ANTHROPIC_MODEL` for Claude, codex's
     /// `model` for `dev`). Unset ⇒ the built-in [`crate::commands::code::DEFAULT_MODEL`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -37,9 +37,9 @@ pub struct Settings {
     /// still forces it off regardless.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mcp: Option<bool>,
-    /// Which coding agent a bare `hanzo code` runs: `dev`, `claude`, `codex`,
+    /// Which coding agent a bare `hanzo` runs: `dev`, `claude`, `codex`,
     /// `agy` or `cursor`. Unset ⇒ [`super::backend::DEFAULT`] (`dev`, ours).
-    /// Naming one on the command line — `hanzo code claude`, `--claude`,
+    /// Naming one on the command line — `hanzo dev --claude`,
     /// `--backend claude` — wins over this, because an invocation is more
     /// specific than a default.
     ///
@@ -54,7 +54,7 @@ pub struct Settings {
     /// overrides this for one run. Unset ⇒ `agent` above.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub harness: Option<String>,
-    /// The context window (in tokens) `hanzo code` requests on the GATEWAY route.
+    /// The context window (in tokens) `hanzo dev` requests on the GATEWAY route.
     /// Unset ⇒ [`super::DEFAULT_CONTEXT_WINDOW`] (1M). Hanzo's frontier models are
     /// natively 1M, but a coding backend pointed at a custom gateway can't verify
     /// that and clamps itself to the standard 200K, so this NAMES the real window:

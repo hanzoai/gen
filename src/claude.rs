@@ -50,7 +50,7 @@ impl Backend for Claude {
         cmd.current_dir(&spec.cwd);
         let mut cleanup = Vec::new();
 
-        // A ROUTED `hanzo code claude` is not the user's own Claude Code install: it
+        // A ROUTED `hanzo dev --claude` is not the user's own Claude Code install: it
         // runs against its own config home, so their saved `/model` never becomes
         // this session's identity (it OUTRANKS `ANTHROPIC_MODEL`) and Hanzo's
         // injected tiers never leak back into their sessions. `--no-route` keeps
@@ -538,7 +538,7 @@ mod tests {
     /// The `[1m]` extended-context suffix rides ONLY a large-context model at a
     /// window beyond the standard 200K. A short-context variant (`*-flash`,
     /// `*-mini` — the background models) NEVER gets it, and opting the window back
-    /// to standard drops it too — so `hanzo code --backend claude` never asks the
+    /// to standard drops it too — so `hanzo dev --backend claude` never asks the
     /// gateway for a 1M window on a model that can't serve one.
     #[test]
     fn extended_context_suffix_only_on_large_models_and_windows() {
@@ -1004,7 +1004,7 @@ mod tests {
         assert_eq!(env.get("ANTHROPIC_MODEL").map(String::as_str), Some("claude-opus-4-8"));
     }
 
-    /// A ROUTED `hanzo code claude` is NOT the user's own Claude Code install: it
+    /// A ROUTED `hanzo dev --claude` is NOT the user's own Claude Code install: it
     /// runs against its own config home, so the user's saved `/model` never leaks in
     /// as this session's identity and Hanzo's injected tiers never leak back out.
     #[test]

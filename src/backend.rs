@@ -72,13 +72,12 @@ pub const DEFAULT: BackendKind = BackendKind::Dev;
 /// —
 ///
 /// ```text
-/// hanzo code dev         hanzo code --dev      hanzo code --backend dev
-/// hanzo code claude      hanzo code --claude
-/// hanzo code codex       hanzo code --codex
-/// hanzo code agy         hanzo code --agy
-/// hanzo code cursor      hanzo code --cursor      hanzo code --agent
-/// hanzo dev              (top-level shorthand for `hanzo code dev`)
-/// hanzo code             (default backend: dev)
+/// hanzo dev              hanzo dev --dev       hanzo dev --backend dev
+/// hanzo dev --claude
+/// hanzo dev --codex
+/// hanzo dev --agy
+/// hanzo dev --cursor     hanzo dev --agent
+/// hanzo claude           (a bare session, the backend named as a word)
 /// hanzo "fix the test"   (bare session, default backend)
 /// ```
 ///
@@ -90,7 +89,7 @@ pub const DEFAULT: BackendKind = BackendKind::Dev;
 pub struct Selection {
     /// The first positional operand — a backend name, or the task.
     pub positional: Option<String>,
-    /// The second positional — only reachable as `hanzo code <backend> <task>`.
+    /// The second positional — only reachable as a bare `hanzo <backend> <task>`.
     pub tail: Option<String>,
     /// `--backend X`, or whichever of `--claude` / `--codex` / `--dev` was set.
     /// clap's arg group guarantees at most one of those reaches us.
@@ -105,11 +104,12 @@ pub struct Selection {
 /// Resolve `(backend, task)` from every spelling at once.
 ///
 /// The one rule for the positional operand: it is the BACKEND if it is exactly a
-/// backend name, otherwise it is the TASK. So `hanzo code dev` picks a backend
-/// and `hanzo code "fix the test"` states a task, with no flag needed for either.
+/// backend name, otherwise it is the TASK. So a bare `hanzo claude` picks a backend
+/// and `hanzo dev "fix the test"` states a task, with no flag needed for either.
+/// `hanzo dev` itself refuses the word form: its tool is a flag.
 ///
 /// Naming the backend twice is an error rather than a precedence rule, because a
-/// precedence rule here is one nobody could remember: `hanzo code claude --codex`
+/// precedence rule here is one nobody could remember: `hanzo claude --codex`
 /// has no defensible winner, so it gets a clean message instead of a silent pick.
 pub fn select(sel: Selection) -> Result<(BackendKind, Option<String>)> {
     let positional_names_backend = sel.positional.as_deref().is_some_and(BackendKind::names);
@@ -119,7 +119,7 @@ pub fn select(sel: Selection) -> Result<(BackendKind, Option<String>)> {
             let pos = sel.positional.as_deref().unwrap_or_default();
             anyhow::bail!(
                 "backend named twice: `{pos}` and `--{named}` — name it once \
-                 (`hanzo code {pos}` or `hanzo code --{named}`)"
+                 (`hanzo {pos}` or `hanzo --{named}`)"
             );
         }
         let kind = BackendKind::parse(sel.positional.as_deref().unwrap_or_default())?;
@@ -130,7 +130,7 @@ pub fn select(sel: Selection) -> Result<(BackendKind, Option<String>)> {
     if let Some(extra) = &sel.tail {
         anyhow::bail!(
             "unexpected argument '{extra}' — a task is ONE argument; quote it \
-             (`hanzo code \"fix the failing test\"`)"
+             (`hanzo dev \"fix the failing test\"`)"
         );
     }
 
@@ -532,14 +532,14 @@ mod tests {
         }
     }
 
-    /// Naming nothing runs OUR agent — `hanzo code` and a bare `hanzo` alike.
+    /// Naming nothing runs OUR agent — `hanzo dev` and a bare `hanzo` alike.
     #[test]
     fn the_default_backend_is_ours() {
         assert_eq!(select(sel(None, None, None)).unwrap().0, BackendKind::Dev);
     }
 
     /// A lone operand is the TASK unless it is exactly a backend name — the one
-    /// rule that lets `hanzo code dev` and `hanzo code "fix it"` both work.
+    /// rule that lets a bare `hanzo claude` and `hanzo "fix it"` both work.
     #[test]
     fn a_lone_operand_is_a_task_unless_it_names_a_backend() {
         let (kind, task) = select(sel(Some("fix the failing test"), None, None)).unwrap();
@@ -550,7 +550,7 @@ mod tests {
         );
         assert_eq!(task.as_deref(), Some("fix the failing test"));
 
-        // `hanzo code claude "fix it"` — backend positionally, task after it.
+        // `hanzo claude "fix it"` — backend positionally, task after it.
         let (kind, task) = select(sel(Some("claude"), Some("fix it"), None)).unwrap();
         assert_eq!(kind, BackendKind::Claude);
         assert_eq!(task.as_deref(), Some("fix it"));

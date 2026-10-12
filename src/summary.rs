@@ -1,4 +1,4 @@
-//! The block `hanzo code` prints when a session ends: how long it ran, what it
+//! The block `hanzo dev` prints when a session ends: how long it ran, what it
 //! used, what that comes to, and where to see it in the cloud.
 //!
 //! Every figure says where it came from. **Reported** is what the backend's own
@@ -225,7 +225,7 @@ impl Run {
             None
         };
         println!();
-        println!("{}", "hanzo code · session summary".bold());
+        println!("{}", "hanzo dev · session summary".bold());
         for line in lines(&e, book.as_ref(), meter.as_ref()) {
             println!("{}", line.dimmed());
         }
