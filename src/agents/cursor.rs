@@ -11,8 +11,9 @@ pub const AGENT: Agent = Agent {
     name: "cursor",
     aliases: &["agent", "cursor-agent"],
     title: "Cursor",
-    // `cursor-agent` first: xAI's installer also puts an `agent` on PATH.
-    programs: &["cursor-agent", "agent"],
+    // `cursor-agent` only. Cursor's installer links `agent` beside it, and so
+    // does xAI's, to Grok: a bare `agent` on PATH may be either.
+    programs: &["cursor-agent"],
     upgrade: Upgrade::Own(&["update"]),
     routable: false,
     toolset: Toolset::Never,

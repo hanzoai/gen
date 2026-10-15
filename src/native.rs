@@ -37,7 +37,7 @@ pub enum Login {
     Antigravity,
 }
 
-/// Claude, ChatGPT (Codex), Antigravity (`agy`), Cursor (`agent`).
+/// Claude, ChatGPT (Codex), Antigravity (`agy`), Cursor (`cursor-agent`).
 pub const AGENTS: &[NativeAgent] = &[
     NativeAgent {
         backend: "claude",
@@ -68,7 +68,8 @@ pub const AGENTS: &[NativeAgent] = &[
         aliases: &["agent", "cursor-agent"],
         title: "Cursor",
         detail: "Login with Cursor",
-        programs: &["agent", "cursor-agent"],
+        // Never a bare `agent`: xAI's installer links one to Grok.
+        programs: &["cursor-agent"],
         login: Login::Args(&["login"]),
     },
 ];
@@ -141,6 +142,21 @@ mod tests {
         assert!(find("openai").is_none());
         assert!(find("anthropic").is_none());
         assert!(find("hanzo").is_none());
+    }
+
+    /// Signing in runs the same binary a session does. A login table that ran
+    /// `agent` first sent a Cursor sign-in to Grok wherever xAI's installer had
+    /// put its `agent` ahead on PATH.
+    #[test]
+    fn each_login_runs_the_binary_its_sessions_run() {
+        for agent in AGENTS {
+            // Claude and Codex have session drivers of their own, outside the table.
+            if let Some(coding) = crate::commands::code::agents::find(agent.backend) {
+                assert_eq!(agent.programs, coding.programs, "{}", agent.backend);
+            }
+            assert!(!agent.programs.contains(&"agent"), "{} runs a bare `agent`", agent.backend);
+        }
+        assert_eq!(find("cursor").unwrap().programs, ["cursor-agent"]);
     }
 
     #[test]
