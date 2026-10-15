@@ -55,8 +55,8 @@ pub struct Tier {
 pub const TIERS: &[Tier] = &[
     Tier { zen: "enso-flash", carrier: None, slot: Some(HAIKU), name: "Enso Flash", desc: "Hanzo Enso Flash — routine turns: reads, searches, small edits" },
     Tier { zen: "enso-pro", carrier: Some("claude-sonnet-4-6[1m]"), slot: Some("ANTHROPIC_DEFAULT_SONNET_MODEL"), name: "Enso Pro", desc: "Hanzo Enso Pro — frontier coders, routed (1M context)" },
-    Tier { zen: "enso-ultra", carrier: Some("claude-opus-4-8[1m]"), slot: Some("ANTHROPIC_DEFAULT_OPUS_MODEL"), name: "Enso Ultra", desc: "Hanzo Enso Ultra — the hardest turns, routed (900K context)" },
-    Tier { zen: "enso-ultra", carrier: Some("claude-fable-5[1m]"), slot: Some("ANTHROPIC_DEFAULT_FABLE_MODEL"), name: "Enso Ultra (max effort)", desc: "Hanzo Enso Ultra at max effort (900K context)" },
+    Tier { zen: "enso-ultra", carrier: Some("claude-opus-4-8[1m]"), slot: Some("ANTHROPIC_DEFAULT_OPUS_MODEL"), name: "Enso Ultra", desc: "Hanzo Enso Ultra — the hardest turns, routed (1M context)" },
+    Tier { zen: "enso-ultra", carrier: Some("claude-fable-5[1m]"), slot: Some("ANTHROPIC_DEFAULT_FABLE_MODEL"), name: "Enso Ultra (max effort)", desc: "Hanzo Enso Ultra at max effort (1M context)" },
     Tier { zen: "zen6", carrier: Some("claude-sonnet-5[1m]"), slot: None, name: "Zen6", desc: "Hanzo Zen6 — open weights (1M context)" },
 ];
 
