@@ -211,7 +211,8 @@ impl Backend for External {
                 Gateway::Pi => {
                     let dir = home("pi")?;
                     let models = json!({ "providers": { "hanzo": {
-                        "baseUrl": v1(api), "api": "openai-completions", "apiKey": KEY,
+                        // pi interpolates `${NAME}` from its environment, so the token is never written down.
+                        "baseUrl": v1(api), "api": "openai-completions", "apiKey": format!("${{{KEY}}}"),
                         "models": [{ "id": model, "name": model }],
                     } } });
                     crate::private::write(&dir.join("models.json"), models.to_string().as_bytes())?;
