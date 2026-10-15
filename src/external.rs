@@ -144,6 +144,12 @@ impl Backend for External {
                     cmd.env(var, p);
                 }
             }
+            Mcp::Extension(flag) => {
+                if let Some(m) = &spec.mcp {
+                    args.push(flag.to_string());
+                    args.push(std::iter::once(&m.program).chain(&m.args).map(|w| shell_word(w)).collect::<Vec<_>>().join(" "));
+                }
+            }
             Mcp::Inline(flag) => {
                 if let Some(m) = &spec.mcp {
                     args.push(flag.to_string());
@@ -177,9 +183,30 @@ impl Backend for External {
                         args.extend(["-m".into(), format!("hanzo/{model}")]);
                     }
                 }
-                Gateway::Grok => {
-                    cmd.env("GROK_BASE_URL", v1(api)).env("GROK_API_KEY", token);
-                    args.extend(["-m".into(), model.into()]);
+                Gateway::Goose => {
+                    cmd.env("OPENAI_HOST", api.trim_end_matches('/'))
+                        .env("OPENAI_BASE_PATH", "v1/chat/completions")
+                        .env("OPENAI_API_KEY", token);
+                    args.extend(["--provider".into(), "openai".into(), "--model".into(), model.into()]);
+                }
+                Gateway::Hermes => {
+                    let dir = home("hermes")?;
+                    // JSON is YAML: the file Hermes reads, written without a YAML writer.
+                    let mut doc = json!({
+                        "model": { "provider": "hanzo", "default": model },
+                        "providers": { "hanzo": { "base_url": v1(api), "key_env": KEY } },
+                    });
+                    if let Some(m) = &spec.mcp {
+                        doc["mcp_servers"] = json!({ "hanzo": entry(m) });
+                    }
+                    crate::private::write(&dir.join("config.yaml"), doc.to_string().as_bytes())?;
+                    cmd.env("HERMES_HOME", &dir).env(KEY, token);
+                }
+                Gateway::Aider => {
+                    cmd.env("OPENAI_API_BASE", v1(api)).env("OPENAI_API_KEY", token);
+                    // A gateway model is not in aider's own table; without this it warns, and
+                    // `--yes-always` answers its offer to open the docs in a browser.
+                    args.extend(["--model".into(), format!("openai/{model}"), "--no-show-model-warnings".into()]);
                 }
                 Gateway::Pi => {
                     let dir = home("pi")?;
@@ -194,14 +221,13 @@ impl Backend for External {
             }
         }
 
-        if auto {
+        if auto && (a.auto_headless || !headless) {
+            cmd.envs(a.auto_env.iter().copied());
             // crush's `--yolo` belongs to its screen, and `crush run` refuses it; every
             // other agent takes its own on the session.
             if a.mcp == Mcp::Crush {
-                if !headless {
-                    root.extend(a.auto.iter().map(|s| s.to_string()));
-                }
-            } else if headless || matches!(a.prompt, Prompt::Flag(_)) {
+                root.extend(a.auto.iter().map(|s| s.to_string()));
+            } else if headless || matches!(a.prompt, Prompt::Flag(_) | Prompt::Positional) {
                 args.extend(a.auto.iter().map(|s| s.to_string()));
             }
         }
@@ -209,18 +235,21 @@ impl Backend for External {
         cmd.args(&root);
         if headless {
             let task = spec.task.as_deref().unwrap_or_default();
-            if let Prompt::Sub(sub) = a.prompt {
-                cmd.arg(sub);
+            if let Prompt::Sub { run, .. } = a.prompt {
+                cmd.arg(run);
             }
             cmd.args(&args);
             if spec.structured {
                 cmd.args(a.stream);
             }
             match a.prompt {
-                Prompt::Flag(flag) => cmd.arg(flag).arg(task),
-                Prompt::Sub(_) => cmd.arg(task),
+                Prompt::Flag(flag) | Prompt::Sub { flag: Some(flag), .. } => cmd.arg(flag).arg(task),
+                Prompt::Sub { flag: None, .. } | Prompt::Positional => cmd.arg(task),
             };
         } else {
+            if let Prompt::Sub { session: Some(session), .. } = a.prompt {
+                cmd.arg(session);
+            }
             cmd.args(&args);
         }
         cmd.args(&spec.passthrough);
@@ -243,6 +272,15 @@ impl Backend for External {
 
     fn transcript_path(&self, _route: &Route, _cwd: &Path, _backend_session_id: &str) -> Option<PathBuf> {
         None
+    }
+}
+
+/// `w` as one word of a command line: quoted when it holds anything a shell would split on.
+fn shell_word(w: &str) -> String {
+    if !w.is_empty() && w.chars().all(|c| c.is_ascii_alphanumeric() || "-_./=:@+%,".contains(c)) {
+        w.to_string()
+    } else {
+        format!("'{}'", w.replace('\'', "'\\''"))
     }
 }
 
@@ -363,11 +401,57 @@ mod tests {
     }
 
     #[test]
-    fn grok_takes_the_gateway_from_its_own_variables() {
-        let l = of("grok").build(&spec(Mode::Headless, gateway())).unwrap();
-        assert_eq!(argv(&l), ["-m", "enso", "-p", "fix the test"]);
-        assert_eq!(env(&l, "GROK_BASE_URL").as_deref(), Some("https://api.hanzo.ai/v1"));
-        assert_eq!(env(&l, "GROK_API_KEY").as_deref(), Some("tok"));
+    fn goose_takes_the_toolset_as_an_extension_and_the_gateway_as_its_openai_provider() {
+        let l = of("goose").build(&spec(Mode::Headless, gateway())).unwrap();
+        assert_eq!(argv(&l), ["run", "--with-extension", "/opt/hanzo __mcp -- hanzo-mcp", "--provider", "openai", "--model", "enso", "-t", "fix the test"]);
+        assert_eq!(env(&l, "OPENAI_HOST").as_deref(), Some("https://api.hanzo.ai"));
+        assert_eq!(env(&l, "OPENAI_BASE_PATH").as_deref(), Some("v1/chat/completions"));
+        assert_eq!(env(&l, "GOOSE_MODE").as_deref(), Some("auto"));
+        // Interactive goose is `goose session`, which takes the same extension.
+        let l = of("goose").build(&spec(Mode::Interactive, Route::Inherit)).unwrap();
+        assert_eq!(argv(&l)[..2], ["session", "--with-extension"]);
+    }
+
+    #[test]
+    fn aider_takes_the_gateway_as_an_openai_base_and_an_openai_model() {
+        let l = of("aider").build(&spec(Mode::Headless, gateway())).unwrap();
+        assert_eq!(argv(&l), ["--model", "openai/enso", "--no-show-model-warnings", "--yes-always", "--message", "fix the test"]);
+        assert_eq!(env(&l, "OPENAI_API_BASE").as_deref(), Some("https://api.hanzo.ai/v1"));
+    }
+
+    #[test]
+    fn hermes_on_hanzo_reads_the_provider_and_the_toolset_from_a_home_of_hanzos_own() {
+        let l = of("hermes").build(&spec(Mode::Headless, gateway())).unwrap();
+        assert_eq!(argv(&l), ["--yolo", "-z", "fix the test"]);
+        let home = env(&l, "HERMES_HOME").unwrap();
+        let doc: Value = serde_json::from_str(&std::fs::read_to_string(std::path::Path::new(&home).join("config.yaml")).unwrap()).unwrap();
+        assert_eq!(doc["providers"]["hanzo"], json!({ "base_url": "https://api.hanzo.ai/v1", "key_env": "HANZO_API_KEY" }));
+        assert_eq!(doc["model"]["default"], "enso");
+        assert_eq!(doc["mcp_servers"]["hanzo"]["command"], "/opt/hanzo");
+        assert_eq!(env(&l, "HANZO_API_KEY").as_deref(), Some("tok"));
+        assert!(agents::find("hermes").unwrap().takes_mcp(true) && !agents::find("hermes").unwrap().takes_mcp(false));
+        // On its own account Hermes keeps its own home.
+        let own = of("hermes").build(&spec(Mode::Headless, Route::Inherit)).unwrap();
+        assert!(env(&own, "HERMES_HOME").is_none());
+    }
+
+    #[test]
+    fn kimi_acts_without_asking_on_its_screen_only() {
+        assert_eq!(argv(&of("kimi").build(&spec(Mode::Headless, Route::Inherit)).unwrap()), ["-p", "fix the test"]);
+        assert_eq!(argv(&of("kimi").build(&spec(Mode::Interactive, Route::Inherit)).unwrap()), ["--yolo"]);
+    }
+
+    #[test]
+    fn cline_takes_its_task_as_its_first_argument() {
+        let l = of("cline").build(&spec(Mode::Headless, Route::Inherit)).unwrap();
+        assert_eq!(argv(&l), ["--yolo", "fix the test"]);
+    }
+
+    #[test]
+    fn a_command_line_word_is_quoted_only_when_a_shell_would_split_it() {
+        assert_eq!(shell_word("/opt/hanzo"), "/opt/hanzo");
+        assert_eq!(shell_word("/my dir/x"), "'/my dir/x'");
+        assert_eq!(shell_word("it's"), "'it'\\''s'");
     }
 
     #[test]

@@ -540,7 +540,10 @@ pub async fn run(cfg: &mut Config, opts: Options) -> Result<()> {
         None
     };
     // What the summary says of the toolset: the ledger it reads, or why there is none.
-    let takes = !matches!(kind, BackendKind::Tool(a) if a.mcp == agents::Mcp::None);
+    let takes = match kind {
+        BackendKind::Tool(a) => a.takes_mcp(opts.cloud),
+        _ => true,
+    };
     let tools: std::result::Result<std::path::PathBuf, String> = match (&mcp, takes, ledger) {
         (_, false, _) => Err(format!("{} takes no MCP server for one run", kind.as_str())),
         (None, _, _) => Err("not attached (`--no-mcp`, or hanzo-mcp is not installed)".into()),

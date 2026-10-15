@@ -12,8 +12,11 @@
 pub enum Prompt {
     /// `<flag> TASK`, as in `-p TASK`.
     Flag(&'static str),
-    /// `<sub> TASK`, as in `run TASK`.
-    Sub(&'static str),
+    /// `<run> [<flag>] TASK` headless, as in `run TASK` or `run -t TASK`; `session`
+    /// names the subcommand an interactive run needs, when the bare program is not one.
+    Sub { run: &'static str, flag: Option<&'static str>, session: Option<&'static str> },
+    /// `TASK` as the program's first argument.
+    Positional,
 }
 
 /// How the Hanzo MCP server is handed to the agent for one run, leaving the
@@ -32,6 +35,8 @@ pub enum Mcp {
     Opencode(&'static str),
     /// crush's `crush.json`, in a data directory of Hanzo's own (`-D`).
     Crush,
+    /// The server's command line as one string after `flag`, as in goose's `--with-extension`.
+    Extension(&'static str),
 }
 
 /// How the agent's own model calls reach api.hanzo.ai under `--cloud`.
@@ -43,10 +48,15 @@ pub enum Gateway {
     Qwen,
     /// A `hanzo` provider in the [`Mcp::Opencode`] / [`Mcp::Crush`] document.
     Config,
-    /// `GROK_BASE_URL` and `GROK_API_KEY`, `-m MODEL`.
-    Grok,
     /// A `hanzo` provider in `models.json` under Hanzo's own `PI_CODING_AGENT_DIR`.
     Pi,
+    /// goose's `openai` provider: `OPENAI_HOST`, `OPENAI_BASE_PATH`, `OPENAI_API_KEY`, `--provider openai --model MODEL`.
+    Goose,
+    /// `OPENAI_API_BASE` and `OPENAI_API_KEY`, `--model openai/MODEL`, as aider reads them.
+    Aider,
+    /// A `config.yaml` under Hanzo's own `HERMES_HOME` naming a `hanzo` provider, and the
+    /// toolset beside it: Hermes reads servers only from its home.
+    Hermes,
 }
 
 /// One agent.
@@ -64,6 +74,10 @@ pub struct Agent {
     pub prompt: Prompt,
     /// Act without asking (`--force`, `--yolo`, …).
     pub auto: &'static [&'static str],
+    /// The same, for an agent that reads it from its environment.
+    pub auto_env: &'static [(&'static str, &'static str)],
+    /// Whether `auto` also applies to a headless run. crush and kimi refuse it beside a task.
+    pub auto_headless: bool,
     /// Structured events on stdout, for a run streamed to the cloud.
     pub stream: &'static [&'static str],
     pub mcp: Mcp,
@@ -78,10 +92,13 @@ pub const AGENTS: &[Agent] = &[
         name: "cursor",
         aliases: &["agent", "cursor-agent"],
         title: "Cursor",
-        programs: &["agent", "cursor-agent"],
+        // `cursor-agent` first: xAI's installer also puts an `agent` on PATH.
+        programs: &["cursor-agent", "agent"],
         package: None,
         prompt: Prompt::Flag("--print"),
         auto: &["--force"],
+        auto_env: &[],
+        auto_headless: true,
         stream: &["--output-format", "stream-json"],
         mcp: Mcp::None,
         gateway: Gateway::None,
@@ -95,6 +112,8 @@ pub const AGENTS: &[Agent] = &[
         package: None,
         prompt: Prompt::Flag("--print"),
         auto: &["--dangerously-skip-permissions"],
+        auto_env: &[],
+        auto_headless: true,
         stream: &["--output-format", "stream-json"],
         mcp: Mcp::None,
         gateway: Gateway::None,
@@ -108,6 +127,8 @@ pub const AGENTS: &[Agent] = &[
         package: Some("@google/gemini-cli"),
         prompt: Prompt::Flag("-p"),
         auto: &["--yolo"],
+        auto_env: &[],
+        auto_headless: true,
         stream: &["--output-format", "stream-json"],
         mcp: Mcp::Settings("GEMINI_CLI_SYSTEM_SETTINGS_PATH"),
         gateway: Gateway::None,
@@ -121,6 +142,8 @@ pub const AGENTS: &[Agent] = &[
         package: Some("@qwen-code/qwen-code"),
         prompt: Prompt::Flag("-p"),
         auto: &["--yolo"],
+        auto_env: &[],
+        auto_headless: true,
         stream: &["--output-format", "stream-json"],
         mcp: Mcp::File { flag: "--mcp-config", prefix: "" },
         gateway: Gateway::Qwen,
@@ -132,8 +155,10 @@ pub const AGENTS: &[Agent] = &[
         title: "OpenCode",
         programs: &["opencode"],
         package: Some("opencode-ai"),
-        prompt: Prompt::Sub("run"),
+        prompt: Prompt::Sub { run: "run", flag: None, session: None },
         auto: &["--auto"],
+        auto_env: &[],
+        auto_headless: true,
         stream: &["--format", "json"],
         mcp: Mcp::Opencode("OPENCODE_CONFIG_CONTENT"),
         gateway: Gateway::Config,
@@ -145,8 +170,10 @@ pub const AGENTS: &[Agent] = &[
         title: "Kilo Code",
         programs: &["kilo", "kilocode"],
         package: Some("@kilocode/cli"),
-        prompt: Prompt::Sub("run"),
+        prompt: Prompt::Sub { run: "run", flag: None, session: None },
         auto: &["--auto"],
+        auto_env: &[],
+        auto_headless: true,
         stream: &["--format", "json"],
         mcp: Mcp::Opencode("KILO_CONFIG_CONTENT"),
         gateway: Gateway::Config,
@@ -158,8 +185,10 @@ pub const AGENTS: &[Agent] = &[
         title: "Crush",
         programs: &["crush"],
         package: Some("@charmland/crush"),
-        prompt: Prompt::Sub("run"),
+        prompt: Prompt::Sub { run: "run", flag: None, session: None },
         auto: &["--yolo"],
+        auto_env: &[],
+        auto_headless: false,
         stream: &[],
         mcp: Mcp::Crush,
         gateway: Gateway::Config,
@@ -170,9 +199,11 @@ pub const AGENTS: &[Agent] = &[
         aliases: &["pi-coding-agent"],
         title: "Pi",
         programs: &["pi"],
-        package: Some("@mariozechner/pi-coding-agent"),
+        package: Some("@earendil-works/pi-coding-agent"),
         prompt: Prompt::Flag("-p"),
         auto: &[],
+        auto_env: &[],
+        auto_headless: true,
         stream: &["--mode", "json"],
         mcp: Mcp::None,
         gateway: Gateway::Pi,
@@ -186,6 +217,8 @@ pub const AGENTS: &[Agent] = &[
         package: Some("@github/copilot"),
         prompt: Prompt::Flag("-p"),
         auto: &["--allow-all-tools"],
+        auto_env: &[],
+        auto_headless: true,
         stream: &["--output-format", "json"],
         mcp: Mcp::File { flag: "--additional-mcp-config", prefix: "@" },
         gateway: Gateway::None,
@@ -199,6 +232,8 @@ pub const AGENTS: &[Agent] = &[
         package: Some("@sourcegraph/amp"),
         prompt: Prompt::Flag("-x"),
         auto: &["--dangerously-allow-all"],
+        auto_env: &[],
+        auto_headless: true,
         stream: &["--stream-json"],
         mcp: Mcp::Inline("--mcp-config"),
         gateway: Gateway::None,
@@ -206,18 +241,162 @@ pub const AGENTS: &[Agent] = &[
     },
     Agent {
         name: "grok",
-        aliases: &["grok-cli"],
-        title: "Grok CLI",
+        aliases: &["grok-build", "xai"],
+        title: "Grok Build",
         programs: &["grok"],
-        package: Some("@vibe-kit/grok-cli"),
+        package: None,
         prompt: Prompt::Flag("-p"),
-        auto: &[],
+        auto: &["--always-approve"],
+        auto_env: &[],
+        auto_headless: true,
         stream: &[],
         mcp: Mcp::None,
-        gateway: Gateway::Grok,
+        gateway: Gateway::None,
+        login: Some(&["login"]),
+    },
+    Agent {
+        name: "goose",
+        aliases: &[],
+        title: "Goose",
+        programs: &["goose"],
+        package: None,
+        prompt: Prompt::Sub { run: "run", flag: Some("-t"), session: Some("session") },
+        auto: &[],
+        auto_env: &[("GOOSE_MODE", "auto")],
+        auto_headless: true,
+        stream: &["--output-format", "json"],
+        mcp: Mcp::Extension("--with-extension"),
+        gateway: Gateway::Goose,
+        login: None,
+    },
+    Agent {
+        name: "aider",
+        aliases: &["aider-chat"],
+        title: "Aider",
+        programs: &["aider"],
+        package: None,
+        prompt: Prompt::Flag("--message"),
+        auto: &["--yes-always"],
+        auto_env: &[],
+        auto_headless: true,
+        stream: &[],
+        mcp: Mcp::None,
+        gateway: Gateway::Aider,
+        login: None,
+    },
+    Agent {
+        name: "hermes",
+        aliases: &["hermes-agent"],
+        title: "Hermes Agent",
+        programs: &["hermes"],
+        package: None,
+        prompt: Prompt::Flag("-z"),
+        auto: &["--yolo"],
+        auto_env: &[],
+        auto_headless: true,
+        stream: &[],
+        mcp: Mcp::None,
+        gateway: Gateway::Hermes,
+        login: None,
+    },
+    Agent {
+        name: "cline",
+        aliases: &[],
+        title: "Cline",
+        programs: &["cline"],
+        package: Some("cline"),
+        prompt: Prompt::Positional,
+        auto: &["--yolo"],
+        auto_env: &[],
+        auto_headless: true,
+        stream: &["--json"],
+        mcp: Mcp::None,
+        gateway: Gateway::None,
+        login: None,
+    },
+    Agent {
+        name: "continue",
+        aliases: &["cn"],
+        title: "Continue CLI",
+        programs: &["cn"],
+        package: Some("@continuedev/cli"),
+        prompt: Prompt::Flag("-p"),
+        auto: &[],
+        auto_env: &[],
+        auto_headless: true,
+        stream: &["--format", "json"],
+        mcp: Mcp::None,
+        gateway: Gateway::None,
+        login: Some(&["login"]),
+    },
+    Agent {
+        name: "kimi",
+        aliases: &["kimi-code"],
+        title: "Kimi Code",
+        programs: &["kimi"],
+        package: Some("@moonshot-ai/kimi-code"),
+        prompt: Prompt::Flag("-p"),
+        auto: &["--yolo"],
+        auto_env: &[],
+        auto_headless: false,
+        stream: &[],
+        mcp: Mcp::None,
+        gateway: Gateway::None,
+        login: Some(&["login"]),
+    },
+    Agent {
+        name: "omp",
+        aliases: &["oh-my-pi"],
+        title: "Oh My Pi",
+        programs: &["omp"],
+        package: Some("@oh-my-pi/pi-coding-agent"),
+        prompt: Prompt::Flag("-p"),
+        auto: &["--auto-approve"],
+        auto_env: &[],
+        auto_headless: true,
+        stream: &[],
+        mcp: Mcp::None,
+        gateway: Gateway::None,
+        login: None,
+    },
+    Agent {
+        name: "letta",
+        aliases: &["letta-code"],
+        title: "Letta Code",
+        programs: &["letta"],
+        package: Some("@letta-ai/letta-code"),
+        prompt: Prompt::Flag("-p"),
+        auto: &[],
+        auto_env: &[],
+        auto_headless: true,
+        stream: &["--output-format", "stream-json"],
+        mcp: Mcp::None,
+        gateway: Gateway::None,
+        login: None,
+    },
+    Agent {
+        name: "kode",
+        aliases: &[],
+        title: "Kode",
+        programs: &["kode"],
+        package: Some("@shareai-lab/kode"),
+        prompt: Prompt::Flag("-p"),
+        auto: &["--dangerously-skip-permissions"],
+        auto_env: &[],
+        auto_headless: true,
+        stream: &["--output-format", "stream-json"],
+        mcp: Mcp::File { flag: "--mcp-config", prefix: "" },
+        gateway: Gateway::None,
         login: None,
     },
 ];
+
+impl Agent {
+    /// Whether the Hanzo toolset reaches this agent on a run, `routed` or not.
+    pub fn takes_mcp(&self, routed: bool) -> bool {
+        self.mcp != Mcp::None || (routed && self.gateway == Gateway::Hermes)
+    }
+}
 
 /// The agent a spelling names: its name or one of its aliases, any case.
 pub fn find(name: &str) -> Option<&'static Agent> {
