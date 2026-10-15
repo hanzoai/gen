@@ -31,7 +31,6 @@ mod dev;
 // so anything that can hold a session — `hanzo link` as much as `hanzo dev` —
 // must be able to name the value it is setting.
 pub mod event;
-mod external;
 pub(crate) mod harness;
 mod home;
 mod kit;

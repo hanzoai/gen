@@ -1,0 +1,9 @@
+{"ts":"2026-10-15T05:34:39.790Z","type":"agent_event","event":{"type":"iteration_start","iteration":1}}
+{"ts":"2026-10-15T05:34:42.112Z","type":"agent_event","event":{"type":"content_start","contentType":"reasoning","reasoning":"We need to answer: \"What is 2+2? Answer in one word without using any tools.\" The answer is \"4\". One word. No tools. So we respond with \"4\".","redacted":false}}
+{"ts":"2026-10-15T05:34:42.112Z","type":"agent_event","event":{"type":"content_start","contentType":"text","text":"4","accumulated":"4"}}
+{"ts":"2026-10-15T05:34:42.115Z","type":"agent_event","event":{"type":"usage","inputTokens":6380,"outputTokens":4,"reasoningTokenCount":41,"totalInputTokens":6380,"totalOutputTokens":4,"totalCost":0}}
+{"ts":"2026-10-15T05:34:42.116Z","type":"agent_event","event":{"type":"content_end","contentType":"text","text":"4"}}
+{"ts":"2026-10-15T05:34:42.116Z","type":"agent_event","event":{"type":"content_end","contentType":"reasoning","reasoning":"We need to answer: \"What is 2+2? Answer in one word without using any tools.\" The answer is \"4\". One word. No tools. So we respond with \"4\"."}}
+{"ts":"2026-10-15T05:34:42.117Z","type":"agent_event","event":{"type":"iteration_end","iteration":1,"hadToolCalls":false,"toolCallCount":0}}
+{"ts":"2026-10-15T05:34:42.118Z","type":"agent_event","event":{"type":"done","reason":"completed","text":"4","iterations":1,"usage":{"inputTokens":6380,"outputTokens":4,"totalCost":0}}}
+{"ts":"2026-10-15T05:34:42.382Z","type":"run_result","finishReason":"completed","iterations":1,"usage":{"inputTokens":6380,"outputTokens":4,"cacheReadTokens":0,"cacheWriteTokens":0,"totalCost":0},"aggregateUsage":{"inputTokens":6380,"outputTokens":4,"cacheReadTokens":0,"cacheWriteTokens":0,"totalCost":0},"durationMs":2336,"text":"4","model":{"id":"enso","provider":"openai-compatible"}}

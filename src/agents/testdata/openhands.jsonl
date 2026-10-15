@@ -1,0 +1,22 @@
+OpenHands CLI terminal UI may not work correctly in this environment: Rich detected a non-interactive or unsupported terminal; interactive UI may not render correctly
+To override Rich's detection, you can set TTY_INTERACTIVE=1 (and optionally TTY_COMPATIBLE=1).
+[37mInitializing agent[0m[33m...[0m
+[32m✓ Agent initialized with model: openai/enso[0m
+{"id":"cfce3c4c-afee-4faf-8e01-326d50b650c7","timestamp":"2026-10-14T22:15:16.817891","source":"user","llm_message":{"role":"user","content":[{"cache_prompt":false,"type":"text","text":"Run the shell command 'ls' once, then reply with the single word mango."}],"tool_calls":null,"tool_call_id":null,"name":null,"reasoning_content":null,"thinking_blocks":[],"responses_reasoning_item":null},"llm_response_id":null,"activated_skills":[],"extended_content":[],"sender":null,"critic_result":null,"kind":"MessageEvent"}
+Agent is working
+{"id":"675a0fba-6711-4ce0-8c38-a724f05c5248","timestamp":"2026-10-14T22:16:04.901319","source":"agent","thought":[],"reasoning_content":"We are to run the shell command 'ls' once and then reply with the single word \"mango\".\n Let's break it down:\n 1. Run the command 'ls' in the terminal.\n 2. After that, we must output only the word \"mango\".\n\n However, note that the terminal t","thinking_blocks":[],"responses_reasoning_item":null,"action":{"command":"ls","is_input":false,"timeout":null,"reset":false,"kind":"TerminalAction"},"tool_name":"terminal","tool_call_id":"call-f5114d43-3f24-4db0-aa3d-59e9213bdb94","tool_call":{"id":"call-f5114d43-3f24-4db0-aa3d-59e9213bdb94","responses_item_id":null,"name":"terminal","arguments":"{\"command\": \"ls\", \"security_risk\": \"LOW\", \"summary\": \"List directory contents\"}","origin":"completion"},"llm_response_id":"chatcmpl-448b6dcd-c0c6-4c4f-802f-5fee703dca5e","security_risk":"LOW","critic_result":null,"summary":"List directory contents","kind":"ActionEvent"}
+{"id":"0a1d35df-0bf3-48de-917f-3a4e880814d7","timestamp":"2026-10-14T22:16:09.485757","source":"environment","tool_name":"terminal","tool_call_id":"call-f5114d43-3f24-4db0-aa3d-59e9213bdb94","observation":{"content":[{"cache_prompt":false,"type":"text","text":"clear\n\n\nls\ncalc.py"}],"is_error":false,"command":"ls","exit_code":0,"timeout":false,"metadata":{"exit_code":0,"pid":-1,"username":"z","hostname":"dgx","working_dir":"/work/project","py_interpreter_path":"/home/user/.cache/uv/archive-v0/0iYfxYhDmb69ZidK/bin/python","prefix":"","suffix":"\n[The command completed with exit code 0.]"},"full_output_save_dir":"/home/user/.openhands/conversations/2b4e00365a45477e8dd43c492238464b/observations","kind":"TerminalObservation"},"action_id":"675a0fba-6711-4ce0-8c38-a724f05c5248","kind":"ObservationEvent"}
+{"id":"de3a254a-64e8-4966-ba84-f7a9bc996871","timestamp":"2026-10-14T22:16:12.278404","source":"agent","llm_message":{"role":"assistant","content":[{"cache_prompt":false,"type":"text","text":"mango"}],"tool_calls":null,"tool_call_id":null,"name":null,"reasoning_content":"We need to reply with the single word \"mango\". The instruction: \"Run the shell command 'ls' once, then reply with the single word mango.\" We have run ls. Now we reply with \"mango\". We should not add anything else. So output: mango. We'll ju","thinking_blocks":[],"responses_reasoning_item":null},"llm_response_id":"chatcmpl-fc00e243-4adc-4dd4-8d55-157841cec418","activated_skills":[],"extended_content":[],"sender":null,"critic_result":null,"kind":"MessageEvent"}
+Agent finished
+
+[92m───────────────────────────── [0mCONVERSATION SUMMARY[92m ─────────────────────────────[0m
+[1mNumber of agent messages:[0m [1;36m3[0m
+[1mLast message sent by the agent:[0m
+[36m╭─[0m[36m Agent [0m[36m─╮[0m
+[36m│[0m mango   [36m│[0m
+[36m╰─────────╯[0m
+[92m────────────────────────────────────────────────────────────────────────────────[0m
+Goodbye! 👋
+Conversation ID: 2b4e00365a45477e8dd43c492238464b
+Hint: run openhands --resume 2b4e0036-5a45-477e-8dd4-3c492238464b to resume this
+conversation.

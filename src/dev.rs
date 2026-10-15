@@ -47,6 +47,8 @@ impl Agent {
     /// `codex`, driven as its own backend. NOT an alias of `dev`: a user who
     /// names it gets that program, or a clear failure if it is not installed.
     pub const CODEX: Agent = Agent { program: "codex" };
+    /// Open Interpreter, a Codex fork that kept its `exec`, `-c` and JSONL grammar.
+    pub const INTERPRETER: Agent = Agent { program: "interpreter" };
 }
 
 /// The gateway origin the native `hanzo` provider already targets; when the
@@ -147,7 +149,9 @@ impl Backend for Agent {
                     args.push(cfg_string("model_catalog_json", &path.to_string_lossy()));
                     cleanup.push(path);
                 }
-                if api.trim_end_matches('/') != NATIVE_API {
+                // Only `dev` ships a native `hanzo` provider. codex and Open Interpreter
+                // are told about the gateway on every run, or they call api.openai.com.
+                if api.trim_end_matches('/') != NATIVE_API || self.program != Agent::DEV.program {
                     let base = format!("{}/v1", api.trim_end_matches('/'));
                     args.push("-c".into());
                     args.push(cfg_string("model_providers.hanzocode.name", "Hanzo Code"));
@@ -399,11 +403,13 @@ fn auto_overrides(user: Option<&toml::Table>) -> Vec<String> {
 }
 
 /// The agent's own `config.toml`, read from the home it reads: `DEV_HOME` (else
-/// `~/.hanzo/dev`) for `dev`, `CODEX_HOME` (else `~/.codex`) for `codex`.
+/// `~/.hanzo/dev`) for `dev`, `CODEX_HOME` (else `~/.codex`) for `codex`, and
+/// `CODEX_HOME` (else `~/.openinterpreter`) for Open Interpreter.
 #[cfg(not(test))]
 fn user_config(program: &str) -> Option<toml::Table> {
     let (var, default) = match program {
         "dev" => ("DEV_HOME", ".hanzo/dev"),
+        "interpreter" => ("CODEX_HOME", ".openinterpreter"),
         _ => ("CODEX_HOME", ".codex"),
     };
     let home = std::env::var_os(var)
@@ -468,6 +474,19 @@ mod tests {
             .get_envs()
             .filter_map(|(k, v)| Some((k.to_string_lossy().to_string(), v?.to_string_lossy().to_string())))
             .collect()
+    }
+
+    #[test]
+    fn codex_and_open_interpreter_are_given_the_gateway_provider_even_at_the_native_api() {
+        for agent in [Agent::CODEX, Agent::INTERPRETER] {
+            let l = agent.build(&spec(Mode::Headless, "https://api.hanzo.ai")).unwrap();
+            let args: Vec<String> = l.command.as_std().get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+            assert!(args.iter().any(|a| a == "model_provider=\"hanzocode\""), "{}: {args:?}", agent.program);
+            assert!(args.iter().any(|a| a.starts_with("model_providers.hanzocode.base_url=") && a.contains("https://api.hanzo.ai/v1")), "{args:?}");
+        }
+        // dev carries the provider natively.
+        let l = Agent::DEV.build(&spec(Mode::Headless, "https://api.hanzo.ai")).unwrap();
+        assert!(!l.command.as_std().get_args().any(|a| a.to_string_lossy().contains("hanzocode")));
     }
 
     #[test]

@@ -1,7 +1,8 @@
 //! The coding-backend seam: ONE trait every backend satisfies, so the
 //! orchestrator (register → spawn → stream → finalize) is identical for all of
-//! them. Five backends today — our own `dev` (the default), `claude`, `codex`,
-//! Antigravity (`agy`) and Cursor (`agent`) — and they are distinct products, never aliases of one another.
+//! them: our own `dev` (the default), `claude`, `codex` and `interpreter`, and
+//! every agent in [`super::agents`], one file each. They are distinct products,
+//! never aliases of one another.
 //!
 //! Each backend owns only what genuinely differs: how it is invoked (argv +
 //! env), how its native MCP + model-routing are wired, and how one line of its
@@ -14,7 +15,7 @@ use std::path::{Path, PathBuf};
 use super::claude::Claude;
 use super::dev::Agent;
 use super::event::Mapped;
-use super::external::External;
+use super::agents::Session;
 
 /// Which coding agent to wrap. Distinct products — never aliases of each
 /// other: a user who names one gets THAT agent, or a clear failure.
@@ -24,6 +25,8 @@ pub enum BackendKind {
     Dev,
     Claude,
     Codex,
+    /// Open Interpreter, a Codex fork that kept its grammar.
+    Interpreter,
     /// Any agent in [`super::agents::AGENTS`]: Cursor, Antigravity, Gemini, Qwen, …
     Tool(&'static super::agents::Agent),
 }
@@ -36,6 +39,7 @@ impl BackendKind {
             "dev" => Ok(BackendKind::Dev),
             "claude" | "claude-code" | "cc" => Ok(BackendKind::Claude),
             "codex" => Ok(BackendKind::Codex),
+            "interpreter" | "open-interpreter" | "oi" => Ok(BackendKind::Interpreter),
             other => super::agents::find(other)
                 .map(BackendKind::Tool)
                 .ok_or_else(|| anyhow::anyhow!("unknown backend '{other}' (expected: {})", expected())),
@@ -49,6 +53,7 @@ impl BackendKind {
             BackendKind::Dev => "dev",
             BackendKind::Claude => "claude",
             BackendKind::Codex => "codex",
+            BackendKind::Interpreter => "interpreter",
             BackendKind::Tool(a) => a.name,
         }
     }
@@ -61,12 +66,12 @@ impl BackendKind {
 
     /// Every backend's canonical name, ours first.
     pub fn all() -> impl Iterator<Item = &'static str> {
-        ["dev", "claude", "codex"].into_iter().chain(super::agents::AGENTS.iter().map(|a| a.name))
+        ["dev", "claude", "codex", "interpreter"].into_iter().chain(super::agents::AGENTS.iter().map(|a| a.name))
     }
 
     /// Whether the agent keeps its own login and never takes the Hanzo route.
     pub fn own_account_only(self) -> bool {
-        matches!(self, BackendKind::Tool(a) if a.gateway == super::agents::Gateway::None)
+        matches!(self, BackendKind::Tool(a) if !a.routable)
     }
 }
 
@@ -407,7 +412,8 @@ pub fn resolve(kind: BackendKind) -> Box<dyn Backend> {
         BackendKind::Dev => Box::new(Agent::DEV),
         BackendKind::Claude => Box::new(Claude),
         BackendKind::Codex => Box::new(Agent::CODEX),
-        BackendKind::Tool(agent) => Box::new(External { agent }),
+        BackendKind::Interpreter => Box::new(Agent::INTERPRETER),
+        BackendKind::Tool(agent) => Box::new(Session::new(agent)),
     }
 }
 

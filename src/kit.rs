@@ -198,7 +198,7 @@ pub fn root(kind: BackendKind, route: &Route) -> Option<PathBuf> {
     match kind {
         BackendKind::Dev | BackendKind::Codex => Some(dirs::home_dir()?.join(".agents").join("skills")),
         BackendKind::Claude => Some(home::of(route)?.join("skills")),
-        BackendKind::Tool(_) => None,
+        BackendKind::Interpreter | BackendKind::Tool(_) => None,
     }
 }
 
