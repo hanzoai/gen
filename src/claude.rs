@@ -521,7 +521,7 @@ mod tests {
         s.routing = Route::Via(Routing::Gateway {
             api: "https://api.hanzo.ai".into(),
             token: "JWT".into(),
-            model: "enso-ultra".into(),
+            model: "enso-auto".into(),
             small_fast_model: "enso-flash".into(),
             context_window: 1_000_000,
         });
@@ -532,7 +532,7 @@ mod tests {
             .get_envs()
             .filter_map(|(k, v)| Some((k.to_string_lossy().to_string(), v?.to_string_lossy().to_string())))
             .collect();
-        assert_eq!(env.get("ANTHROPIC_MODEL").map(String::as_str), Some("enso-ultra[1m]"));
+        assert_eq!(env.get("ANTHROPIC_MODEL").map(String::as_str), Some("enso-auto[1m]"));
     }
 
     /// The `[1m]` extended-context suffix rides ONLY a large-context model at a
@@ -563,10 +563,10 @@ mod tests {
         // Large model + 1M window -> suffix. An UNTIERED id keeps this bare-id
         // behavior; a tiered one rides its carrier instead (see the tier tests).
         assert_eq!(model_of("enso", 1_000_000), "enso[1m]");
-        assert_eq!(model_of("enso-pro", 1_000_000), "enso-pro[1m]");
+        assert_eq!(model_of("enso-auto", 1_000_000), "enso-auto[1m]");
         // Short-context variants never get it, even at a 1M window.
         assert_eq!(model_of("enso-flash", 1_000_000), "enso-flash");
-        assert_eq!(model_of("zen5-mini", 1_000_000), "zen5-mini");
+        assert_eq!(model_of("zen6-flash", 1_000_000), "zen6-flash");
         // Opting the window back to standard drops it.
         assert_eq!(model_of("enso", 200_000), "enso");
     }
@@ -951,22 +951,22 @@ mod tests {
         Claude.build(&s).unwrap()
     }
 
-    /// A zen tier rides its CARRIER — a model id Claude Code recognizes — so the
+    /// A tier rides its CARRIER — a model id Claude Code recognizes — so the
     /// client grants the real 1M context budget instead of clamping a custom id to
     /// 128K/200K. `modelOverrides` in the seeded settings maps the carrier back to
-    /// the zen id before the request leaves the client, so the gateway still serves
-    /// `zen5-pro`.
+    /// the served id before the request leaves the client, so the gateway still
+    /// serves `enso-ultra`.
     #[test]
-    fn a_zen_tier_rides_its_recognized_carrier() {
-        let env = env_of(&launch_with("zen5-pro", "zen5-flash", 1_000_000));
+    fn a_tier_rides_its_recognized_carrier() {
+        let env = env_of(&launch_with("enso-ultra", "enso-flash", 1_000_000));
         assert_eq!(env.get("ANTHROPIC_MODEL").map(String::as_str), Some("claude-opus-4-8[1m]"));
-        let env = env_of(&launch_with("zen5", "zen5-flash", 1_000_000));
+        let env = env_of(&launch_with("enso-pro", "enso-flash", 1_000_000));
         assert_eq!(env.get("ANTHROPIC_MODEL").map(String::as_str), Some("claude-sonnet-4-6[1m]"));
-        let env = env_of(&launch_with("zen5-coder", "zen5-flash", 1_000_000));
-        assert_eq!(env.get("ANTHROPIC_MODEL").map(String::as_str), Some("claude-sonnet-5"));
-        // A tier with no carrier (the short-context flash tier) is pinned directly.
-        let env = env_of(&launch_with("zen5-flash", "zen5-flash", 1_000_000));
-        assert_eq!(env.get("ANTHROPIC_MODEL").map(String::as_str), Some("zen5-flash"));
+        let env = env_of(&launch_with("zen6", "enso-flash", 1_000_000));
+        assert_eq!(env.get("ANTHROPIC_MODEL").map(String::as_str), Some("claude-sonnet-5[1m]"));
+        // A tier with no carrier (the flash tier) is pinned directly.
+        let env = env_of(&launch_with("enso-flash", "enso-flash", 1_000_000));
+        assert_eq!(env.get("ANTHROPIC_MODEL").map(String::as_str), Some("enso-flash"));
     }
 
     /// Claude's own tiering (subagents, `/compact`, the background model) resolves
@@ -975,13 +975,14 @@ mod tests {
     /// gateway route fills every slot, with the picker's branding.
     #[test]
     fn every_tiering_slot_is_named_and_branded() {
-        let env = env_of(&launch_with("zen5", "zen5-flash", 1_000_000));
+        let env = env_of(&launch_with("enso", "enso-flash", 1_000_000));
         assert_eq!(env.get("ANTHROPIC_DEFAULT_SONNET_MODEL").map(String::as_str), Some("claude-sonnet-4-6[1m]"));
         assert_eq!(env.get("ANTHROPIC_DEFAULT_OPUS_MODEL").map(String::as_str), Some("claude-opus-4-8[1m]"));
         assert_eq!(env.get("ANTHROPIC_DEFAULT_FABLE_MODEL").map(String::as_str), Some("claude-fable-5[1m]"));
-        assert_eq!(env.get("ANTHROPIC_DEFAULT_HAIKU_MODEL").map(String::as_str), Some("zen5-flash"));
-        assert_eq!(env.get("ANTHROPIC_DEFAULT_SONNET_MODEL_NAME").map(String::as_str), Some("Zen5"));
-        assert_eq!(env.get("ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME").map(String::as_str), Some("Zen5 Flash"));
+        assert_eq!(env.get("ANTHROPIC_DEFAULT_HAIKU_MODEL").map(String::as_str), Some("enso-flash"));
+        assert_eq!(env.get("ANTHROPIC_DEFAULT_SONNET_MODEL_NAME").map(String::as_str), Some("Enso Pro"));
+        assert_eq!(env.get("ANTHROPIC_DEFAULT_OPUS_MODEL_NAME").map(String::as_str), Some("Enso Ultra"));
+        assert_eq!(env.get("ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME").map(String::as_str), Some("Enso Flash"));
         assert!(env.contains_key("ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION"));
     }
 
@@ -989,8 +990,8 @@ mod tests {
     /// no label — the picker must never name a model the slot does not hold.
     #[test]
     fn an_untiered_small_fast_model_fills_its_slot_unlabelled() {
-        let env = env_of(&launch_with("enso", "enso-flash", 1_000_000));
-        assert_eq!(env.get("ANTHROPIC_DEFAULT_HAIKU_MODEL").map(String::as_str), Some("enso-flash"));
+        let env = env_of(&launch_with("enso", "zen6-flash", 1_000_000));
+        assert_eq!(env.get("ANTHROPIC_DEFAULT_HAIKU_MODEL").map(String::as_str), Some("zen6-flash"));
         assert!(!env.contains_key("ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME"), "an untiered id must not borrow a tier's label");
         // An untiered main model keeps the bare-id + `[1m]` behavior.
         assert_eq!(env.get("ANTHROPIC_MODEL").map(String::as_str), Some("enso[1m]"));
@@ -1000,7 +1001,7 @@ mod tests {
     /// the carrier too — the setting governs every model, tiered or not.
     #[test]
     fn standard_window_drops_the_suffix_from_a_carrier() {
-        let env = env_of(&launch_with("zen5-pro", "zen5-flash", 200_000));
+        let env = env_of(&launch_with("enso-ultra", "enso-flash", 200_000));
         assert_eq!(env.get("ANTHROPIC_MODEL").map(String::as_str), Some("claude-opus-4-8"));
     }
 
@@ -1009,7 +1010,7 @@ mod tests {
     /// as this session's identity and Hanzo's injected tiers never leak back out.
     #[test]
     fn a_routed_session_runs_in_hanzos_own_claude_config_home() {
-        let env = env_of(&launch_with("zen5", "zen5-flash", 1_000_000));
+        let env = env_of(&launch_with("enso", "enso-flash", 1_000_000));
         let dir = env.get("CLAUDE_CONFIG_DIR").expect("CLAUDE_CONFIG_DIR must relocate the config home");
         assert!(dir.ends_with("/.hanzo/claude"), "got {dir}");
         assert!(!dir.ends_with("/.claude"), "must never be the user's own Claude home");
@@ -1049,8 +1050,8 @@ mod tests {
         let routed = at(&Route::Via(Routing::Gateway {
             api: "https://api.hanzo.ai".into(),
             token: "JWT".into(),
-            model: "zen5".into(),
-            small_fast_model: "zen5-flash".into(),
+            model: "enso".into(),
+            small_fast_model: "enso-flash".into(),
             context_window: 1_000_000,
         }));
         assert!(routed.ends_with("/.hanzo/claude/projects/-home-z-proj/sid-1.jsonl"), "got {routed}");
@@ -1058,17 +1059,17 @@ mod tests {
         assert!(inherited.ends_with("/.claude/projects/-home-z-proj/sid-1.jsonl"), "got {inherited}");
     }
 
-    /// A zen tier rides a `claude-*` CARRIER, so Claude Code's base prompt would
+    /// A tier rides a `claude-*` CARRIER, so Claude Code's base prompt would
     /// have the model introduce itself as that carrier. The gateway route appends
     /// (never replaces) an identity line naming the real tier — the harness keeps
     /// its own tool-use/safety prompt. An id with no carrier claims nothing.
     #[test]
     fn a_carried_model_is_told_which_model_it_actually_is() {
-        let args = argv(&launch_with("zen5-pro", "zen5-flash", 1_000_000));
+        let args = argv(&launch_with("enso-ultra", "enso-flash", 1_000_000));
         let i = args.iter().position(|a| a == "--append-system-prompt").expect("carried model must correct its identity");
         let line = &args[i + 1];
-        assert!(line.contains("Zen5 Pro"), "must name the tier it really is: {line}");
-        assert!(line.contains("zen5-pro"), "must name the served id: {line}");
+        assert!(line.contains("Enso Ultra"), "must name the tier it really is: {line}");
+        assert!(line.contains("enso-ultra"), "must name the served id: {line}");
         assert!(!line.contains("claude-opus"), "must not repeat the carrier back to the model: {line}");
         // An untiered id rides no carrier, so nothing is claimed on its behalf.
         let plain = argv(&launch_with("enso", "enso-flash", 1_000_000));

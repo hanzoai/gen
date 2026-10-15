@@ -134,8 +134,8 @@ mod tests {
         Route::Via(Routing::Gateway {
             api: "https://api.hanzo.ai".into(),
             token: "T".into(),
-            model: "zen5".into(),
-            small_fast_model: "zen5-flash".into(),
+            model: "enso".into(),
+            small_fast_model: "enso-flash".into(),
             context_window: 1_000_000,
         })
     }
