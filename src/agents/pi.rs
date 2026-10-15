@@ -6,14 +6,14 @@
 use anyhow::Result;
 use serde_json::json;
 
-use super::{wire, Agent, Run, Toolset, KEY};
+use super::{wire, Agent, Run, Toolset, Upgrade, KEY};
 
 pub const AGENT: Agent = Agent {
     name: "pi",
     aliases: &["pi-coding-agent"],
     title: "Pi",
     programs: &["pi"],
-    package: Some("@earendil-works/pi-coding-agent"),
+    upgrade: Upgrade::Npm("@earendil-works/pi-coding-agent"),
     routable: true,
     toolset: Toolset::Never,
     build,

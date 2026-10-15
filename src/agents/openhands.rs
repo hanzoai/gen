@@ -5,7 +5,7 @@
 use anyhow::Result;
 use serde_json::Value;
 
-use super::{Agent, Reader, Run, Toolset};
+use super::{Agent, Reader, Run, Toolset, Upgrade};
 use crate::commands::code::event::Mapped;
 
 pub const AGENT: Agent = Agent {
@@ -13,7 +13,7 @@ pub const AGENT: Agent = Agent {
     aliases: &["openhands-cli"],
     title: "OpenHands",
     programs: &["openhands"],
-    package: None,
+    upgrade: Upgrade::Uv("openhands"),
     routable: true,
     toolset: Toolset::Never,
     build,

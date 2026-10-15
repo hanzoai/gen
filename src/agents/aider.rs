@@ -4,14 +4,14 @@
 
 use anyhow::Result;
 
-use super::{wire, Agent, Run, Toolset};
+use super::{wire, Agent, Run, Toolset, Upgrade};
 
 pub const AGENT: Agent = Agent {
     name: "aider",
     aliases: &["aider-chat"],
     title: "Aider",
     programs: &["aider"],
-    package: None,
+    upgrade: Upgrade::Uv("aider-chat"),
     routable: true,
     toolset: Toolset::Never,
     build,

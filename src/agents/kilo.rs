@@ -5,14 +5,14 @@
 use anyhow::Result;
 use serde_json::json;
 
-use super::{wire, Agent, Run, Toolset, KEY};
+use super::{wire, Agent, Run, Toolset, Upgrade, KEY};
 
 pub const AGENT: Agent = Agent {
     name: "kilo",
     aliases: &["kilocode", "kilo-code"],
     title: "Kilo Code",
     programs: &["kilo", "kilocode"],
-    package: Some("@kilocode/cli"),
+    upgrade: Upgrade::Npm("@kilocode/cli"),
     routable: true,
     toolset: Toolset::Always,
     build,

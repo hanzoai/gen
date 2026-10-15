@@ -5,14 +5,14 @@
 use anyhow::Result;
 use serde_json::json;
 
-use super::{wire, Agent, Run, Toolset};
+use super::{wire, Agent, Run, Toolset, Upgrade};
 
 pub const AGENT: Agent = Agent {
     name: "qwen",
     aliases: &["qwen-code"],
     title: "Qwen Code",
     programs: &["qwen"],
-    package: Some("@qwen-code/qwen-code"),
+    upgrade: Upgrade::Npm("@qwen-code/qwen-code"),
     routable: true,
     toolset: Toolset::Always,
     build,

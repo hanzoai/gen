@@ -6,14 +6,14 @@
 use anyhow::Result;
 use serde_json::json;
 
-use super::{wire, Agent, Run, Toolset, KEY};
+use super::{wire, Agent, Run, Toolset, Upgrade, KEY};
 
 pub const AGENT: Agent = Agent {
     name: "crush",
     aliases: &[],
     title: "Crush",
     programs: &["crush"],
-    package: Some("@charmland/crush"),
+    upgrade: Upgrade::Npm("@charmland/crush"),
     routable: true,
     toolset: Toolset::Always,
     build,

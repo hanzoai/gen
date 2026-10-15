@@ -4,14 +4,14 @@
 
 use anyhow::Result;
 
-use super::{wire, Agent, Run, Toolset};
+use super::{wire, Agent, Run, Toolset, Upgrade};
 
 pub const AGENT: Agent = Agent {
     name: "continue",
     aliases: &["cn"],
     title: "Continue CLI",
     programs: &["cn"],
-    package: Some("@continuedev/cli"),
+    upgrade: Upgrade::Npm("@continuedev/cli"),
     routable: false,
     toolset: Toolset::Never,
     build,

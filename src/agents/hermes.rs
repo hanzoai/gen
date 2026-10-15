@@ -7,14 +7,14 @@
 use anyhow::Result;
 use serde_json::json;
 
-use super::{wire, Agent, Run, Toolset, KEY};
+use super::{wire, Agent, Run, Toolset, Upgrade, KEY};
 
 pub const AGENT: Agent = Agent {
     name: "hermes",
     aliases: &["hermes-agent"],
     title: "Hermes Agent",
     programs: &["hermes"],
-    package: None,
+    upgrade: Upgrade::Own(&["update"]),
     routable: true,
     toolset: Toolset::Routed,
     build,

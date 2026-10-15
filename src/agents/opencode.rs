@@ -5,14 +5,14 @@
 use anyhow::Result;
 use serde_json::json;
 
-use super::{wire, Agent, Run, Toolset, KEY};
+use super::{wire, Agent, Run, Toolset, Upgrade, KEY};
 
 pub const AGENT: Agent = Agent {
     name: "opencode",
     aliases: &[],
     title: "OpenCode",
     programs: &["opencode"],
-    package: Some("opencode-ai"),
+    upgrade: Upgrade::Npm("opencode-ai"),
     routable: true,
     toolset: Toolset::Always,
     build,

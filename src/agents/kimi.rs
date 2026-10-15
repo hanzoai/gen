@@ -4,14 +4,14 @@
 
 use anyhow::Result;
 
-use super::{wire, Agent, Run, Toolset};
+use super::{wire, Agent, Run, Toolset, Upgrade};
 
 pub const AGENT: Agent = Agent {
     name: "kimi",
     aliases: &["kimi-code"],
     title: "Kimi Code",
     programs: &["kimi"],
-    package: Some("@moonshot-ai/kimi-code"),
+    upgrade: Upgrade::Npm("@moonshot-ai/kimi-code"),
     routable: false,
     toolset: Toolset::Never,
     build,

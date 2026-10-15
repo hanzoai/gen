@@ -5,14 +5,14 @@
 use anyhow::Result;
 use serde_json::json;
 
-use super::{wire, Agent, Run, Toolset};
+use super::{wire, Agent, Run, Toolset, Upgrade};
 
 pub const AGENT: Agent = Agent {
     name: "kode",
     aliases: &[],
     title: "Kode",
     programs: &["kode"],
-    package: Some("@shareai-lab/kode"),
+    upgrade: Upgrade::Npm("@shareai-lab/kode"),
     routable: false,
     toolset: Toolset::Always,
     build,

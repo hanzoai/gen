@@ -5,7 +5,7 @@
 use anyhow::Result;
 use serde_json::{json, Value};
 
-use super::{Agent, Reader, Run, Toolset};
+use super::{Agent, Reader, Run, Toolset, Upgrade};
 use crate::commands::code::event::{Mapped, Usage};
 
 pub const AGENT: Agent = Agent {
@@ -13,7 +13,7 @@ pub const AGENT: Agent = Agent {
     aliases: &["gemini-cli"],
     title: "Gemini CLI",
     programs: &["gemini"],
-    package: Some("@google/gemini-cli"),
+    upgrade: Upgrade::Npm("@google/gemini-cli"),
     routable: false,
     toolset: Toolset::Always,
     build,

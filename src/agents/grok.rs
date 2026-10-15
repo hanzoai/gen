@@ -3,14 +3,14 @@
 
 use anyhow::Result;
 
-use super::{wire, Agent, Run, Toolset};
+use super::{wire, Agent, Run, Toolset, Upgrade};
 
 pub const AGENT: Agent = Agent {
     name: "grok",
     aliases: &["grok-build", "xai"],
     title: "Grok Build",
     programs: &["grok"],
-    package: None,
+    upgrade: Upgrade::Own(&["update"]),
     routable: false,
     toolset: Toolset::Never,
     build,

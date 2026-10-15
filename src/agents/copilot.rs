@@ -4,7 +4,7 @@
 use anyhow::Result;
 use serde_json::{json, Value};
 
-use super::{Agent, Reader, Run, Toolset};
+use super::{Agent, Reader, Run, Toolset, Upgrade};
 use crate::commands::code::event::{Mapped, Usage};
 
 pub const AGENT: Agent = Agent {
@@ -12,7 +12,7 @@ pub const AGENT: Agent = Agent {
     aliases: &["github-copilot"],
     title: "GitHub Copilot CLI",
     programs: &["copilot"],
-    package: Some("@github/copilot"),
+    upgrade: Upgrade::Npm("@github/copilot"),
     routable: false,
     toolset: Toolset::Always,
     build,

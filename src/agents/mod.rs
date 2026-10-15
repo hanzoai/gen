@@ -78,6 +78,17 @@ pub enum Toolset {
     Routed,
 }
 
+/// How `hanzo upgrade` brings an agent to its current release.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Upgrade {
+    /// `npm install` of this package under `~/.hanzo`, its binary in `~/.hanzo/bin`.
+    Npm(&'static str),
+    /// Its own updater, these arguments to its binary, as in `goose update`.
+    Own(&'static [&'static str]),
+    /// `uv tool upgrade` of this package, for an agent installed with `uv tool install`.
+    Uv(&'static str),
+}
+
 /// One agent.
 #[derive(Clone, Copy)]
 pub struct Agent {
@@ -88,8 +99,8 @@ pub struct Agent {
     pub title: &'static str,
     /// Binaries to try, in order.
     pub programs: &'static [&'static str],
-    /// The npm package `hanzo upgrade <name>` installs, when it ships there.
-    pub package: Option<&'static str>,
+    /// How `hanzo upgrade <name>` brings it to its current release.
+    pub upgrade: Upgrade,
     /// Whether its own model calls can go through api.hanzo.ai under `--cloud`.
     pub routable: bool,
     pub toolset: Toolset,
@@ -136,12 +147,18 @@ pub fn prefix() -> Option<PathBuf> {
     Some(dirs::home_dir()?.join(".hanzo"))
 }
 
-/// The binary that runs `a`: the first of its programs on PATH, else in `~/.hanzo/bin`.
+/// The binary that runs one of `programs`: the copy `hanzo upgrade` keeps in
+/// `~/.hanzo/bin` first, so upgrading it changes what runs, else the first on PATH.
+pub fn find_program(programs: &[&str]) -> Option<PathBuf> {
+    let managed = prefix().map(|p| p.join("bin"));
+    managed
+        .and_then(|bin| programs.iter().map(|p| bin.join(p)).find(|p| p.is_file()))
+        .or_else(|| programs.iter().find_map(|p| which::which(p).ok()))
+}
+
+/// The binary that runs `a`.
 pub fn program(a: &Agent) -> Option<PathBuf> {
-    a.programs.iter().find_map(|p| which::which(p).ok()).or_else(|| {
-        let bin = prefix()?.join("bin");
-        a.programs.iter().map(|p| bin.join(p)).find(|p| p.is_file())
-    })
+    find_program(a.programs)
 }
 
 /// The variable a routed agent's configuration names for the bearer, so the key is never written down.

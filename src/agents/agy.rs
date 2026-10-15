@@ -4,7 +4,7 @@
 use anyhow::Result;
 use serde_json::Value;
 
-use super::{inside, Agent, Reader, Run, Toolset};
+use super::{inside, Agent, Reader, Run, Toolset, Upgrade};
 use crate::commands::code::event::{Mapped, Usage};
 
 pub const AGENT: Agent = Agent {
@@ -12,7 +12,7 @@ pub const AGENT: Agent = Agent {
     aliases: &["antigravity"],
     title: "Antigravity",
     programs: &["agy"],
-    package: None,
+    upgrade: Upgrade::Own(&["update"]),
     routable: false,
     toolset: Toolset::Never,
     build,

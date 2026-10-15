@@ -5,7 +5,7 @@
 use anyhow::Result;
 use serde_json::Value;
 
-use super::{Agent, Reader, Run, Toolset};
+use super::{Agent, Reader, Run, Toolset, Upgrade};
 use crate::commands::code::event::{Mapped, Usage};
 
 pub const AGENT: Agent = Agent {
@@ -13,7 +13,7 @@ pub const AGENT: Agent = Agent {
     aliases: &["letta-code"],
     title: "Letta Code",
     programs: &["letta"],
-    package: Some("@letta-ai/letta-code"),
+    upgrade: Upgrade::Npm("@letta-ai/letta-code"),
     routable: false,
     toolset: Toolset::Never,
     build,

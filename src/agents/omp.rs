@@ -7,14 +7,14 @@
 use anyhow::Result;
 use serde_json::json;
 
-use super::{wire, Agent, Run, Toolset, KEY};
+use super::{wire, Agent, Run, Toolset, Upgrade, KEY};
 
 pub const AGENT: Agent = Agent {
     name: "omp",
     aliases: &["oh-my-pi"],
     title: "Oh My Pi",
     programs: &["omp"],
-    package: Some("@oh-my-pi/pi-coding-agent"),
+    upgrade: Upgrade::Npm("@oh-my-pi/pi-coding-agent"),
     routable: true,
     toolset: Toolset::Routed,
     build,

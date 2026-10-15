@@ -4,14 +4,14 @@
 use anyhow::Result;
 use serde_json::json;
 
-use super::{wire, Agent, Run, Toolset};
+use super::{wire, Agent, Run, Toolset, Upgrade};
 
 pub const AGENT: Agent = Agent {
     name: "amp",
     aliases: &[],
     title: "Amp",
     programs: &["amp"],
-    package: Some("@sourcegraph/amp"),
+    upgrade: Upgrade::Npm("@sourcegraph/amp"),
     routable: false,
     toolset: Toolset::Always,
     build,

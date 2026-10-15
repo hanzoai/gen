@@ -7,7 +7,7 @@
 use anyhow::Result;
 use serde_json::{json, Value};
 
-use super::{Agent, Reader, Run, Toolset};
+use super::{Agent, Reader, Run, Toolset, Upgrade};
 use crate::commands::code::event::{Mapped, Usage};
 
 pub const AGENT: Agent = Agent {
@@ -15,7 +15,7 @@ pub const AGENT: Agent = Agent {
     aliases: &[],
     title: "Cline",
     programs: &["cline"],
-    package: Some("cline"),
+    upgrade: Upgrade::Npm("cline"),
     routable: true,
     toolset: Toolset::Routed,
     build,
