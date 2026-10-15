@@ -148,10 +148,11 @@ pub fn command(program: &str, args: &[String]) -> Spawn {
 
 /// Entry point of `hanzo __mcp -- <server> <args…>` over the process's stdio.
 pub async fn main(argv: &[String]) -> Result<()> {
-    let rest = argv.iter().position(|a| a == "--").map_or(argv, |i| &argv[i + 1..]);
-    let (program, args) = rest.split_first().ok_or_else(|| anyhow!("usage: hanzo __mcp -- <server> [args…]"))?;
+    let (head, rest) = argv.iter().position(|a| a == "--").map_or((&argv[..0], argv), |i| (&argv[..i], &argv[i + 1..]));
+    let ledger = head.iter().position(|a| a == "--ledger").and_then(|i| head.get(i + 1)).map(PathBuf::from);
+    let (program, args) = rest.split_first().ok_or_else(|| anyhow!("usage: hanzo __mcp [--ledger FILE] -- <server> [args…]"))?;
     let spawn = command(program, args);
-    serve(tokio::io::stdin(), tokio::io::stdout(), spawn, program, args, cache_dir()).await
+    serve(tokio::io::stdin(), tokio::io::stdout(), spawn, program, args, cache_dir(), ledger).await
 }
 
 /// One message to the agent.
@@ -208,7 +209,7 @@ fn key_of(id: &Value) -> String {
 }
 
 /// Serves the agent on `input`/`output` until it closes `input`.
-pub async fn serve<R, W>(input: R, mut output: W, spawn: Spawn, program: &str, args: &[String], dir: Option<PathBuf>) -> Result<()>
+pub async fn serve<R, W>(input: R, mut output: W, spawn: Spawn, program: &str, args: &[String], dir: Option<PathBuf>, ledger: Option<PathBuf>) -> Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -220,6 +221,8 @@ where
     let mut backend: Option<Backend> = None;
     let mut learn = Learn::default();
     let mut dirty = false;
+    // Each `tools/call` in flight: its tool and when it was asked, for the ledger.
+    let mut calls: std::collections::HashMap<String, (String, std::time::Instant)> = std::collections::HashMap::new();
 
     loop {
         // A line from the agent or from the real server, whichever comes first.
@@ -309,6 +312,10 @@ where
                             if !method.is_empty() {
                                 b.inflight.insert(key_of(id));
                             }
+                            if method == "tools/call" && ledger.is_some() {
+                                let tool = msg.pointer("/params/name").and_then(Value::as_str).unwrap_or("tool").to_string();
+                                calls.insert(key_of(id), (tool, std::time::Instant::now()));
+                            }
                         }
                         b.tx.write_all(l.as_bytes()).await?;
                         b.tx.write_all(b"\n").await?;
@@ -349,6 +356,11 @@ where
                             _ => {
                                 if let (Some(id), true, Some(b)) = (&id, is_response, backend.as_mut()) {
                                     b.inflight.remove(&key_of(id));
+                                }
+                                if let (Some(id), true, Some(path), Some(m)) = (&id, is_response, ledger.as_deref(), &msg) {
+                                    if let Some((tool, at)) = calls.remove(&key_of(id)) {
+                                        super::ledger::append(path, &super::ledger::entry(&tool, at.elapsed().as_millis() as u64, m));
+                                    }
                                 }
                                 output.write_all(l.as_bytes()).await?;
                                 output.write_all(b"\n").await?;
@@ -522,10 +534,15 @@ mod tests {
 
     /// Drives the proxy with a script of agent lines and returns every line it wrote back, in order.
     async fn session(spawn: Spawn, dir: &Path, script: &[Value]) -> Vec<Value> {
+        session_to(spawn, dir, script, None).await
+    }
+
+    /// The same, recording tool calls in `ledger`.
+    async fn session_to(spawn: Spawn, dir: &Path, script: &[Value], ledger: Option<PathBuf>) -> Vec<Value> {
         let (mut agent_w, proxy_r) = duplex(1 << 16);
         let (proxy_w, agent_r) = duplex(1 << 16);
         let dir = dir.to_path_buf();
-        let h = tokio::spawn(async move { serve(proxy_r, proxy_w, spawn, "fake-server", &["--project-dir".into(), "/x".into()], Some(dir)).await });
+        let h = tokio::spawn(async move { serve(proxy_r, proxy_w, spawn, "fake-server", &["--project-dir".into(), "/x".into()], Some(dir), ledger).await });
         let mut out = Vec::new();
         let mut replies = BufReader::new(agent_r).lines();
         for m in script {
@@ -582,6 +599,18 @@ mod tests {
         assert_eq!(started.load(Ordering::SeqCst), 2);
         assert_eq!(out[2]["id"], 3);
         assert_eq!(out[2]["result"]["content"][0]["text"], "ran read");
+    }
+
+    #[tokio::test]
+    async fn every_tool_call_is_written_to_the_ledger_with_the_answer_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = dir.path().join("sessions").join("s.jsonl");
+        let spawn = fake(Arc::new(AtomicUsize::new(0)));
+        let out = session_to(spawn, &dir.path().join("cache"), &[init(), initialized(), list(), call()], Some(ledger.clone())).await;
+        assert_eq!(out[2]["result"]["content"][0]["text"], "ran read");
+        let got = super::super::ledger::read(&ledger);
+        assert_eq!(got.len(), 1, "one call, one line");
+        assert_eq!((got[0].tool.as_str(), got[0].ok, got[0].model.as_deref()), ("read", true, None));
     }
 
     #[tokio::test]

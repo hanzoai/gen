@@ -193,12 +193,12 @@ pub fn cache() -> Option<PathBuf> {
 }
 
 /// Where `kind` reads its user's skills under `route`, or `None` for a backend
-/// that carries no kit (Antigravity and Cursor read neither).
+/// that carries no kit (the agents of [`super::agents`] read neither).
 pub fn root(kind: BackendKind, route: &Route) -> Option<PathBuf> {
     match kind {
         BackendKind::Dev | BackendKind::Codex => Some(dirs::home_dir()?.join(".agents").join("skills")),
         BackendKind::Claude => Some(home::of(route)?.join("skills")),
-        BackendKind::Agy | BackendKind::Cursor => None,
+        BackendKind::Tool(_) => None,
     }
 }
 
@@ -792,8 +792,8 @@ mod tests {
     #[test]
     fn only_the_backends_that_read_skills_carry_a_kit() {
         let via = Route::Inherit;
-        assert!(root(BackendKind::Agy, &via).is_none());
-        assert!(root(BackendKind::Cursor, &via).is_none());
+        assert!(root(BackendKind::parse("agy").unwrap(), &via).is_none());
+        assert!(root(BackendKind::parse("cursor").unwrap(), &via).is_none());
         if let Some(home) = dirs::home_dir() {
             assert_eq!(root(BackendKind::Dev, &via), Some(home.join(".agents/skills")));
             assert_eq!(root(BackendKind::Codex, &via), Some(home.join(".agents/skills")));

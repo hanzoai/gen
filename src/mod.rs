@@ -21,6 +21,7 @@
 //! `--resume <sessionId>` restores cwd/repo/ref and relaunches the backend with
 //! its native resume against the same cloud session.
 
+pub mod agents;
 pub mod backend;
 mod claude;
 pub mod context;
@@ -34,6 +35,7 @@ mod external;
 pub(crate) mod harness;
 mod home;
 mod kit;
+pub mod ledger;
 pub mod mcp;
 pub mod sample;
 pub mod session;
@@ -308,9 +310,9 @@ fn resolve_routing(
     if !cloud && backend != BackendKind::Dev {
         return Ok(Route::Inherit);
     }
-    // Antigravity and Cursor have no gateway wire, so they always keep their
-    // own login, `--cloud` or not.
-    if matches!(backend, BackendKind::Agy | BackendKind::Cursor) {
+    // An agent with no gateway wire (Cursor, Antigravity, Gemini, …) always keeps
+    // its own login, `--cloud` or not.
+    if backend.own_account_only() {
         return Ok(Route::Inherit);
     }
     // The model rides ONLY the gateway route (resolved once here). Both gateway
@@ -524,14 +526,26 @@ pub async fn run(cfg: &mut Config, opts: Options) -> Result<()> {
     // otherwise `~/.hanzo/settings.json` `mcp` decides, defaulting ON. A missing
     // server warns but never blocks. The same switch governs the cloud's tools.
     let mcp_on = opts.mcp && settings.mcp.unwrap_or(true);
+    // Where the proxy records each tool call, for the summary to say what the
+    // toolset did. Named here because the server is attached before the cloud
+    // session exists.
+    let ledger = ledger::path(&format!("{}-{:08x}", chrono::Utc::now().format("%Y%m%dT%H%M%S"), rand::random::<u32>()));
     let mcp = if mcp_on {
-        let m = resolve_mcp(&cwd);
+        let m = resolve_mcp(&cwd, ledger.as_deref());
         if m.is_none() {
-            crate::warn("hanzo-mcp not found (install `hanzo-mcp` or `uv`) — continuing without the Hanzo toolset.");
+            crate::warn("hanzo-mcp not found — install it with `hanzo upgrade mcp` (or `curl -fsSL hanzo.sh/mcp | sh`); continuing without the Hanzo toolset.");
         }
         m
     } else {
         None
+    };
+    // What the summary says of the toolset: the ledger it reads, or why there is none.
+    let takes = !matches!(kind, BackendKind::Tool(a) if a.mcp == agents::Mcp::None);
+    let tools: std::result::Result<std::path::PathBuf, String> = match (&mcp, takes, ledger) {
+        (_, false, _) => Err(format!("{} takes no MCP server for one run", kind.as_str())),
+        (None, _, _) => Err("not attached (`--no-mcp`, or hanzo-mcp is not installed)".into()),
+        (Some(_), true, Some(l)) => Ok(l),
+        (Some(_), true, None) => Err("attached; no home directory to keep a ledger in".into()),
     };
 
     // Routing: which model endpoint this run's calls go to, and with what
@@ -735,7 +749,7 @@ pub async fn run(cfg: &mut Config, opts: Options) -> Result<()> {
                     .map(|p| p.display().to_string());
                 finalize(c, id, &outcome, status, &snapshot, &api, &who, transcript).await;
             }
-            spent.end(cfg, backend.label(), kind == BackendKind::Claude, &outcome.usage, session_id.as_deref()).await;
+            spent.end(cfg, backend.label(), kind == BackendKind::Claude, &outcome.usage, session_id.as_deref(), tools.as_deref().map_err(String::as_str)).await;
             if let Some(id) = &session_id {
                 report_link(id);
             }
@@ -764,7 +778,7 @@ pub async fn run(cfg: &mut Config, opts: Options) -> Result<()> {
                 finalize(c, id, &outcome, status, &snapshot, &api, &who, transcript).await;
             }
             // The tool's own screen was the stream, so nothing was reported here.
-            spent.end(cfg, backend.label(), kind == BackendKind::Claude, &Usage::default(), session_id.as_deref()).await;
+            spent.end(cfg, backend.label(), kind == BackendKind::Claude, &Usage::default(), session_id.as_deref(), tools.as_deref().map_err(String::as_str)).await;
             if let Some(id) = &session_id {
                 report_link(id);
             }

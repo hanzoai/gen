@@ -40,13 +40,10 @@ struct Usage {
     at: u64,
 }
 
-/// Native backends a person can sign in to. `dev` is ours and is not an account.
-const NATIVE: &[BackendKind] = &[
-    BackendKind::Claude,
-    BackendKind::Codex,
-    BackendKind::Agy,
-    BackendKind::Cursor,
-];
+/// Whether `kind` is an agent a person signs in to. `dev` is ours and is not an account.
+fn signs_in(kind: BackendKind) -> bool {
+    kind != BackendKind::Dev
+}
 
 /// Which configured agent a bare `hanzo` runs.
 ///
@@ -67,7 +64,7 @@ pub fn used_account(
     inherited: bool,
     hanzo: Option<(&str, &str)>,
 ) -> String {
-    if inherited && NATIVE.contains(&backend) {
+    if inherited && signs_in(backend) {
         return backend.as_str().to_string();
     }
     match hanzo {
@@ -96,7 +93,7 @@ pub fn inventory(identities: &[(&str, &str)], native: &[String]) -> Vec<Account>
         let Ok(kind) = BackendKind::parse(name) else {
             continue;
         };
-        if !NATIVE.contains(&kind) {
+        if !signs_in(kind) {
             continue;
         }
         let id = kind.as_str().to_string();
@@ -153,7 +150,7 @@ fn native_kind(name: &str) -> Option<BackendKind> {
         .map(|agent| agent.backend)
         .or_else(|| BackendKind::parse(name).ok().map(|k| k.as_str()))?;
     let kind = BackendKind::parse(canonical).ok()?;
-    NATIVE.contains(&kind).then_some(kind)
+    signs_in(kind).then_some(kind)
 }
 
 fn hanzo_account<'a>(accounts: &'a [Account], active: Option<&str>) -> Option<&'a Account> {
@@ -272,7 +269,7 @@ mod tests {
             used_account(BackendKind::Dev, false, Some(("hanzo", "z"))),
             "hanzo:hanzo/z"
         );
-        assert_eq!(used_account(BackendKind::Agy, true, None), "agy");
+        assert_eq!(used_account(BackendKind::parse("agy").unwrap(), true, None), "agy");
     }
 
     /// The whole table, on disk: every connected account can be selected, and

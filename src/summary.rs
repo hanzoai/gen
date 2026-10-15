@@ -38,6 +38,8 @@ pub struct Ended<'a> {
     /// The gateway model the run named, when its calls went through api.hanzo.ai.
     pub routed: Option<&'a str>,
     pub session: Option<&'a str>,
+    /// What the Hanzo toolset did ([`super::ledger`]), or why it did nothing.
+    pub tools: Result<&'a [super::ledger::Entry], &'a str>,
 }
 
 impl Ended<'_> {
@@ -92,6 +94,10 @@ pub fn lines(e: &Ended, book: Option<&Book>, meter: Option<&Result<serde_json::V
         None => out.extend(metered(e, meter)),
     }
 
+    match e.tools {
+        Ok(entries) => out.extend(super::ledger::rows(entries).iter().map(|(k, v)| row(k, v))),
+        Err(why) => out.push(row("hanzo tools", why)),
+    }
     if let Some(id) = e.session {
         out.push(row("dashboard", &url(id)));
     }
@@ -130,7 +136,7 @@ fn cost(e: &Ended, t: &Tally, book: Option<&Book>) -> Vec<String> {
 /// other run, the plain statement that Hanzo did not see its tokens.
 fn metered(e: &Ended, meter: Option<&Result<serde_json::Value, String>>) -> Vec<String> {
     if e.routed.is_none() {
-        return vec![row("usage", &format!("not observed: {} ran on its own account and Hanzo meters none of it", e.backend))];
+        return vec![row("model", &format!("{} on its own account; Hanzo bills only what its tools handed off", e.backend))];
     }
     let window = format!(
         "{}–{} UTC",
@@ -196,6 +202,7 @@ impl Run {
         apart: bool,
         usage: &Usage,
         session: Option<&str>,
+        tools: Result<&std::path::Path, &str>,
     ) {
         use colored::Colorize;
         let e = Ended {
@@ -207,7 +214,10 @@ impl Run {
             apart,
             routed: self.routed.as_deref(),
             session,
+            tools: Err(""),
         };
+        let entries = tools.map(super::ledger::read);
+        let e = Ended { tools: entries.as_ref().map(Vec::as_slice).map_err(|w| *w), ..e };
         // The cloud is asked only for a person at a terminal. A script reads what the agent printed, and the
         // process should end when the agent does: its block carries what the run reported and nothing it
         // has to wait for.
@@ -261,6 +271,7 @@ mod tests {
             apart: true,
             routed,
             session: Some("sess_abc"),
+            tools: Err("not attached (`--no-mcp`, or hanzo-mcp is not installed)"),
         }
     }
 
@@ -365,9 +376,25 @@ mod tests {
         e.backend = "cursor";
         e.session = None;
         let out = text(&lines(&e, None, None));
-        assert!(out.contains("not observed: cursor ran on its own account and Hanzo meters none of it"), "{out}");
+        assert!(out.contains("cursor on its own account; Hanzo bills only what its tools handed off"), "{out}");
+        assert!(out.contains("hanzo tools not attached"), "{out}");
         assert!(!out.contains("dashboard"), "an unlinked run has no session to link: {out}");
         assert!(!asks(&e));
+    }
+
+    #[test]
+    fn the_block_says_what_the_toolset_handed_off() {
+        let none = Usage::default();
+        let calls = [
+            super::super::ledger::Entry { tool: "llm".into(), ms: 900, ok: true, model: Some("enso-auto".into()), input: Some(110), output: Some(29) },
+            super::super::ledger::Entry { tool: "kai_decide".into(), ms: 53, ok: true, model: Some("kai".into()), input: Some(11), output: Some(0) },
+        ];
+        let mut e = ended(&none, None);
+        e.tools = Ok(&calls);
+        let out = text(&lines(&e, None, None));
+        assert!(out.contains("hanzo tools 2 calls"), "{out}");
+        assert!(out.contains("1 call handed to enso-auto · in 110 · out 29"), "{out}");
+        assert!(out.contains("1 call handed to kai"), "{out}");
     }
 
     #[test]

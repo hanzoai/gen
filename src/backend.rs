@@ -16,7 +16,7 @@ use super::dev::Agent;
 use super::event::Mapped;
 use super::external::External;
 
-/// Which coding agent to wrap. Five distinct products — never aliases of each
+/// Which coding agent to wrap. Distinct products — never aliases of each
 /// other: a user who names one gets THAT agent, or a clear failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendKind {
@@ -24,22 +24,21 @@ pub enum BackendKind {
     Dev,
     Claude,
     Codex,
-    /// Google Antigravity (`agy`).
-    Agy,
-    /// Cursor's agent CLI.
-    Cursor,
+    /// Any agent in [`super::agents::AGENTS`]: Cursor, Antigravity, Gemini, Qwen, …
+    Tool(&'static super::agents::Agent),
 }
 
 impl BackendKind {
-    /// Parse a backend name. Every accepted spelling lives HERE and nowhere else.
+    /// Parse a backend name. Our three are spelled here; every other agent's
+    /// spellings live in its row of [`super::agents::AGENTS`].
     pub fn parse(s: &str) -> Result<BackendKind> {
         match s.trim().to_ascii_lowercase().as_str() {
             "dev" => Ok(BackendKind::Dev),
             "claude" | "claude-code" | "cc" => Ok(BackendKind::Claude),
             "codex" => Ok(BackendKind::Codex),
-            "agy" | "antigravity" => Ok(BackendKind::Agy),
-            "cursor" | "agent" | "cursor-agent" => Ok(BackendKind::Cursor),
-            other => anyhow::bail!("unknown backend '{other}' (expected: {EXPECTED})"),
+            other => super::agents::find(other)
+                .map(BackendKind::Tool)
+                .ok_or_else(|| anyhow::anyhow!("unknown backend '{other}' (expected: {})", expected())),
         }
     }
 
@@ -50,8 +49,7 @@ impl BackendKind {
             BackendKind::Dev => "dev",
             BackendKind::Claude => "claude",
             BackendKind::Codex => "codex",
-            BackendKind::Agy => "agy",
-            BackendKind::Cursor => "cursor",
+            BackendKind::Tool(a) => a.name,
         }
     }
 
@@ -60,10 +58,22 @@ impl BackendKind {
     pub fn names(s: &str) -> bool {
         BackendKind::parse(s).is_ok()
     }
+
+    /// Every backend's canonical name, ours first.
+    pub fn all() -> impl Iterator<Item = &'static str> {
+        ["dev", "claude", "codex"].into_iter().chain(super::agents::AGENTS.iter().map(|a| a.name))
+    }
+
+    /// Whether the agent keeps its own login and never takes the Hanzo route.
+    pub fn own_account_only(self) -> bool {
+        matches!(self, BackendKind::Tool(a) if a.gateway == super::agents::Gateway::None)
+    }
 }
 
 /// The backend names offered in help text and in the "unknown backend" error.
-const EXPECTED: &str = "dev | claude | codex | agy | cursor";
+pub fn expected() -> String {
+    BackendKind::all().collect::<Vec<_>>().join(" | ")
+}
 
 /// The default backend when no spelling names one: OUR agent.
 pub const DEFAULT: BackendKind = BackendKind::Dev;
@@ -397,33 +407,46 @@ pub fn resolve(kind: BackendKind) -> Box<dyn Backend> {
         BackendKind::Dev => Box::new(Agent::DEV),
         BackendKind::Claude => Box::new(Claude),
         BackendKind::Codex => Box::new(Agent::CODEX),
-        BackendKind::Agy => Box::new(External::AGY),
-        BackendKind::Cursor => Box::new(External::CURSOR),
+        BackendKind::Tool(agent) => Box::new(External { agent }),
     }
 }
 
-/// Resolve how to launch hanzo-mcp as a stdio server scoped to `cwd`. Prefer the
-/// installed console script, else uv's ephemeral runner. Returns `None` when
-/// neither is on PATH — MCP is an enhancement, so a missing server never blocks
-/// the session (the caller warns and continues without it).
-pub fn resolve_mcp(cwd: &Path) -> Option<McpAttach> {
-    let project = cwd.display().to_string();
-    let direct = if which::which("hanzo-mcp").is_ok() {
-        McpAttach { program: "hanzo-mcp".into(), args: vec!["--project-dir".into(), project] }
-    } else if which::which("uvx").is_ok() {
-        McpAttach { program: "uvx".into(), args: vec!["hanzo-mcp".into(), "--project-dir".into(), project] }
-    } else {
-        return None;
+/// Resolve how to launch hanzo-mcp as a stdio server scoped to `cwd`: the native
+/// binary hanzo.sh installed beside this one, else the first on PATH. Returns
+/// `None` when there is none — MCP is an enhancement, so a missing server never
+/// blocks the session (the caller warns and continues without it). `ledger` is
+/// where the proxy records each tool call for the session summary.
+pub fn resolve_mcp(cwd: &Path, ledger: Option<&Path>) -> Option<McpAttach> {
+    let exe = std::env::current_exe().ok();
+    let program = beside(exe.as_deref(), MCP_BIN).or_else(|| which::which(MCP_BIN).ok())?;
+    let direct = McpAttach {
+        program: program.display().to_string(),
+        args: vec!["--project-dir".into(), cwd.display().to_string()],
     };
-    Some(lazy(direct, std::env::current_exe().ok()))
+    Some(lazy(direct, exe, ledger))
+}
+
+/// The MCP server's binary name, as hanzo.sh installs it.
+pub const MCP_BIN: &str = if cfg!(windows) { "hanzo-mcp.exe" } else { "hanzo-mcp" };
+
+/// `name` in the directory `exe` lives in, when it is there: the tools hanzo.sh
+/// installs together are found together, whatever PATH puts first.
+fn beside(exe: Option<&Path>, name: &str) -> Option<PathBuf> {
+    let p = exe?.canonicalize().ok()?.parent()?.join(name);
+    p.is_file().then_some(p)
 }
 
 /// The server behind this binary's own lazy proxy ([`super::mcp`]): the agent's wait
 /// for it to start is the proxy's, which answers from the last time the server spoke.
 /// Without a path to this binary the server is attached as it is.
-fn lazy(direct: McpAttach, exe: Option<std::path::PathBuf>) -> McpAttach {
+fn lazy(direct: McpAttach, exe: Option<std::path::PathBuf>, ledger: Option<&Path>) -> McpAttach {
     let Some(exe) = exe else { return direct };
-    let mut args = vec!["__mcp".to_string(), "--".to_string(), direct.program];
+    let mut args = vec!["__mcp".to_string()];
+    if let Some(l) = ledger {
+        args.extend(["--ledger".to_string(), l.display().to_string()]);
+    }
+    args.push("--".to_string());
+    args.push(direct.program);
     args.extend(direct.args);
     McpAttach { program: exe.display().to_string(), args }
 }
@@ -451,11 +474,23 @@ mod tests {
     #[test]
     fn the_toolset_is_attached_through_the_lazy_proxy() {
         let direct = McpAttach { program: "hanzo-mcp".into(), args: vec!["--project-dir".into(), "/p".into()] };
-        let got = lazy(direct.clone(), Some("/opt/hanzo".into()));
+        let got = lazy(direct.clone(), Some("/opt/hanzo".into()), None);
         assert_eq!(got.program, "/opt/hanzo");
         assert_eq!(got.args, ["__mcp", "--", "hanzo-mcp", "--project-dir", "/p"]);
+        let kept = lazy(direct.clone(), Some("/opt/hanzo".into()), Some(Path::new("/l.jsonl")));
+        assert_eq!(kept.args, ["__mcp", "--ledger", "/l.jsonl", "--", "hanzo-mcp", "--project-dir", "/p"]);
         // No path to this binary: the server is attached as it is.
-        assert_eq!(lazy(direct, None).program, "hanzo-mcp");
+        assert_eq!(lazy(direct, None, None).program, "hanzo-mcp");
+    }
+
+    #[test]
+    fn the_server_beside_this_binary_wins_over_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("hanzo");
+        std::fs::write(&exe, b"").unwrap();
+        assert_eq!(beside(Some(&exe), MCP_BIN), None);
+        std::fs::write(dir.path().join(MCP_BIN), b"").unwrap();
+        assert_eq!(beside(Some(&exe), MCP_BIN), Some(dir.path().canonicalize().unwrap().join(MCP_BIN)));
     }
 
     fn sel(positional: Option<&str>, tail: Option<&str>, named: Option<&str>) -> Selection {
@@ -585,14 +620,11 @@ mod tests {
         // `codex` is its OWN backend. Aliasing it to `dev` would silently run a
         // different agent than the one the user named.
         assert_eq!(BackendKind::parse("codex").unwrap(), BackendKind::Codex);
-        assert_eq!(BackendKind::parse("agy").unwrap(), BackendKind::Agy);
-        assert_eq!(BackendKind::parse("antigravity").unwrap(), BackendKind::Agy);
-        assert_eq!(BackendKind::parse("cursor").unwrap(), BackendKind::Cursor);
-        assert_eq!(BackendKind::parse("agent").unwrap(), BackendKind::Cursor);
-        assert_eq!(
-            BackendKind::parse("cursor-agent").unwrap(),
-            BackendKind::Cursor
-        );
+        for (spelling, name) in [("agy", "agy"), ("antigravity", "agy"), ("cursor", "cursor"), ("agent", "cursor"), ("cursor-agent", "cursor"), ("qwen-code", "qwen"), ("kilocode", "kilo"), ("gemini", "gemini")] {
+            assert_eq!(BackendKind::parse(spelling).unwrap().as_str(), name, "{spelling}");
+        }
+        assert!(BackendKind::parse("gemini").unwrap().own_account_only());
+        assert!(!BackendKind::parse("opencode").unwrap().own_account_only());
         assert!(BackendKind::parse("gpt").is_err());
     }
 
