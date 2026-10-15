@@ -46,7 +46,7 @@ mod tier;
 #[cfg(test)]
 pub(crate) mod testmock;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use colored::*;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -756,6 +756,11 @@ pub async fn run(cfg: &mut Config, opts: Options) -> Result<()> {
                 report_link(id);
             }
             run?;
+            // A task run is scripted, so its exit status is the answer: an agent
+            // that failed fails `hanzo`, and a caller's `&&` or CI step sees it.
+            if status == Status::Error {
+                bail!("{} did not finish the task: it exited with an error", backend.label());
+            }
         }
         Mode::Interactive => {
             let run = run_interactive(&*backend, launch, client.clone(), session_id.clone(), &route, &cwd, watch_sid).await;
