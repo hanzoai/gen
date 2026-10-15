@@ -1,9 +1,12 @@
 //! Gemini CLI. It keeps its own Google login: it speaks only Gemini's wire, which
-//! api.hanzo.ai does not serve. The toolset arrives as system settings, a file
-//! this run names in `GEMINI_CLI_SYSTEM_SETTINGS_PATH`.
+//! api.hanzo.ai does not serve. It takes no MCP server for one run: a system
+//! settings file (`GEMINI_CLI_SYSTEM_SETTINGS_PATH`) is read only when it and
+//! every directory above it are root's and writable by nobody else (gemini-cli
+//! 0.64 `isFileAndDirectorySecureSync`), which no file this process writes is.
+//! The toolset is added once, `gemini mcp add -s user hanzo <hanzo-mcp>`.
 
 use anyhow::Result;
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use super::{Agent, Reader, Run, Toolset, Upgrade};
 use crate::commands::code::event::{Mapped, Usage};
@@ -15,16 +18,12 @@ pub const AGENT: Agent = Agent {
     programs: &["gemini"],
     upgrade: Upgrade::Npm("@google/gemini-cli"),
     routable: false,
-    toolset: Toolset::Always,
+    toolset: Toolset::Never,
     build,
     read,
 };
 
 fn build(r: &mut Run) -> Result<()> {
-    if let Some(m) = r.mcp() {
-        let p = r.file(&json!({ "mcpServers": { "hanzo": { "command": m.program, "args": m.args } } }))?;
-        r.env("GEMINI_CLI_SYSTEM_SETTINGS_PATH", p);
-    }
     if r.auto() {
         r.arg("--yolo");
     }
@@ -86,14 +85,13 @@ fn read(r: &mut Reader, line: &str) -> Vec<Mapped> {
 mod tests {
     use super::super::test::*;
     use crate::commands::code::backend::{Mode, Route};
-    use serde_json::Value;
 
+    /// Gemini skips a system settings file a user owns, so a run writes none.
     #[test]
-    fn gemini_reads_the_toolset_as_system_settings_and_keeps_its_own_account() {
+    fn gemini_keeps_its_own_account_and_is_handed_no_settings_file() {
         let l = build("gemini", &spec(Mode::Headless, gateway()));
         assert_eq!(argv(&l), ["--yolo", "-p", "fix the test"]);
-        let doc: Value = serde_json::from_str(&std::fs::read_to_string(env(&l, "GEMINI_CLI_SYSTEM_SETTINGS_PATH").unwrap()).unwrap()).unwrap();
-        assert_eq!(doc["mcpServers"]["hanzo"]["args"][0], "__mcp");
+        assert!(env(&l, "GEMINI_CLI_SYSTEM_SETTINGS_PATH").is_none());
         assert!(env(&l, "OPENAI_API_KEY").is_none());
         assert_eq!(argv(&build("gemini", &spec(Mode::Interactive, Route::Inherit))), ["--yolo"]);
     }
