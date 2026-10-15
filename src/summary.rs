@@ -205,6 +205,7 @@ impl Run {
         tools: Result<&std::path::Path, &str>,
     ) {
         use colored::Colorize;
+        let entries = tools.map(super::ledger::read);
         let e = Ended {
             backend,
             took: self.at.elapsed(),
@@ -214,10 +215,8 @@ impl Run {
             apart,
             routed: self.routed.as_deref(),
             session,
-            tools: Err(""),
+            tools: entries.as_ref().map(Vec::as_slice).map_err(|w| *w),
         };
-        let entries = tools.map(super::ledger::read);
-        let e = Ended { tools: entries.as_ref().map(Vec::as_slice).map_err(|w| *w), ..e };
         // The cloud is asked only for a person at a terminal. A script reads what the agent printed, and the
         // process should end when the agent does: its block carries what the run reported and nothing it
         // has to wait for.
