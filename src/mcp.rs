@@ -345,10 +345,9 @@ where
                                     if let (Some(d), Some(full)) = (dir.as_deref(), assemble(&learn, program, args, &version)) {
                                         if manifest.as_ref().map(|x| (&x.initialize, &x.tools, &x.prompts, &x.resources, &x.templates))
                                             != Some((&full.initialize, &full.tools, &full.prompts, &full.resources, &full.templates))
+                                            && store(d, &full).is_ok()
                                         {
-                                            if store(d, &full).is_ok() {
-                                                manifest = Some(full);
-                                            }
+                                            manifest = Some(full);
                                         }
                                     }
                                 }
