@@ -379,7 +379,7 @@ fn stringify_content(c: Option<&Value>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::code::event::Kind;
+    use crate::event::Kind;
     use std::path::PathBuf;
 
     fn spec(mode: Mode) -> Spec {
@@ -387,7 +387,7 @@ mod tests {
             mode,
             task: Some("do it".into()),
             cwd: PathBuf::from("/tmp/proj"),
-            routing: Route::Via(Routing::Gateway { api: "https://api.hanzo.ai".into(), token: "JWT".into(), model: crate::commands::code::DEFAULT_MODEL.into(), small_fast_model: crate::commands::code::DEFAULT_SMALL_FAST_MODEL.into(), context_window: 1_000_000 }),
+            routing: Route::Via(Routing::Gateway { api: "https://api.hanzo.ai".into(), token: "JWT".into(), model: crate::DEFAULT_MODEL.into(), small_fast_model: crate::DEFAULT_SMALL_FAST_MODEL.into(), context_window: 1_000_000 }),
             // The default is auto-approve ON (the confirmed default).
             approval: Approval::Auto,
             mcp: Some(McpAttach { program: "hanzo-mcp".into(), args: vec!["--project-dir".into(), "/tmp/proj".into()] }),
@@ -397,6 +397,7 @@ mod tests {
             trust_project: false,
             resume: None,
             passthrough: vec![],
+            refresh: Vec::new(),
         }
     }
 
@@ -500,11 +501,11 @@ mod tests {
         // second place for the default to be stated and therefore to go stale.
         assert_eq!(
             env.get("ANTHROPIC_MODEL").map(String::as_str),
-            Some(format!("{}[1m]", crate::commands::code::DEFAULT_MODEL).as_str())
+            Some(format!("{}[1m]", crate::DEFAULT_MODEL).as_str())
         );
         assert_eq!(
             env.get("ANTHROPIC_DEFAULT_HAIKU_MODEL").map(String::as_str),
-            Some(crate::commands::code::DEFAULT_SMALL_FAST_MODEL)
+            Some(crate::DEFAULT_SMALL_FAST_MODEL)
         );
         // The deprecated var is cleared so a stale shell export can't shadow it.
         assert!(cleared(&l, "ANTHROPIC_SMALL_FAST_MODEL"), "deprecated small/fast var must be cleared");

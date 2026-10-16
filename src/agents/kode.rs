@@ -40,7 +40,7 @@ fn build(r: &mut Run) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::super::test::*;
-    use crate::commands::code::backend::{Mode, Route};
+    use crate::backend::{Mode, Route};
 
     #[test]
     fn kode_takes_the_toolset_as_claudes_mcp_config() {

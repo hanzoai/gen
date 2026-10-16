@@ -6,7 +6,7 @@ use anyhow::Result;
 use serde_json::Value;
 
 use super::{Agent, Reader, Run, Toolset, Upgrade};
-use crate::commands::code::event::Mapped;
+use crate::event::Mapped;
 
 pub const AGENT: Agent = Agent {
     name: "openhands",
@@ -67,7 +67,7 @@ fn read(_: &mut Reader, line: &str) -> Vec<Mapped> {
 #[cfg(test)]
 mod tests {
     use super::super::test::*;
-    use crate::commands::code::backend::{Mode, Route};
+    use crate::backend::{Mode, Route};
 
     #[test]
     fn openhands_runs_headless_and_reads_the_gateway_from_its_llm_variables() {

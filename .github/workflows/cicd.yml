@@ -1,0 +1,13 @@
+# Canonical caller — every knob lives in /hanzo.yml, none here. It sits in
+# .github/workflows because github.com reads nothing else, and this org's own
+# runners there carry the `linux-amd64` label hanzoai/ci schedules on.
+name: CI/CD
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+jobs:
+  cicd:
+    uses: hanzoai/ci/.github/workflows/build.yml@v2
+    secrets: inherit

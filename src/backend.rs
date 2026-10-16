@@ -358,6 +358,10 @@ pub struct Spec {
     pub resume: Option<String>,
     /// Extra args forwarded verbatim to the backend (never widened by us).
     pub passthrough: Vec<String>,
+    /// The command that prints the signed-in account's access token, fresh
+    /// ([`crate::Profile::refresh`]): what an agent that outlives one sign-in
+    /// token runs for the next.
+    pub refresh: Vec<String>,
 }
 
 impl Spec {

@@ -1,0 +1,36 @@
+[package]
+name = "hanzo-gen"
+version = "0.1.0"
+edition = "2021"
+authors = ["Hanzo AI"]
+description = "Hanzo Gen — the agentic harness: launch and route any coding agent (Hanzo Dev, Claude Code, Codex, Cursor, …) with Hanzo MCP and one model router"
+license = "MIT"
+repository = "https://github.com/hanzoai/gen"
+
+[[bin]]
+name = "gen"
+path = "src/main.rs"
+
+[dependencies]
+# The platform client the session, target and kit calls ride on: the same wire
+# the Hanzo CLI uses, consumed by pinned commit as that crate intends.
+hanzo-client = { git = "https://github.com/hanzoai/cli", rev = "695b57aae6abc21dcdfc3bf6a6d61ed965be8af3" }
+anyhow = "1.0"
+base64 = "0.22"
+chrono = "0.4"
+clap = { version = "4.5", features = ["derive", "env"] }
+colored = "2.1"
+dirs = "5.0"
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "gzip", "rustls-tls", "http2", "charset"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+tempfile = "3.10"
+tokio = { version = "1.36", features = ["full"] }
+toml = "0.8"
+tracing = "0.1"
+which = "6.0"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

@@ -9,7 +9,7 @@ use anyhow::Result;
 use serde_json::Value;
 
 use super::{Agent, Reader, Run, Toolset, Upgrade};
-use crate::commands::code::event::{Mapped, Usage};
+use crate::event::{Mapped, Usage};
 
 pub const AGENT: Agent = Agent {
     name: "gemini",
@@ -84,7 +84,7 @@ fn read(r: &mut Reader, line: &str) -> Vec<Mapped> {
 #[cfg(test)]
 mod tests {
     use super::super::test::*;
-    use crate::commands::code::backend::{Mode, Route};
+    use crate::backend::{Mode, Route};
 
     /// Gemini skips a system settings file a user owns, so a run writes none.
     #[test]

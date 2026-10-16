@@ -19,11 +19,11 @@ use std::path::{Path, PathBuf};
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
     /// The gateway model `hanzo dev` names (`ANTHROPIC_MODEL` for Claude, codex's
-    /// `model` for `dev`). Unset ⇒ the built-in [`crate::commands::code::DEFAULT_MODEL`].
+    /// `model` for `dev`). Unset ⇒ the built-in [`crate::DEFAULT_MODEL`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// The gateway small/fast model (Claude's `ANTHROPIC_SMALL_FAST_MODEL`). Unset
-    /// ⇒ the built-in [`crate::commands::code::DEFAULT_SMALL_FAST_MODEL`]. `dev` has no small/fast model.
+    /// ⇒ the built-in [`crate::DEFAULT_SMALL_FAST_MODEL`]. `dev` has no small/fast model.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub small_fast_model: Option<String>,
     /// Auto-approve the coding agent's actions without a per-action prompt. Unset
@@ -157,8 +157,8 @@ impl Settings {
 /// built-in value, so the file DOCUMENTS the defaults instead of being empty.
 fn defaults_document() -> Settings {
     Settings {
-        model: Some(crate::commands::code::DEFAULT_MODEL.to_string()),
-        small_fast_model: Some(crate::commands::code::DEFAULT_SMALL_FAST_MODEL.to_string()),
+        model: Some(crate::DEFAULT_MODEL.to_string()),
+        small_fast_model: Some(crate::DEFAULT_SMALL_FAST_MODEL.to_string()),
         auto_approve: Some(true),
         mcp: Some(true),
         context_window: Some(super::DEFAULT_CONTEXT_WINDOW),
@@ -219,14 +219,14 @@ mod tests {
         assert!(
             doc.contains(&format!(
                 "\"model\":\"{}\"",
-                crate::commands::code::DEFAULT_MODEL
+                crate::DEFAULT_MODEL
             )),
             "got {doc}"
         );
         assert!(
             doc.contains(&format!(
                 "\"smallFastModel\":\"{}\"",
-                crate::commands::code::DEFAULT_SMALL_FAST_MODEL
+                crate::DEFAULT_SMALL_FAST_MODEL
             )),
             "got {doc}"
         );

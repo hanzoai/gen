@@ -1,7 +1,9 @@
-//! `hanzo dev` — wrap a local coding agent (Claude Code or `dev`) so a
+//! Hanzo Gen — the agentic harness. It launches a coding agent (Hanzo Dev, the
+//! default, or Claude Code, Codex, Cursor and the rest in [`agents`]) so a
 //! developer's terminal session is (opt-in) linked, live-streamed and tracked in
 //! Hanzo cloud, with the Hanzo MCP toolset attached and model usage metered
-//! universally through the Hanzo gateway.
+//! universally through the Hanzo gateway. `hanzo dev` and `gen` are this crate;
+//! the program around it is its [`Host`].
 //!
 //! Three things are wired natively:
 //!   1. Session link + live stream — register on `/v1/agents/sessions`, forward
@@ -22,6 +24,7 @@
 //! its native resume against the same cloud session.
 
 pub mod agents;
+pub mod args;
 pub mod backend;
 mod claude;
 pub mod context;
@@ -31,14 +34,18 @@ mod dev;
 // so anything that can hold a session — `hanzo link` as much as `hanzo dev` —
 // must be able to name the value it is setting.
 pub mod event;
-pub(crate) mod harness;
+pub mod harness;
 mod home;
+pub mod host;
 mod kit;
 pub mod ledger;
 pub mod mcp;
+pub mod native;
+pub mod private;
 pub mod sample;
+pub mod savings;
 pub mod session;
-pub(crate) mod settings;
+pub mod settings;
 mod summary;
 pub mod target;
 mod theme;
@@ -56,10 +63,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncSeekExt};
 
-use crate::config::Config;
-use crate::iam::identity::Identity;
-use crate::iam::provider::{self, Provider};
-use crate::{commands::network, iam::store};
+pub use args::Args;
+pub use host::{Account, Host, Profile, Provider};
 
 use backend::{resolve, resolve_mcp, Approval, BackendKind, Backend, Launch, Mode, Route, Routing, Spec};
 use context::{ResumeRecord, Snapshot};
@@ -67,6 +72,13 @@ use control::{Act, Command};
 use event::{Kind, Mapped, Status, Usage};
 use session::SessionClient;
 use settings::Settings;
+
+/// Tell the user something went sideways WITHOUT failing the run — one place, so
+/// every warning looks the same and none of them lands on stdout, where it would
+/// corrupt what a caller is piping (`hanzo auth token`).
+pub fn warn(msg: &str) {
+    eprintln!("{} {}", "warning:".yellow().bold(), msg);
+}
 
 /// Parsed `hanzo dev` invocation.
 pub struct Options {
@@ -170,8 +182,8 @@ enum Cred {
 /// The longest a run waits for the cloud to register its session before it starts unlinked.
 const LINK_WAIT: Duration = Duration::from_secs(2);
 
-pub(super) const DEFAULT_MODEL: &str = "enso-auto";
-pub(super) const DEFAULT_SMALL_FAST_MODEL: &str = "enso-flash";
+pub(crate) const DEFAULT_MODEL: &str = "enso-auto";
+pub(crate) const DEFAULT_SMALL_FAST_MODEL: &str = "enso-flash";
 
 /// The context window `hanzo dev` requests on the gateway route by default: the
 /// real 1M window Hanzo's frontier models serve. A coding backend pointed at a
@@ -179,7 +191,7 @@ pub(super) const DEFAULT_SMALL_FAST_MODEL: &str = "enso-flash";
 /// gateway route NAMES the window (Claude `[1m]` suffix, `dev` `model_catalog_json`).
 /// Overridable in `~/.hanzo/settings.json` `contextWindow`; below the standard
 /// window it's a no-op (opting out of the extended window).
-pub(super) const DEFAULT_CONTEXT_WINDOW: u64 = 1_000_000;
+pub(crate) const DEFAULT_CONTEXT_WINDOW: u64 = 1_000_000;
 
 /// Resolve the auto-approve decision by precedence: an explicit CLI flag wins,
 /// then `~/.hanzo/settings.json` `autoApprove`, then the built-in default (ON).
@@ -295,8 +307,10 @@ fn route_plan(backend: BackendKind, provider: Option<&str>, has_bearer: bool) ->
 /// child's model-auth env correctly. A direct run ⇒ `Inherit`; a resolved
 /// credential ⇒ `Via`; nothing resolved ⇒ [`unresolved_route`] (fail closed iff a
 /// provider was selected, else inherit an unconfigured backend's own account).
+#[allow(clippy::too_many_arguments)]
 fn resolve_routing(
-    cfg: &Config,
+    host: &dyn Host,
+    provider: Option<&str>,
     settings: &Settings,
     cloud: bool,
     backend: BackendKind,
@@ -324,7 +338,6 @@ fn resolve_routing(
         small_fast_model: models.small_fast_model.clone(),
         context_window: models.context_window,
     };
-    let provider = cfg.auth.provider.as_deref();
     for cred in route_plan(backend, provider, bearer.is_some()) {
         match cred {
             Cred::Bearer => {
@@ -333,17 +346,17 @@ fn resolve_routing(
                 }
             }
             Cred::HanzoKey => {
-                if let Some(token) = provider::key(Provider::Hanzo)? {
+                if let Some(token) = host.key(Provider::Hanzo)? {
                     return Ok(Route::Via(gateway(token)));
                 }
             }
             Cred::AnthropicKey => {
-                if let Some(key) = provider::key(Provider::Anthropic)? {
+                if let Some(key) = host.key(Provider::Anthropic)? {
                     return Ok(Route::Via(Routing::Anthropic { key }));
                 }
             }
             Cred::OpenAIKey => {
-                if let Some(key) = provider::key(Provider::OpenAI)? {
+                if let Some(key) = host.key(Provider::OpenAI)? {
                     return Ok(Route::Via(Routing::OpenAI { key }));
                 }
             }
@@ -393,7 +406,7 @@ fn unresolved_route(provider_selected: bool) -> Route {
 /// place it is true.
 pub(crate) fn cloud_resume_block(
     rec_identity: &str,
-    active: Option<&Identity>,
+    active: Option<&Account>,
     rec_api: &str,
     active_api: &str,
 ) -> Option<String> {
@@ -433,27 +446,25 @@ pub(crate) fn cloud_resume_block(
     })
 }
 
-pub async fn run(cfg: &mut Config, opts: Options) -> Result<()> {
+pub async fn run(host: Arc<dyn Host>, opts: Options) -> Result<()> {
     let kind = opts.backend;
     let backend = resolve(kind);
     let mode = if opts.task.is_some() { Mode::Headless } else { Mode::Interactive };
-    let net = network::active(cfg);
-    let api = net.api;
+    let profile = host.profile();
+    let api = profile.api.clone();
     // The one network whose api may be plain http (the kit's bearer check).
-    let local = net.name == "local";
+    let local = profile.local;
 
-    // Auth: the ACTIVE identity's hanzo.id bearer from the OS keychain (never
+    // Auth: the ACTIVE identity's hanzo.id bearer, from the host (never
     // argv/logged). The identity rides along because the cloud session this run
     // registers is org-scoped to its `owner` — the two must not drift.
-    let (identity, bearer) = match store::active_token(cfg, &opts.brand).await? {
-        Some((id, t)) => (Some(id), Some(t.access_token)),
-        None => (None, None),
-    };
+    let identity = host.account(&opts.brand).await?;
+    let bearer = identity.as_ref().map(|a| a.token.clone());
 
     // `owner/name` for the LOCAL resume record — never sent to cloud.
-    let who = identity.as_ref().map(Identity::to_string).unwrap_or_default();
+    let who = identity.as_ref().map(Account::to_string).unwrap_or_default();
 
-    let mut do_link = effective_link(opts.link, opts.no_link, cfg.code.link);
+    let mut do_link = effective_link(opts.link, opts.no_link, profile.link);
     if do_link && bearer.is_none() {
         crate::warn("not signed in — run `hanzo auth login` to link this session. Continuing locally (no cloud stream).");
         do_link = false;
@@ -553,7 +564,7 @@ pub async fn run(cfg: &mut Config, opts: Options) -> Result<()> {
     // Routing: which model endpoint this run's calls go to, and with what
     // credential — the Hanzo gateway (metered) for a Hanzo login, or a provider's
     // OWN API for a stored OpenAI/Anthropic key. A third-party tool is direct unless `--cloud`.
-    let routing = resolve_routing(cfg, &settings, opts.cloud, kind, &api, bearer.as_deref(), opts.model.as_deref())?;
+    let routing = resolve_routing(&*host, profile.provider.as_deref(), &settings, opts.cloud, kind, &api, bearer.as_deref(), opts.model.as_deref())?;
     // Local usage, one line per session, for whichever connected account this
     // run actually used. A missing home does not stop the session.
     let used = harness::used_account(
@@ -565,11 +576,13 @@ pub async fn run(cfg: &mut Config, opts: Options) -> Result<()> {
         .ok()
         .or_else(|| settings.harness.clone());
     let active = identity.as_ref().map(|id| format!("{}/{}", id.owner, id.name));
-    let ids: Vec<(&str, &str)> = cfg
-        .auth
+    // Every identity the host holds, and the one signed in: a host with no index
+    // of its own still has that one, and the inventory drops the repeat.
+    let ids: Vec<(&str, &str)> = profile
         .identities
         .iter()
-        .map(|id| (id.owner.as_str(), id.name.as_str()))
+        .map(|(owner, name)| (owner.as_str(), name.as_str()))
+        .chain(identity.as_ref().map(|id| (id.owner.as_str(), id.name.as_str())))
         .collect();
     if let Err(e) = harness::track(&ids, active.as_deref(), pin.as_deref(), &used) {
         crate::warn(&e.to_string());
@@ -579,7 +592,7 @@ pub async fn run(cfg: &mut Config, opts: Options) -> Result<()> {
     // vanish into an inherited endpoint. `provider` is always `Some` here — it is
     // what makes the outcome `FailClosed` rather than `Inherit`.
     if matches!(routing, Route::FailClosed) {
-        if let Some(p) = cfg.auth.provider.as_deref() {
+        if let Some(p) = profile.provider.as_deref() {
             crate::warn(&format!(
                 "selected provider `{p}` has no usable key — run `hanzo auth login` (or run without `--cloud` \
                  to use the tool's own account). Model calls will NOT route, and the child's \
@@ -608,7 +621,7 @@ pub async fn run(cfg: &mut Config, opts: Options) -> Result<()> {
     let snapshot = Snapshot::capture(&cwd, backend.label(), backend.version());
 
     let client = if do_link {
-        Some(SessionClient::new(&api, bearer.as_deref().unwrap())?.with_org(cfg.org.as_deref()))
+        Some(SessionClient::new(&api, bearer.as_deref().unwrap())?.with_org(profile.org.as_deref()))
     } else {
         None
     };
@@ -679,7 +692,7 @@ pub async fn run(cfg: &mut Config, opts: Options) -> Result<()> {
     // wrote, so announcing once and going quiet reads offline ninety seconds into a
     // session that is still running. The guard beats until this run returns.
     let _machine = links_target(do_link, bearer.is_some())
-        .then(|| target::beat(cfg, &api, &snapshot.machine_id, &snapshot.host));
+        .then(|| target::beat(host.clone(), &api, &snapshot.machine_id, &snapshot.host));
 
     // Claude theme (Dracula dark / Alucard light, auto by the user's preference).
     // Native — writes `<config home>/themes` + selects it; never patches Claude. The
@@ -687,7 +700,7 @@ pub async fn run(cfg: &mut Config, opts: Options) -> Result<()> {
     // has no Claude themes. Held to end-of-run so plain `claude` keeps its theme.
     // Takes the ROUTE because that is what decides which home this session reads.
     let _theme_guard = (kind == BackendKind::Claude)
-        .then(|| theme::apply(&routing, opts.theme.as_deref(), &cfg.code.theme));
+        .then(|| theme::apply(&routing, opts.theme.as_deref(), &profile.theme));
 
     banner(
         &opts,
@@ -720,6 +733,7 @@ pub async fn run(cfg: &mut Config, opts: Options) -> Result<()> {
         trust_project: opts.project_mcp,
         resume: resume_handle.clone(),
         passthrough: opts.passthrough.clone(),
+        refresh: profile.refresh.clone(),
     };
     // The route also decides which config home the backend wrote its transcript in,
     // so keep it for the pointer recorded after the child exits — the supervisor
@@ -751,7 +765,7 @@ pub async fn run(cfg: &mut Config, opts: Options) -> Result<()> {
                     .map(|p| p.display().to_string());
                 finalize(c, id, &outcome, status, &snapshot, &api, &who, transcript).await;
             }
-            spent.end(cfg, backend.label(), kind == BackendKind::Claude, &outcome.usage, session_id.as_deref(), tools.as_deref().map_err(String::as_str)).await;
+            spent.end(&*host, backend.label(), kind == BackendKind::Claude, &outcome.usage, session_id.as_deref(), tools.as_deref().map_err(String::as_str)).await;
             if let Some(id) = &session_id {
                 report_link(id);
             }
@@ -785,7 +799,7 @@ pub async fn run(cfg: &mut Config, opts: Options) -> Result<()> {
                 finalize(c, id, &outcome, status, &snapshot, &api, &who, transcript).await;
             }
             // The tool's own screen was the stream, so nothing was reported here.
-            spent.end(cfg, backend.label(), kind == BackendKind::Claude, &Usage::default(), session_id.as_deref(), tools.as_deref().map_err(String::as_str)).await;
+            spent.end(&*host, backend.label(), kind == BackendKind::Claude, &Usage::default(), session_id.as_deref(), tools.as_deref().map_err(String::as_str)).await;
             if let Some(id) = &session_id {
                 report_link(id);
             }
@@ -1427,9 +1441,9 @@ fn uuid_v4() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::code::claude::Claude;
-    use crate::commands::code::dev::Agent;
-    use crate::commands::code::testmock::MockCloud;
+    use crate::claude::Claude;
+    use crate::dev::Agent;
+    use crate::testmock::MockCloud;
     use tokio::io::AsyncWriteExt;
 
     async fn reader_of(fixture: &str) -> impl AsyncBufRead + Unpin {
@@ -1454,11 +1468,9 @@ mod tests {
         }
     }
 
-    fn id(s: &str) -> Identity {
-        // Derived from claims, as everywhere else — there is no other way to
-        // build one, which is the point.
+    fn id(s: &str) -> Account {
         let (owner, name) = s.split_once('/').unwrap();
-        Identity::from_access_token(&crate::iam::identity::testjwt::jwt(owner, name)).unwrap()
+        Account { owner: owner.into(), name: name.into(), token: "T".into() }
     }
 
     /// Same identity: the cloud session is ours, re-attach silently.
@@ -1802,6 +1814,7 @@ mod tests {
             trust_project: false,
             resume: None,
             passthrough: vec![],
+            refresh: Vec::new(),
         }
     }
 
@@ -2136,8 +2149,8 @@ mod tests {
 #[cfg(test)]
 mod control_tests {
     use super::*;
-    use crate::commands::code::claude::Claude;
-    use crate::commands::code::testmock::MockCloud;
+    use crate::claude::Claude;
+    use crate::testmock::MockCloud;
     use std::sync::Mutex;
     use tokio::io::AsyncWriteExt;
 
@@ -2233,6 +2246,7 @@ mod control_tests {
             trust_project: false,
             resume: None,
             passthrough: Vec::new(),
+            refresh: Vec::new(),
         }
     }
 

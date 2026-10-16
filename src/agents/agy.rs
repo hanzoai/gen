@@ -5,7 +5,7 @@ use anyhow::Result;
 use serde_json::Value;
 
 use super::{inside, Agent, Reader, Run, Toolset, Upgrade};
-use crate::commands::code::event::{Mapped, Usage};
+use crate::event::{Mapped, Usage};
 
 pub const AGENT: Agent = Agent {
     name: "agy",
@@ -86,7 +86,7 @@ fn read(r: &mut Reader, line: &str) -> Vec<Mapped> {
 #[cfg(test)]
 mod tests {
     use super::super::test::*;
-    use crate::commands::code::backend::{Mode, Route};
+    use crate::backend::{Mode, Route};
 
     #[test]
     fn agy_takes_its_task_by_print() {

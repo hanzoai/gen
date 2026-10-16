@@ -55,7 +55,7 @@ fn build(r: &mut Run) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::super::test::*;
-    use crate::commands::code::backend::{Mode, Route};
+    use crate::backend::{Mode, Route};
 
     #[test]
     fn crush_keeps_its_own_flags_ahead_of_run_and_yolo_on_its_screen() {

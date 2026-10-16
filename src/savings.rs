@@ -5,8 +5,8 @@
 //!   rates `GET {api}/v1/models` lists (`pricing.prompt`, `pricing.completion`,
 //!   `pricing.rates.input_cache_read`, `input_cache_write`). An estimate: it is
 //!   what those tokens cost at the list, not what an account was charged.
-//! - **The cloud meter** (`Llm`): `GET /v1/usage/summary`, the org's Hanzo-routed
-//!   inference totals. Only the fields the cloud answers are read; one it does not
+//! - **The cloud meter** (`Llm`): `GET /v1/usage/summary`, which the host reads
+//!   ([`crate::Host::meter`]), the org's Hanzo-routed inference totals. Only the fields the cloud answers are read; one it does not
 //!   answer is absent, never zero.
 //! - **Formatting**: one spelling of a count, a dollar amount and a share, shared by
 //!   the end-of-session block and the console.
@@ -14,11 +14,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use hanzo_client::Method;
 use serde_json::Value;
-
-use crate::commands::product::{envelope_error, Seam};
-use crate::config::Config;
 
 // ---- listed prices ------------------------------------------------------------
 
@@ -358,42 +354,6 @@ impl Plan {
             })
             .unwrap_or_default()
     }
-}
-
-/// How long one cloud read may take.
-const PATIENCE: Duration = Duration::from_secs(10);
-
-/// `GET /v1/usage/summary` through the one authenticated seam, as its `data`. A
-/// refusal, a transport fault and an error envelope are each a reason, never an
-/// empty document.
-pub async fn summary(cfg: &mut Config, query: &[String]) -> Result<Value, String> {
-    let call = async {
-        let seam = Seam::open(cfg).await.map_err(|e| format!("{e:#}"))?;
-        let reply = seam
-            .send(Method::GET, "/v1/usage/summary", query, None)
-            .await
-            .map_err(|e| format!("{e:#}"))?;
-        let body = reply.body;
-        if !(200..300).contains(&reply.status) {
-            let said = envelope_error(&body)
-                .or_else(|| body.get("detail").and_then(Value::as_str).map(String::from))
-                .unwrap_or_else(|| match &body {
-                    Value::String(s) => s.clone(),
-                    Value::Null => String::new(),
-                    v => v.to_string(),
-                });
-            let said: String = said.split_whitespace().collect::<Vec<_>>().join(" ");
-            let said: String = said.chars().take(120).collect();
-            return Err(format!("{} {said}", reply.status).trim_end().to_string());
-        }
-        if let Some(msg) = envelope_error(&body) {
-            return Err(msg);
-        }
-        Ok(body.get("data").cloned().unwrap_or(body))
-    };
-    tokio::time::timeout(PATIENCE, call)
-        .await
-        .unwrap_or_else(|_| Err(format!("no answer in {}s", PATIENCE.as_secs())))
 }
 
 // ---- how a number is written ----------------------------------------------------

@@ -18,7 +18,8 @@ use tokio::task::JoinHandle;
 
 use super::backend::{Route, Routing};
 use super::event::Usage;
-use crate::commands::savings::{self, int, pct, span, usd, Book, Llm, Tally};
+use crate::savings::{self, int, pct, span, usd, Book, Llm, Tally};
+use crate::Host;
 
 /// Where the cloud shows a session.
 pub fn url(id: &str) -> String {
@@ -197,7 +198,7 @@ impl Run {
     /// figure out, never the block.
     pub async fn end(
         self,
-        cfg: &mut crate::config::Config,
+        host: &dyn Host,
         backend: &str,
         apart: bool,
         usage: &Usage,
@@ -226,7 +227,8 @@ impl Run {
             _ => None,
         };
         let meter = if person && asks(&e) {
-            Some(match tokio::time::timeout(METER_WAIT, savings::summary(cfg, &window(&e))).await {
+            let query = window(&e);
+            Some(match tokio::time::timeout(METER_WAIT, host.meter(&query)).await {
                 Ok(m) => m,
                 Err(_) => Err(format!("the cloud did not answer in {}s", METER_WAIT.as_secs_f32())),
             })

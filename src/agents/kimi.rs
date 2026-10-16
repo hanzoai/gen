@@ -31,7 +31,7 @@ fn build(r: &mut Run) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::super::test::*;
-    use crate::commands::code::backend::{Mode, Route};
+    use crate::backend::{Mode, Route};
 
     #[test]
     fn kimi_acts_without_asking_on_its_screen_only() {

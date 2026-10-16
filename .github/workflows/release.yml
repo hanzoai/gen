@@ -1,0 +1,331 @@
+# Release — a tag `vX.Y.Z` ships `gen` at that version.
+#
+# The version is assigned by hand, never computed here: a person sets it in
+# Cargo.toml's [package], commits, and pushes the tag `v<that version>`. This
+# workflow refuses a tag Cargo.toml does not say and writes no commit, no tag and
+# no version anywhere.
+#
+# What it ships is what hanzo.sh installs: per platform, `gen-<os>-<arch>.tar.gz`
+# holding one file named `gen` (`gen.exe` on Windows), and its `.sha256` beside
+# it. hanzoai/cli's install.sh picks the highest stable tag whose release carries
+# this machine's archive and checksum, so a draft is invisible to it until
+# `publish` has verified all ten assets.
+#
+# The runners are this org's own (`linux-amd64`); the image carries cc, make,
+# curl, jq, tar, xz, zip, git and python3, and no Rust and no LLVM, so Rust comes
+# from rustup into $HOME and nothing here installs a package. One amd64 machine
+# builds all five targets: `cargo-zigbuild` links the musl and darwin targets
+# (darwin against a vendored, checksum-pinned MacOSX SDK), and `cargo-xwin`
+# builds windows-msvc with LLVM's clang-cl. This is Hanzo Dev's release, cut down
+# to one small binary.
+#
+# A runner lives for one job, so sccache wraps every rustc call and hanzoai/ci's
+# bin/cache carries its objects and the crate downloads to the next run through
+# this org's store (/v1/s3, the IAM identity KMS mints, no bucket credential).
+name: Release
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+  workflow_dispatch:
+concurrency:
+  group: release
+  cancel-in-progress: false
+permissions:
+  contents: write
+env:
+  ZIG_VERSION: '0.16.0'
+  ZIG_SHA256: '70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00'
+  ZIGBUILD_VERSION: '0.23.0'
+  LLVM_VERSION: '21.1.2'
+  LLVM_SHA256: '38dc1e278b8d688d9f4f1077da1dcda623d9e0dd89ffcf03bc18d3492bbd9cb6'
+  # Named away from XWIN_VERSION on purpose: cargo-xwin reads that env as its
+  # --xwin-version flag (the Windows SDK manifest), and a crate version there
+  # kills every msvc build with "invalid digit found in string".
+  XWIN_CRATE_VERSION: '0.23.1'
+  MACOS_SDK_URL: 'https://github.com/phracker/MacOSX-SDKs/releases/download/11.3/MacOSX11.3.sdk.tar.xz'
+  MACOS_SDK_SHA256: 'cd4f08a75577145b8f05245a2975f7c81401d75e9535dcffbb879ee1deefcbf4'
+  # The musl release tarball, by version and by its sha256 per runner arch.
+  SCCACHE_VERSION: '0.18.0'
+  SCCACHE_SHA256_X86_64: '45f1447fbe231e3037bde351ef70677dd212216c8d62ae7ca409fecc4d6acc89'
+  SCCACHE_SHA256_AARCH64: '2b3284d5da3b46a47dc4229e75bb7b88ac4aa99c8d754fb7d2f84997e5a4354a'
+  # hanzoai/ci at the commit whose bin/cache this release runs.
+  CI_SHA: '386b7a26942215254a1964f107ad5e8715e8349e'
+jobs:
+  version:
+    runs-on: [linux-amd64]
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      release: ${{ steps.v.outputs.release }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: The version is the tag's, and the draft that will hold it
+        id: v
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          case "$GITHUB_REF" in
+            refs/tags/v[0-9]*) v=${GITHUB_REF_NAME#v} ;;
+            *) echo "::error::a release runs from a tag vX.Y.Z, not $GITHUB_REF: set Cargo.toml's version, commit, and push the tag"; exit 1 ;;
+          esac
+          printf '%s' "$v" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "::error::$GITHUB_REF_NAME is not vX.Y.Z"; exit 1; }
+          c=$(sed -n '/^\[package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)
+          [ "$c" = "$v" ] || { echo "::error::the tag says $v and Cargo.toml's [package] says $c: the version is assigned by hand, in Cargo.toml, before the tag"; exit 1; }
+          auth=(-H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json")
+          # A rerun of the same tag finds its own draft; a published release at
+          # this version is a version already taken, which no run may ship again.
+          rel=$(curl -s "${auth[@]}" "https://api.github.com/repos/$REPO/releases?per_page=100" \
+            | jq -r --arg t "v$v" '.[] | select(.tag_name == $t) | "\(.id) \(.draft)"' | head -1)
+          case "$rel" in
+            "") rel=$(curl -s -X POST "${auth[@]}" "https://api.github.com/repos/$REPO/releases" \
+                  -d "$(jq -nc --arg t "v$v" --arg n "gen v$v" --arg sha "$GITHUB_SHA" \
+                    '{tag_name:$t,name:$n,target_commitish:$sha,draft:true}')" | jq -r '.id // empty')
+                [ -n "$rel" ] || { echo "::error::could not open the draft release"; exit 1; } ;;
+            *" true") rel=${rel% true} ;;
+            *" false") echo "::error::v$v is already published: a version is never shipped twice"; exit 1 ;;
+          esac
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "release=$rel" >> "$GITHUB_OUTPUT"
+          echo "release v$v from $GITHUB_REF_NAME — draft $rel"
+
+  build:
+    name: ${{ matrix.target.id }}
+    needs: version
+    runs-on: [linux-amd64]
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - { id: linux-amd64,   rust: x86_64-unknown-linux-musl }
+          - { id: linux-arm64,   rust: aarch64-unknown-linux-musl }
+          - { id: darwin-amd64,  rust: x86_64-apple-darwin,  apple: true }
+          - { id: darwin-arm64,  rust: aarch64-apple-darwin, apple: true }
+          - { id: windows-amd64, rust: x86_64-pc-windows-msvc, msvc: true }
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+      RUSTFLAGS: -C debuginfo=0 -C strip=symbols
+      CARGO_BUILD_JOBS: "2"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain deps
+        run: |
+          set -euo pipefail
+          missing=""
+          for t in cc make perl curl jq tar xz sha256sum; do command -v "$t" >/dev/null || missing="$missing $t"; done
+          [ -z "$missing" ] || { echo "::error::the runner lacks:$missing"; exit 1; }
+          echo "the toolchain is here"
+      - name: Rust (pinned by rust-toolchain.toml)
+        run: |
+          set -euo pipefail
+          command -v rustup >/dev/null || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none; }
+          export PATH="$HOME/.cargo/bin:$PATH"; echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          CH=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$CH" --profile minimal
+          rustup target add --toolchain "$CH" ${{ matrix.target.rust }}
+      - name: sccache, and the org's cache tool
+        # sccache keys an object by the hash of what went into it, never by
+        # mtime, so a fresh checkout hits wherever the bytes did not move. An
+        # accelerator, not a dependency: a download that fails or does not match
+        # its pin leaves RUSTC_WRAPPER unset and the build runs cold.
+        run: |
+          set +e   # nothing in this step may fail the build
+          set -uo pipefail
+          case "$(uname -m)" in
+            x86_64) arch=x86_64; want=$SCCACHE_SHA256_X86_64 ;;
+            aarch64) arch=aarch64; want=$SCCACHE_SHA256_AARCH64 ;;
+            *) echo "::notice::no sccache is pinned for $(uname -m), so this build runs cold"; exit 0 ;;
+          esac
+          n="sccache-v${SCCACHE_VERSION}-${arch}-unknown-linux-musl"
+          d="$RUNNER_TEMP/sccache-bin"; mkdir -p "$d"
+          curl -fsSL -m 120 "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/$n.tar.gz" -o "$d/s.tgz" \
+            || { echo "::notice::sccache did not download, so this build runs cold"; exit 0; }
+          echo "$want  $d/s.tgz" | sha256sum -c --quiet - \
+            || { echo "::warning::$n.tar.gz does not match its pinned sha256; it is not run, and this build runs cold"; exit 0; }
+          if ! { tar -xzf "$d/s.tgz" -C "$d" --strip-components=1 "$n/sccache" && "$d/sccache" --version; }; then
+            echo "::notice::sccache did not unpack, so this build runs cold"; exit 0
+          fi
+          {
+            echo "RUSTC_WRAPPER=$d/sccache"
+            echo "SCCACHE_DIR=$RUNNER_TEMP/sccache"
+            echo "SCCACHE_CACHE_SIZE=5G"
+            echo "SCCACHE_IDLE_TIMEOUT=0"
+          } >> "$GITHUB_ENV"
+          echo "$d" >> "$GITHUB_PATH"
+          if curl -fsSL -m 60 "https://raw.githubusercontent.com/hanzoai/ci/$CI_SHA/bin/cache" -o "$RUNNER_TEMP/cache"; then
+            chmod +x "$RUNNER_TEMP/cache"
+          else
+            echo "::notice::hanzoai/ci@$CI_SHA bin/cache did not download, so nothing is carried between runs"
+          fi
+      - name: Restore the Rust cache (this org's store)
+        # The name is what an archive is only valid for: the compiler, sccache's
+        # own version, and the target. The key is what decides its contents:
+        # every tracked file that goes into the binary and every flag and
+        # cross-toolchain pin in the environment, which sccache hashes too.
+        #
+        # The IAM token is minted here and handed to bin/cache alone, never to
+        # GITHUB_ENV: the Build step runs every crate's build script and proc
+        # macro, and none of them needs this org's identity.
+        id: rustcache
+        if: env.RUSTC_WRAPPER != ''
+        env:
+          KMS_CLIENT_ID: ${{ secrets.KMS_CLIENT_ID }}
+          KMS_CLIENT_SECRET: ${{ secrets.KMS_CLIENT_SECRET }}
+          TARGET: ${{ matrix.target.rust }}
+        run: |
+          set +e   # nothing in this step may fail the build
+          set -uo pipefail
+          [ -x "$RUNNER_TEMP/cache" ] || { echo "::notice::no bin/cache, so this build starts cold"; exit 0; }
+          name="$({ rustc -vV; sccache --version; } | sha256sum | cut -c1-16)-$TARGET"
+          key=$({ git ls-tree -r HEAD -- Cargo.toml Cargo.lock rust-toolchain.toml src assets
+                  env | grep -E '^(RUSTFLAGS|CARGO_[A-Z0-9_]+|ZIG[A-Z0-9_]*|LLVM_[A-Z0-9_]+|XWIN_[A-Z0-9_]+|MACOS_SDK_[A-Z0-9_]+)=' | sort
+                } | sha256sum | cut -c1-32)
+          echo "name=$name" >> "$GITHUB_OUTPUT"; echo "key=$key" >> "$GITHUB_OUTPUT"
+          T=$(printf '{"clientId":"%s","clientSecret":"%s"}' "${KMS_CLIENT_ID:-}" "${KMS_CLIENT_SECRET:-}" \
+            | curl -sS -m 30 "${KMS_ENDPOINT:-https://api.hanzo.ai}/v1/kms/auth/login" -H 'Content-Type: application/json' -d @- \
+            | jq -r '.accessToken // empty' 2>/dev/null)
+          if [ -n "$T" ]; then echo "::add-mask::$T"; else echo "::notice::KMS gave no IAM token, so the org store is not used"; fi
+          h=${CARGO_HOME:-$HOME/.cargo}
+          HANZO_API_TOKEN=$T "$RUNNER_TEMP/cache" restore "$name" "$key" \
+            sccache="$SCCACHE_DIR" index="$h/registry/index" crates="$h/registry/cache" git="$h/git/db"
+          # What this build reads or writes from here on is its working set;
+          # everything older is pruned before the save.
+          touch "$RUNNER_TEMP/sccache.since"
+      - name: Zig (the cross-linker)
+        if: ${{ !matrix.target.msvc }}
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" -o zig.tar.xz \
+            || curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-x86_64-${ZIG_VERSION}.tar.xz" -o zig.tar.xz
+          echo "${ZIG_SHA256}  zig.tar.xz" | sha256sum -c -
+          mkdir -p "$HOME/zig" && tar -xf zig.tar.xz -C "$HOME/zig" --strip-components=1
+          echo "$HOME/zig" >> "$GITHUB_PATH"
+          cargo install cargo-zigbuild --version "${ZIGBUILD_VERSION}" --locked
+      - name: Vendor macOS SDK
+        if: ${{ matrix.target.apple }}
+        run: |
+          set -euo pipefail
+          curl -fsSL "${MACOS_SDK_URL}" -o macsdk.tar.xz
+          echo "${MACOS_SDK_SHA256}  macsdk.tar.xz" | sha256sum -c -
+          tar -xf macsdk.tar.xz -C "$HOME"
+          echo "SDKROOT=$HOME/MacOSX11.3.sdk" >> "$GITHUB_ENV"
+      - name: LLVM for windows-msvc
+        # clang-cl compiles the C the crates carry, lld-link links, llvm-lib
+        # archives: three names for two binaries of one LLVM release.
+        if: ${{ matrix.target.msvc }}
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VERSION}/LLVM-${LLVM_VERSION}-Linux-X64.tar.xz" -o llvm.tar.xz
+          echo "${LLVM_SHA256}  llvm.tar.xz" | sha256sum -c -
+          mkdir -p "$HOME/llvm"
+          tar -xJf llvm.tar.xz -C "$HOME/llvm" --strip-components=1 --wildcards \
+            '*/bin/clang' '*/bin/clang-[0-9]*' '*/bin/lld' '*/bin/llvm-ar' '*/lib/clang/*'
+          rm llvm.tar.xz
+          ln -sf clang "$HOME/llvm/bin/clang-cl"
+          ln -sf lld "$HOME/llvm/bin/lld-link"
+          ln -sf llvm-ar "$HOME/llvm/bin/llvm-lib"
+          echo "$HOME/llvm/bin" >> "$GITHUB_PATH"
+          "$HOME/llvm/bin/clang-cl" --version | head -1
+          cargo install cargo-xwin --version "${XWIN_CRATE_VERSION}" --locked
+      - name: Build
+        run: |
+          set -euo pipefail
+          # Hits, misses and why a call was not cacheable, on the log, whether or not the build passes.
+          trap '[ -z "${RUSTC_WRAPPER:-}" ] || sccache --show-stats || true' EXIT
+          case "${{ matrix.target.rust }}" in
+            *apple-darwin|*linux-musl) cargo zigbuild --release --locked --target ${{ matrix.target.rust }} --bin gen ;;
+            *windows-msvc)             cargo xwin build --release --locked --target ${{ matrix.target.rust }} --bin gen ;;
+          esac
+      - name: Save the Rust cache (this org's store)
+        # After a green build, so what is saved is what a passing build
+        # compiled. bin/cache writes only from main or a tag, and only a key the
+        # store does not hold yet. Whatever this build neither read nor wrote is
+        # pruned first, so an archive is one build's working set.
+        if: steps.rustcache.outputs.key != '' && steps.rustcache.outputs.hit != 'exact'
+        env:
+          KMS_CLIENT_ID: ${{ secrets.KMS_CLIENT_ID }}
+          KMS_CLIENT_SECRET: ${{ secrets.KMS_CLIENT_SECRET }}
+          NAME: ${{ steps.rustcache.outputs.name }}
+          KEY: ${{ steps.rustcache.outputs.key }}
+        run: |
+          set +e   # nothing in this step may fail the build
+          set -uo pipefail
+          sccache --stop-server >/dev/null 2>&1 || true
+          find "$SCCACHE_DIR" -type f ! -newer "$RUNNER_TEMP/sccache.since" -delete 2>/dev/null
+          h=${CARGO_HOME:-$HOME/.cargo}
+          for c in "$h"/registry/cache/*/; do
+            i=$(basename "$c")
+            for f in "$c"*.crate; do [ -d "$h/registry/src/$i/$(basename "$f" .crate)" ] || rm -f "$f"; done
+          done
+          T=$(printf '{"clientId":"%s","clientSecret":"%s"}' "${KMS_CLIENT_ID:-}" "${KMS_CLIENT_SECRET:-}" \
+            | curl -sS -m 30 "${KMS_ENDPOINT:-https://api.hanzo.ai}/v1/kms/auth/login" -H 'Content-Type: application/json' -d @- \
+            | jq -r '.accessToken // empty' 2>/dev/null)
+          if [ -n "$T" ]; then echo "::add-mask::$T"; else echo "::notice::KMS gave no IAM token, so the org store is not used"; fi
+          HANZO_API_TOKEN=$T "$RUNNER_TEMP/cache" save "$NAME" "$KEY" \
+            sccache="$SCCACHE_DIR" index="$h/registry/index" crates="$h/registry/cache" git="$h/git/db"
+      - name: Package
+        # One archive per platform, named and shaped as hanzo.sh installs it:
+        # gen-<os>-<arch>.tar.gz unpacks to a single `gen` (`gen.exe`).
+        run: |
+          set -euo pipefail
+          t=${{ matrix.target.rust }}; short=${{ matrix.target.id }}
+          bin=gen; [ "$short" = windows-amd64 ] && bin=gen.exe
+          test -f "target/$t/release/$bin"
+          mkdir -p dist
+          tar -C "target/$t/release" -czf "dist/gen-$short.tar.gz" "$bin"
+          (cd dist && sha256sum "gen-$short.tar.gz" > "gen-$short.tar.gz.sha256")
+          ls -la dist
+      - name: Upload into the draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          REL: ${{ needs.version.outputs.release }}
+        run: |
+          set -euo pipefail
+          auth=(-H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json")
+          for f in dist/*; do
+            n=$(basename "$f")
+            old=$(curl -s "${auth[@]}" "https://api.github.com/repos/$REPO/releases/$REL/assets" | jq -r --arg n "$n" '.[]|select(.name==$n)|.id')
+            for id in $old; do curl -s -X DELETE "${auth[@]}" "https://api.github.com/repos/$REPO/releases/assets/$id" >/dev/null; done
+            code=$(curl -s -o /tmp/up.json -w '%{http_code}' -X POST "${auth[@]}" -H 'Content-Type: application/octet-stream' \
+              --data-binary @"$f" "https://uploads.github.com/repos/$REPO/releases/$REL/assets?name=$n")
+            [ "$code" = 201 ] || { echo "::error::upload $n failed ($code)"; cat /tmp/up.json; exit 1; }
+            echo "uploaded $n"
+          done
+
+  publish:
+    needs: [version, build]
+    runs-on: [linux-amd64]
+    timeout-minutes: 30
+    env:
+      V: ${{ needs.version.outputs.version }}
+      REL: ${{ needs.version.outputs.release }}
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Every asset is present, then the release is real
+        run: |
+          set -euo pipefail
+          auth=(-H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json")
+          mkdir -p dist
+          curl -s "${auth[@]}" "https://api.github.com/repos/$REPO/releases/$REL/assets?per_page=100" > /tmp/assets.json
+          n=$(jq length /tmp/assets.json)
+          [ "$n" -eq 10 ] || { echo "::error::draft holds $n assets, want 10 — a target is missing"; jq -r '.[].name' /tmp/assets.json; exit 1; }
+          # Bytes need octet-stream ALONE: the vnd.github Accept beside it makes
+          # GitHub answer with the asset's metadata instead of its bytes.
+          jq -r '.[] | "\(.id) \(.name)"' /tmp/assets.json | while read -r id name; do
+            curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/octet-stream" \
+              "https://api.github.com/repos/$REPO/releases/assets/$id" -o "dist/$name"
+          done
+          (cd dist && for s in *.sha256; do sha256sum -c "$s" >/dev/null; done)
+          echo "10 assets present and checksum-clean"
+          # The release runs what it ships: the linux binary is native to this
+          # runner, so it answers for the matrix that the artifacts are programs.
+          x=$(mktemp -d); tar -xzf dist/gen-linux-amd64.tar.gz -C "$x"
+          "$x/gen" --version | grep -qF "$V" || { echo "::error::the shipped binary does not say $V"; "$x/gen" --version; exit 1; }
+          "$x/gen" --help >/dev/null
+          echo "smoked: $("$x/gen" --version)"
+          curl -s -X PATCH "${auth[@]}" "https://api.github.com/repos/$REPO/releases/$REL" \
+            -d '{"draft":false}' | jq -r '"published: " + .html_url'

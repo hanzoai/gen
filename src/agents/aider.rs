@@ -38,7 +38,7 @@ fn build(r: &mut Run) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::super::test::*;
-    use crate::commands::code::backend::Mode;
+    use crate::backend::Mode;
 
     #[test]
     fn aider_takes_the_gateway_as_an_openai_base_and_an_openai_model() {

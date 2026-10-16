@@ -132,7 +132,7 @@ pub fn rows(entries: &[Entry]) -> Vec<(String, String)> {
     for (m, (n, i, o, ms)) in by_model {
         let mut line = format!("{n} {} handed to {m}", plural(n, "call"));
         if i + o > 0 {
-            line.push_str(&format!(" · in {} · out {}", crate::commands::savings::int(i), crate::commands::savings::int(o)));
+            line.push_str(&format!(" · in {} · out {}", crate::savings::int(i), crate::savings::int(o)));
         }
         line.push_str(&format!(" · {} each", seconds(ms / n.max(1))));
         out.push((String::new(), line));

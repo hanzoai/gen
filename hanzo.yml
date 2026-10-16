@@ -1,0 +1,29 @@
+# hanzoai/gen — the `gen` binary, and the `hanzo-gen` library `hanzo dev` runs.
+#
+# Gate only: no image, nothing to deploy. The release — five per-platform
+# binaries on a GitHub release, named as hanzo.sh installs them — is
+# .github/workflows/release.yml, from a tag set by hand.
+#
+# --locked so Cargo.lock is a fact rather than a suggestion. Rust comes from
+# rustup when the runner has none; rust-toolchain.toml names the version.
+test:
+  - name: build
+    run: |
+      set -euo pipefail
+      command -v cargo >/dev/null 2>&1 || curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+      export PATH="$HOME/.cargo/bin:$PATH"
+      cargo build --locked
+      ./target/debug/gen --version
+      ./target/debug/gen --help >/dev/null
+
+  - name: test
+    run: |
+      set -euo pipefail
+      export PATH="$HOME/.cargo/bin:$PATH"
+      cargo test --locked
+
+  - name: clippy
+    run: |
+      set -euo pipefail
+      export PATH="$HOME/.cargo/bin:$PATH"
+      cargo clippy --locked --all-targets -- -D warnings

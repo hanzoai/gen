@@ -146,7 +146,7 @@ pub fn choose<'a>(
 
 /// The same spellings `hanzo auth login` accepts (`chatgpt` → codex, `agent` → cursor).
 fn native_kind(name: &str) -> Option<BackendKind> {
-    let canonical = crate::iam::native::find(name)
+    let canonical = crate::native::find(name)
         .map(|agent| agent.backend)
         .or_else(|| BackendKind::parse(name).ok().map(|k| k.as_str()))?;
     let kind = BackendKind::parse(canonical).ok()?;

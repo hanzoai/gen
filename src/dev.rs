@@ -159,16 +159,13 @@ impl Backend for Agent {
                     args.push(cfg_string("model_providers.hanzocode.base_url", &base));
                     args.push("-c".into());
                     args.push(cfg_string("model_providers.hanzocode.wire_api", "responses"));
-                    if is_session_token(token) {
+                    if let (true, Some((program, rest))) = (is_session_token(token), spec.refresh.split_first()) {
                         // A sign-in token ages out within the hour, so the agent asks
-                        // this CLI for it again rather than reading it once.
-                        let exe = std::env::current_exe()
-                            .map(|path| path.to_string_lossy().into_owned())
-                            .unwrap_or_else(|_| "hanzo".into());
+                        // the host for it again rather than reading it once.
                         args.push("-c".into());
-                        args.push(cfg_string("model_providers.hanzocode.auth.command", &exe));
+                        args.push(cfg_string("model_providers.hanzocode.auth.command", program));
                         args.push("-c".into());
-                        args.push(cfg_array("model_providers.hanzocode.auth.args", &["auth".into(), "token".into()]));
+                        args.push(cfg_array("model_providers.hanzocode.auth.args", rest));
                         args.push("-c".into());
                         args.push(format!("model_providers.hanzocode.auth.refresh_interval_ms={TOKEN_REFRESH_MS}"));
                     } else {
@@ -443,8 +440,8 @@ fn toml_string(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::code::backend::McpAttach;
-    use crate::commands::code::event::Kind;
+    use crate::backend::McpAttach;
+    use crate::event::Kind;
 
     fn spec(mode: Mode, api: &str) -> Spec {
         Spec {
@@ -461,6 +458,7 @@ mod tests {
             trust_project: false,
             resume: None,
             passthrough: vec![],
+            refresh: vec!["hanzo".into(), "auth".into(), "token".into()],
         }
     }
 
@@ -778,6 +776,7 @@ mod tests {
             context_window: 1_000_000,
         });
         let args = argv(&Agent::DEV.build(&s).unwrap());
+        assert!(args.iter().any(|a| a == r#"model_providers.hanzocode.auth.command="hanzo""#));
         assert!(args.iter().any(|a| a == r#"model_providers.hanzocode.auth.args=["auth","token"]"#));
         assert!(args.iter().any(|a| a == "model_providers.hanzocode.auth.refresh_interval_ms=600000"));
         assert!(!args.iter().any(|a| a.contains("model_providers.hanzocode.env_key")), "auth and env_key cannot both be set");

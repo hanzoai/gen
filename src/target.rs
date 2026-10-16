@@ -18,12 +18,12 @@ use anyhow::{Context, Result};
 use hanzo_client::{Http, Method, Request, Transport};
 use serde::Serialize;
 use serde_json::Value;
+use std::sync::Arc;
 use std::time::Duration;
 
 use super::context::{hostname, machine_id, Machine, Metrics, Spec, TargetRecord};
 use super::sample::Sampler;
-use crate::config::Config;
-use crate::iam::{paths, store};
+use crate::host::{Host, BRAND};
 
 #[derive(Clone)]
 pub struct TargetClient {
@@ -218,22 +218,21 @@ impl Drop for Beat {
 /// session sending an expired bearer — which `sync` swallows, because every
 /// failure here is best-effort by design. The machine goes offline while the
 /// process is still running and still serving, which is the exact symptom the
-/// heartbeat exists to prevent. `store::active_token` is the ONE accessor that
-/// refreshes, and it takes its own `Config` clone: the credential file is the
-/// shared state, not the struct, and its writes are already serialized under the
-/// credential lock.
-pub fn beat(cfg: &Config, api: &str, machine_id: &str, host: &str) -> Beat {
-    beat_every(BEAT, Creds::Refreshing(Box::new(cfg.clone())), cfg.org.clone(), api, machine_id, host)
+/// heartbeat exists to prevent. [`Host::account`] is the ONE accessor, and it
+/// refreshes: the credential is the host's shared state, not a value held here.
+pub fn beat(host: Arc<dyn Host>, api: &str, machine_id: &str, name: &str) -> Beat {
+    let org = host.profile().org;
+    beat_every(BEAT, Creds::Refreshing(host), org, api, machine_id, name)
 }
 
 /// Where a beat gets its bearer.
 ///
-/// Production has exactly ONE source — `store::active_token`, the single accessor
-/// that refreshes — and the test variant is compiled only under `cfg(test)`, so
-/// there is no second credential path to drift. It exists because the loop is what
-/// needs observing, and a unit test must not read the developer's real vault.
+/// Production has exactly ONE source — the host's account, which refreshes — and
+/// the test variant is compiled only under `cfg(test)`, so there is no second
+/// credential path to drift. It exists because the loop is what needs observing,
+/// and a unit test must not read the developer's real credential.
 enum Creds {
-    Refreshing(Box<Config>),
+    Refreshing(Arc<dyn Host>),
     #[cfg(test)]
     Fixed(String),
 }
@@ -241,11 +240,7 @@ enum Creds {
 impl Creds {
     async fn bearer(&mut self) -> Option<String> {
         match self {
-            Creds::Refreshing(cfg) => store::active_token(cfg, paths::DEFAULT_BRAND)
-                .await
-                .ok()
-                .flatten()
-                .map(|(_, t)| t.access_token),
+            Creds::Refreshing(host) => host.account(BRAND).await.ok().flatten().map(|a| a.token),
             #[cfg(test)]
             Creds::Fixed(t) => Some(t.clone()),
         }
@@ -262,12 +257,12 @@ impl Creds {
 /// sampler, nothing else. Foreground until interrupted, so a service manager owns
 /// the lifetime; dropping the guard aborts it and the row goes stale on its own,
 /// which is how cloud decides a machine left.
-pub async fn present(cfg: &Config) -> Result<()> {
-    let api = crate::commands::network::active(cfg).api;
-    let host = hostname();
-    let _beat = beat(cfg, api.trim_end_matches('/'), &machine_id(), &host);
+pub async fn present(host: Arc<dyn Host>) -> Result<()> {
+    let api = host.profile().api;
+    let name = hostname();
+    let _beat = beat(host, api.trim_end_matches('/'), &machine_id(), &name);
     println!(
-        "● {host} present in the fleet — one beat every {}s, no shell, no session. Ctrl-C leaves.",
+        "● {name} present in the fleet — one beat every {}s, no shell, no session. Ctrl-C leaves.",
         BEAT.as_secs()
     );
     tokio::signal::ctrl_c().await.context("waiting for Ctrl-C")?;
@@ -302,8 +297,8 @@ fn beat_every(period: Duration, mut creds: Creds, org: Option<String>, api: &str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::code::context::Gpu;
-    use crate::commands::code::testmock::MockCloud;
+    use crate::context::Gpu;
+    use crate::testmock::MockCloud;
 
     fn gpu_machine() -> Machine {
         Machine {

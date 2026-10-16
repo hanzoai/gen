@@ -25,8 +25,8 @@ use std::path::{Path, PathBuf};
 use super::backend::Route;
 use super::home;
 
-const DRACULA: &str = include_str!("../../../assets/themes/claude/dracula.json");
-const ALUCARD: &str = include_str!("../../../assets/themes/claude/alucard.json");
+const DRACULA: &str = include_str!("../assets/themes/claude/dracula.json");
+const ALUCARD: &str = include_str!("../assets/themes/claude/alucard.json");
 
 /// Restores the previously-selected Claude theme when dropped (wrapper hygiene).
 /// Holding `_guard` across the backend launch restores on ANY exit — normal,

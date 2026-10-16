@@ -412,7 +412,7 @@ fn line(kit: &Result<Kit, Miss>, synced: &io::Result<Synced>, remote: Option<&Re
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::code::testmock::MockCloud;
+    use crate::testmock::MockCloud;
     use serde_json::json;
 
     fn wire(v: serde_json::Value) -> Kit {

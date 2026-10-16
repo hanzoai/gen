@@ -128,7 +128,7 @@ pub fn transcript(route: &Route, cwd: &Path, session: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::code::backend::Routing;
+    use crate::backend::Routing;
 
     fn gateway() -> Route {
         Route::Via(Routing::Gateway {

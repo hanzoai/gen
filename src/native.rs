@@ -151,7 +151,7 @@ mod tests {
     fn each_login_runs_the_binary_its_sessions_run() {
         for agent in AGENTS {
             // Claude and Codex have session drivers of their own, outside the table.
-            if let Some(coding) = crate::commands::code::agents::find(agent.backend) {
+            if let Some(coding) = crate::agents::find(agent.backend) {
                 assert_eq!(agent.programs, coding.programs, "{}", agent.backend);
             }
             assert!(!agent.programs.contains(&"agent"), "{} runs a bare `agent`", agent.backend);

@@ -7,7 +7,7 @@ use anyhow::Result;
 use serde_json::Value;
 
 use super::{shell_word, Agent, Reader, Run, Toolset, Upgrade};
-use crate::commands::code::event::{Mapped, Usage};
+use crate::event::{Mapped, Usage};
 
 pub const AGENT: Agent = Agent {
     name: "goose",
@@ -95,7 +95,7 @@ fn read(_: &mut Reader, line: &str) -> Vec<Mapped> {
 #[cfg(test)]
 mod tests {
     use super::super::test::*;
-    use crate::commands::code::backend::{Mode, Route};
+    use crate::backend::{Mode, Route};
 
     #[test]
     fn goose_takes_the_toolset_as_an_extension_and_the_gateway_as_its_openai_provider() {

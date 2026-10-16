@@ -5,7 +5,7 @@ use anyhow::Result;
 use serde_json::{json, Value};
 
 use super::{Agent, Reader, Run, Toolset, Upgrade};
-use crate::commands::code::event::{Mapped, Usage};
+use crate::event::{Mapped, Usage};
 
 pub const AGENT: Agent = Agent {
     name: "copilot",
@@ -72,7 +72,7 @@ fn read(_: &mut Reader, line: &str) -> Vec<Mapped> {
 #[cfg(test)]
 mod tests {
     use super::super::test::*;
-    use crate::commands::code::backend::{Mode, Route};
+    use crate::backend::{Mode, Route};
 
     #[test]
     fn copilot_takes_the_toolset_as_an_additional_config_file() {

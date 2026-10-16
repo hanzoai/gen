@@ -173,7 +173,7 @@ impl SessionClient {
     /// was missed. Org scoping is the SAME check that guards the session itself —
     /// a session belonging to another org is a clean 404 here, never a page of
     /// someone else's commands.
-    pub async fn drain_control(&self, id: &str, after: i64) -> Result<super::control::Page> {
+    pub(crate) async fn drain_control(&self, id: &str, after: i64) -> Result<super::control::Page> {
         let path = format!("/v1/agents/sessions/{id}/control?after={after}");
         let v = self.send(Method::GET, &path, None).await?;
         serde_json::from_value(v).context("parsing control page")
@@ -200,7 +200,7 @@ impl SessionClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::code::testmock::MockCloud;
+    use crate::testmock::MockCloud;
 
     #[tokio::test]
     async fn register_sends_bearer_and_agent_and_never_sends_org() {

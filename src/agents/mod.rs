@@ -375,6 +375,7 @@ pub(crate) mod test {
             trust_project: false,
             resume: None,
             passthrough: vec![],
+            refresh: vec!["hanzo".into(), "auth".into(), "token".into()],
         }
     }
 

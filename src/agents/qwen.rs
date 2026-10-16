@@ -44,7 +44,7 @@ fn build(r: &mut Run) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::super::test::*;
-    use crate::commands::code::backend::Mode;
+    use crate::backend::Mode;
     use serde_json::Value;
 
     #[test]
