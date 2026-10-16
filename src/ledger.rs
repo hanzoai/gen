@@ -10,6 +10,7 @@
 //! The session summary reads the file back ([`rows`]) to say what was handed to
 //! Enso, Kai or any other model, beside the agent's own account.
 
+use crate::root::Root;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -30,9 +31,9 @@ pub struct Entry {
     pub output: Option<u64>,
 }
 
-/// `~/.hanzo/sessions/<id>.jsonl`.
-pub fn path(id: &str) -> Option<PathBuf> {
-    Some(dirs::home_dir()?.join(".hanzo").join("sessions").join(format!("{id}.jsonl")))
+/// `~/.hanzo/sessions/<id>.jsonl` under `root`.
+pub fn path(root: &Root, id: &str) -> PathBuf {
+    root.hanzo().join("sessions").join(format!("{id}.jsonl"))
 }
 
 /// The entry for a `tools/call` named `tool` that took `ms`, from the server's reply.

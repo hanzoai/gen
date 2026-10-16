@@ -14,10 +14,11 @@ use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::backend::BackendKind;
+use crate::root::Root;
 
 /// One account the harness can run as.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -211,33 +212,28 @@ pub fn usage(dir: &Path) -> Vec<String> {
         .collect()
 }
 
-/// Record a native sign-in in the real `~/.hanzo` directory.
-pub fn connect_home(backend: &str) -> Result<()> {
-    connect(&home()?, backend)
+/// Record a native sign-in in `root`'s `~/.hanzo`.
+pub fn connect_home(root: &Root, backend: &str) -> Result<()> {
+    connect(&root.hanzo(), backend)
 }
 
 /// Check that a harness pin names a connected account, then record the account
 /// this session used. Returns the usage log so far. A pin of `None` records
 /// without requiring a selection.
 pub fn track(
+    root: &Root,
     identities: &[(&str, &str)],
     active: Option<&str>,
     pin: Option<&str>,
     used: &str,
 ) -> Result<Vec<String>> {
-    let dir = home()?;
+    let dir = root.hanzo();
     let accounts = inventory(identities, &connected(&dir));
     if pin.is_some() {
         choose(&accounts, pin, active)?;
     }
     record(&dir, used)?;
     Ok(usage(&dir))
-}
-
-fn home() -> Result<PathBuf> {
-    super::settings::Settings::path()
-        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-        .ok_or_else(|| anyhow::anyhow!("no home directory — harness accounts are not available"))
 }
 
 fn read_native(path: &Path) -> NativeList {

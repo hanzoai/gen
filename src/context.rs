@@ -9,6 +9,7 @@
 //! ($HOSTNAME/$COMPUTERNAME when the `hostname` command is absent — a machine name,
 //! never a secret). Git remote URLs are scrubbed of embedded credentials.
 
+use crate::root::Root;
 use anyhow::{Context, Result};
 use crate::private;
 use serde::{Deserialize, Serialize};
@@ -63,10 +64,10 @@ pub struct Snapshot {
 impl Snapshot {
     /// Capture the snapshot for `cwd` running `backend` (`backend_version`
     /// best-effort). Reads only explicit sources — never the environment.
-    pub fn capture(cwd: &Path, backend: &str, backend_version: Option<String>) -> Snapshot {
+    pub fn capture(root: &Root, cwd: &Path, backend: &str, backend_version: Option<String>) -> Snapshot {
         Snapshot {
-            machine_id: machine_id(),
-            host: hostname(),
+            machine_id: machine_id(root),
+            host: hostname(root),
             os: std::env::consts::OS.to_string(),
             arch: std::env::consts::ARCH.to_string(),
             cwd: cwd.display().to_string(),
@@ -655,8 +656,8 @@ fn finite(x: f64) -> f64 {
 /// cached under the Hanzo data dir. We deliberately do NOT read system machine
 /// identifiers (which can be sensitive) — a per-install random id is enough to
 /// group a machine's sessions and to gate same-machine resume.
-pub fn machine_id() -> String {
-    let path = data_dir().join("machine-id");
+pub fn machine_id(root: &Root) -> String {
+    let path = root.data().join("machine-id");
     if let Ok(existing) = std::fs::read_to_string(&path) {
         let id = existing.trim().to_string();
         if !id.is_empty() {
@@ -683,7 +684,7 @@ pub fn machine_id() -> String {
 /// "unknown machine" bucket that no amount of looking can take apart. So the
 /// last resort is the stable per-install [`machine_id`] — an opaque name is a
 /// far weaker fact than `evo`, but it is still a fact, and it groups.
-pub fn hostname() -> String {
+pub fn hostname(root: &Root) -> String {
     Command::new("hostname")
         .output()
         .ok()
@@ -691,7 +692,7 @@ pub fn hostname() -> String {
         .and_then(|o| named(&String::from_utf8_lossy(&o.stdout)))
         .or_else(|| std::env::var("HOSTNAME").ok().and_then(|h| named(&h)))
         .or_else(|| std::env::var("COMPUTERNAME").ok().and_then(|h| named(&h)))
-        .unwrap_or_else(machine_id)
+        .unwrap_or_else(|| machine_id(root))
 }
 
 /// A candidate that actually NAMES something, trimmed — or nothing. Every source
@@ -799,8 +800,8 @@ impl ResumeRecord {
         })
     }
 
-    pub fn save(&self) -> Result<()> {
-        let path = record_path(&self.cloud_session_id);
+    pub fn save(&self, root: &Root) -> Result<()> {
+        let path = record_path(root, &self.cloud_session_id);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).context("creating resume store dir")?;
         }
@@ -808,8 +809,8 @@ impl ResumeRecord {
         private::write(&path, &json).context("writing resume record")
     }
 
-    pub fn load(cloud_session_id: &str) -> Result<Option<ResumeRecord>> {
-        let path = record_path(cloud_session_id);
+    pub fn load(root: &Root, cloud_session_id: &str) -> Result<Option<ResumeRecord>> {
+        let path = record_path(root, cloud_session_id);
         match std::fs::read(&path) {
             Ok(bytes) => Ok(Some(
                 serde_json::from_slice(&bytes).context("parsing resume record")?,
@@ -837,8 +838,8 @@ pub struct TargetRecord {
 }
 
 impl TargetRecord {
-    pub fn load(machine_id: &str) -> Result<Option<TargetRecord>> {
-        match std::fs::read(target_path(machine_id)) {
+    pub fn load(root: &Root, machine_id: &str) -> Result<Option<TargetRecord>> {
+        match std::fs::read(target_path(root, machine_id)) {
             Ok(bytes) => Ok(Some(
                 serde_json::from_slice(&bytes).context("parsing target record")?,
             )),
@@ -847,8 +848,8 @@ impl TargetRecord {
         }
     }
 
-    pub fn save(&self) -> Result<()> {
-        let path = target_path(&self.machine_id);
+    pub fn save(&self, root: &Root) -> Result<()> {
+        let path = target_path(root, &self.machine_id);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).context("creating target store dir")?;
         }
@@ -862,27 +863,19 @@ fn safe_name(id: &str) -> String {
     id.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-').collect()
 }
 
-fn record_path(cloud_session_id: &str) -> PathBuf {
+fn record_path(root: &Root, cloud_session_id: &str) -> PathBuf {
     // The id is cloud-minted (`sess_<hex>`); guard the filename regardless.
-    data_dir().join("code").join("sessions").join(format!("{}.json", safe_name(cloud_session_id)))
+    root.data().join("code").join("sessions").join(format!("{}.json", safe_name(cloud_session_id)))
 }
 
-fn target_path(machine_id: &str) -> PathBuf {
-    data_dir().join("code").join("targets").join(format!("{}.json", safe_name(machine_id)))
+fn target_path(root: &Root, machine_id: &str) -> PathBuf {
+    root.data().join("code").join("targets").join(format!("{}.json", safe_name(machine_id)))
 }
 
 /// The target-record path, exposed for test cleanup only.
 #[cfg(test)]
-pub(crate) fn target_path_for_test(machine_id: &str) -> PathBuf {
-    target_path(machine_id)
-}
-
-/// The Hanzo per-user data dir (`~/.local/share/hanzo` on Linux, the platform
-/// equivalent elsewhere). Non-secret runtime state only.
-fn data_dir() -> PathBuf {
-    dirs::data_local_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("hanzo")
+pub(crate) fn target_path_for_test(root: &Root, machine_id: &str) -> PathBuf {
+    target_path(root, machine_id)
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -982,6 +975,7 @@ mod tests {
     #[test]
     fn resume_record_roundtrips_through_the_local_store() {
         let id = format!("sess_test_{}", std::process::id());
+        let root = crate::root::scratch();
         let rec = ResumeRecord {
             cloud_session_id: id.clone(),
             identity: "hanzo/z".into(),
@@ -989,15 +983,15 @@ mod tests {
             backend_session_id: "claude-sid".into(),
             cwd: "/tmp".into(),
             api: "https://api.hanzo.ai".into(),
-            machine_id: machine_id(),
+            machine_id: machine_id(&root),
             repo: Repo::default(),
             transcript_path: Some("/tmp/x.jsonl".into()),
             created_at: 123,
         };
-        rec.save().unwrap();
-        let loaded = ResumeRecord::load(&id).unwrap().unwrap();
+        rec.save(&root).unwrap();
+        let loaded = ResumeRecord::load(&root, &id).unwrap().unwrap();
         assert_eq!(loaded, rec);
-        let _ = std::fs::remove_file(record_path(&id));
+        let _ = std::fs::remove_file(record_path(&root, &id));
     }
 
     // ---- naming the machine ----
@@ -1020,10 +1014,11 @@ mod tests {
     /// unreachable, so the invariant is asserted on the real function.
     #[test]
     fn a_machine_always_names_itself() {
-        let h = hostname();
+        let root = crate::root::scratch();
+        let h = hostname(&root);
         assert!(!h.trim().is_empty(), "a session with no host cannot be grouped");
         assert_eq!(h, h.trim(), "a padded host is a different string every time");
-        assert!(!Snapshot::capture(Path::new("/"), "claude", None).host.is_empty());
+        assert!(!Snapshot::capture(&root, Path::new("/"), "claude", None).host.is_empty());
     }
 
     // ---- machine capability plane ----
@@ -1269,10 +1264,11 @@ Pages wired down:                     80000.";
             api: "https://api.hanzo.ai".into(),
             updated_at: 42,
         };
-        rec.save().unwrap();
-        assert_eq!(TargetRecord::load(&machine).unwrap().unwrap(), rec);
-        let _ = std::fs::remove_file(target_path(&machine));
-        assert!(TargetRecord::load(&machine).unwrap().is_none());
+        let root = crate::root::scratch();
+        rec.save(&root).unwrap();
+        assert_eq!(TargetRecord::load(&root, &machine).unwrap().unwrap(), rec);
+        let _ = std::fs::remove_file(target_path(&root, &machine));
+        assert!(TargetRecord::load(&root, &machine).unwrap().is_none());
     }
 
     // ---- red-hardening: bound the probe, saturate the math, coerce non-finite ----

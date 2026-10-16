@@ -151,7 +151,7 @@ impl Args {
     /// Map the parsed args to the code runner's [`Options`]. The `no_*` flags become
     /// their positive sense here, and the backend is resolved here — both in exactly
     /// ONE place, shared by `hanzo dev`, a bare `hanzo …` and `hanzo desktop`.
-    pub fn into_options(self) -> Result<crate::Options> {
+    pub fn into_options(self, root: crate::Root) -> Result<crate::Options> {
         let is_runc = self.no_sandbox
             || matches!(
                 self.runtime.as_deref().map(str::to_lowercase).as_deref(),
@@ -180,7 +180,7 @@ impl Args {
         // The reader's configured agent, if any. Loaded best-effort — the coding
         // agent must start even when `$HOME` is odd — so an unreadable settings
         // file leaves this None and the built-in default stands.
-        let configured = crate::configured_agent();
+        let configured = crate::configured_agent(&root);
         let (backend, task) = backend::select(backend::Selection {
             positional: self.positional,
             tail: self.tail,
@@ -202,6 +202,7 @@ impl Args {
             model: self.model,
             task,
             passthrough: self.passthrough,
+            root,
         })
     }
 }
@@ -251,7 +252,7 @@ mod tests {
     }
 
     fn backend(argv: &[&str]) -> BackendKind {
-        parse(argv).unwrap().into_options().unwrap().backend
+        parse(argv).unwrap().into_options(crate::root::scratch()).unwrap().backend
     }
 
     /// `gen` is `hanzo dev`: our own agent by default, the tool a flag.
@@ -262,7 +263,7 @@ mod tests {
         assert_eq!(backend(&["gen", "--claude"]), BackendKind::Claude);
         assert_eq!(backend(&["gen", "--codex", "fix it"]), BackendKind::Codex);
         assert_eq!(backend(&["gen", "--backend", "cursor"]).as_str(), "cursor");
-        let o = parse(&["gen", "fix the bug"]).unwrap().into_options().unwrap();
+        let o = parse(&["gen", "fix the bug"]).unwrap().into_options(crate::root::scratch()).unwrap();
         assert_eq!(o.task.as_deref(), Some("fix the bug"));
         let err = parse(&["gen", "claude"]).err().expect("a tool named as a word is refused").to_string();
         assert!(err.contains("`gen --claude`"), "{err}");
@@ -275,7 +276,7 @@ mod tests {
             assert_eq!(backend(&["gen", &format!("--{name}")]).as_str(), name, "--{name}");
         }
         // After `--` an argument is the backend's, whatever it spells.
-        let o = parse(&["gen", "--claude", "--", "--gemini"]).unwrap().into_options().unwrap();
+        let o = parse(&["gen", "--claude", "--", "--gemini"]).unwrap().into_options(crate::root::scratch()).unwrap();
         assert_eq!(o.backend, BackendKind::Claude);
         assert_eq!(o.passthrough, ["--gemini"]);
     }

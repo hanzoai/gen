@@ -35,6 +35,6 @@ async fn main() -> Result<()> {
     }
     let argv = hanzo_gen::args::expand(&Cli::command(), argv);
     let cli = Cli::from_arg_matches(&Cli::command().get_matches_from(argv))?;
-    let opts = cli.args.dev("gen")?.into_options()?;
-    hanzo_gen::run(Arc::new(hanzo_gen::host::Command::default()), opts).await
+    let opts = cli.args.dev("gen")?.into_options(hanzo_gen::Root::need()?)?;
+    hanzo_gen::run(Arc::new(hanzo_gen::host::Command::found().await), opts).await
 }

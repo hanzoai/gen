@@ -16,6 +16,7 @@ use super::claude::Claude;
 use super::dev::Agent;
 use super::event::Mapped;
 use super::agents::Session;
+use crate::root::Root;
 
 /// Which coding agent to wrap. Distinct products — never aliases of each
 /// other: a user who names one gets THAT agent, or a clear failure.
@@ -359,9 +360,11 @@ pub struct Spec {
     /// Extra args forwarded verbatim to the backend (never widened by us).
     pub passthrough: Vec<String>,
     /// The command that prints the signed-in account's access token, fresh
-    /// ([`crate::Profile::refresh`]): what an agent that outlives one sign-in
+    /// ([`crate::Host::refresh`]): what an agent that outlives one sign-in
     /// token runs for the next.
     pub refresh: Vec<String>,
+    /// Where this run keeps what it writes ([`Root`]).
+    pub root: Root,
 }
 
 impl Spec {
@@ -379,7 +382,16 @@ impl Spec {
 /// Claude `--mcp-config` file). Dropping `cleanup` deletes them.
 pub struct Launch {
     pub command: tokio::process::Command,
-    pub cleanup: Vec<tempfile::TempPath>,
+    pub cleanup: Scratch,
+}
+
+/// What a launch made for its one run, removed when the run ends: config files,
+/// and the homes of their own that agents are pointed at (so two sessions of one
+/// agent never read each other's project or ledger).
+#[derive(Default)]
+pub struct Scratch {
+    pub files: Vec<tempfile::TempPath>,
+    pub dirs: Vec<tempfile::TempDir>,
 }
 
 pub trait Backend {
@@ -387,7 +399,7 @@ pub trait Backend {
     fn label(&self) -> &'static str;
 
     /// Best-effort backend version string for the context snapshot.
-    fn version(&self) -> Option<String>;
+    fn version(&self, root: &Root) -> Option<String>;
 
     /// Build the invocation for `spec`. Sets program, args, env and cwd; the
     /// caller decides stdio (piped for headless, inherited for interactive).
@@ -404,6 +416,7 @@ pub trait Backend {
     /// the other home names a file that never exists.
     fn transcript_path(
         &self,
+        root: &Root,
         route: &Route,
         cwd: &Path,
         backend_session_id: &str,

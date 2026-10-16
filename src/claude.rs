@@ -31,6 +31,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use super::backend::{Approval, Backend, Launch, McpAttach, Mode, Remote, Route, Routing, Spec};
+use crate::root::Root;
 use super::event::{Mapped, Usage};
 use super::{home, tier};
 
@@ -41,14 +42,14 @@ impl Backend for Claude {
         "claude"
     }
 
-    fn version(&self) -> Option<String> {
+    fn version(&self, _: &Root) -> Option<String> {
         super::backend::backend_version("claude")
     }
 
     fn build(&self, spec: &Spec) -> Result<Launch> {
         let mut cmd = tokio::process::Command::new("claude");
         cmd.current_dir(&spec.cwd);
-        let mut cleanup = Vec::new();
+        let mut cleanup = super::backend::Scratch::default();
 
         // A ROUTED `hanzo dev --claude` is not the user's own Claude Code install: it
         // runs against its own config home, so their saved `/model` never becomes
@@ -57,7 +58,7 @@ impl Backend for Claude {
         // Claude's own home, because that is where the account it was promised
         // lives. Seeded by `run`; resolved here too because it is a pure function of
         // the route (see [`home::relocate`]).
-        if let Some(dir) = home::relocate(&spec.routing) {
+        if let Some(dir) = home::relocate(&spec.root, &spec.routing) {
             cmd.env("CLAUDE_CONFIG_DIR", dir);
         }
 
@@ -121,7 +122,7 @@ impl Backend for Claude {
                 .context("writing mcp-config")?;
             let path = file.into_temp_path();
             cmd.arg("--mcp-config").arg(&*path);
-            cleanup.push(path);
+            cleanup.files.push(path);
         }
         // The cloud server's bearer: in the env, which the document above NAMES.
         if let Some(remote) = spec.cloud() {
@@ -239,11 +240,11 @@ impl Backend for Claude {
         }
     }
 
-    fn transcript_path(&self, route: &Route, cwd: &Path, backend_session_id: &str) -> Option<PathBuf> {
+    fn transcript_path(&self, root: &Root, route: &Route, cwd: &Path, backend_session_id: &str) -> Option<PathBuf> {
         // Claude writes transcripts under `$CLAUDE_CONFIG_DIR/projects/`, so this
         // must read the SAME home the launch sets — otherwise the cloud pointer and
         // the interactive tail both name a file that never exists.
-        home::transcript(route, cwd, backend_session_id)
+        Some(home::transcript(root, route, cwd, backend_session_id))
     }
 }
 
@@ -398,6 +399,7 @@ mod tests {
             resume: None,
             passthrough: vec![],
             refresh: Vec::new(),
+            root: crate::root::scratch(),
         }
     }
 
@@ -437,7 +439,7 @@ mod tests {
         assert!(!args.iter().any(|a| a == "--permission-mode"));
         // MCP layered on; a temp config file exists and outlives the child.
         assert!(args.iter().any(|a| a == "--mcp-config"));
-        assert_eq!(l.cleanup.len(), 1);
+        assert_eq!(l.cleanup.files.len(), 1);
         // Token rides in env, NOT argv.
         let std = l.command.as_std();
         let env: std::collections::HashMap<_, _> = std
@@ -1043,7 +1045,7 @@ mod tests {
     fn transcript_path_follows_the_config_home_of_its_route() {
         let at = |r: &Route| {
             Claude
-                .transcript_path(r, &PathBuf::from("/home/z/proj"), "sid-1")
+                .transcript_path(&Root::at("/h"), r, &PathBuf::from("/home/z/proj"), "sid-1")
                 .unwrap()
                 .display()
                 .to_string()

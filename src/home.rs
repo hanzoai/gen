@@ -50,14 +50,15 @@ use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
 use super::backend::Route;
+use crate::root::Root;
 
 /// The `CLAUDE_CONFIG_DIR` to SET for `route` — `None` means DO NOT relocate, so
 /// the child keeps Claude's own home and the account that lives in it. Pure, so
 /// every reader (the launch env, the transcript pointer, the theme) agrees from
 /// the route alone without coordinating.
-pub fn relocate(route: &Route) -> Option<PathBuf> {
+pub fn relocate(root: &Root, route: &Route) -> Option<PathBuf> {
     match route {
-        Route::Via(_) => Some(dirs::home_dir()?.join(".hanzo").join("claude")),
+        Route::Via(_) => Some(root.hanzo().join("claude")),
         Route::Inherit | Route::FailClosed => None,
     }
 }
@@ -66,11 +67,8 @@ pub fn relocate(route: &Route) -> Option<PathBuf> {
 /// else Claude's own. This is the one every consumer of the resulting FILES wants
 /// (transcripts, the theme), as opposed to [`relocate`], which answers the
 /// narrower "must we set the env var".
-pub fn of(route: &Route) -> Option<PathBuf> {
-    match relocate(route) {
-        Some(d) => Some(d),
-        None => Some(dirs::home_dir()?.join(".claude")),
-    }
+pub fn of(root: &Root, route: &Route) -> PathBuf {
+    relocate(root, route).unwrap_or_else(|| root.home().join(".claude"))
 }
 
 /// Create the home and seed its first-run defaults, returning the directory.
@@ -79,8 +77,8 @@ pub fn of(route: &Route) -> Option<PathBuf> {
 /// exists to prevent. Best-effort otherwise: a write failure degrades to an
 /// unseeded home rather than blocking the session, exactly as a missing
 /// `~/.hanzo/settings.json` does.
-pub fn prepare(route: &Route) -> Option<PathBuf> {
-    let dir = relocate(route)?;
+pub fn prepare(root: &Root, route: &Route) -> Option<PathBuf> {
+    let dir = relocate(root, route)?;
     let _ = std::fs::create_dir_all(&dir);
     if let Ok(doc) = serde_json::to_string_pretty(&defaults()) {
         once(&dir.join("settings.json"), format!("{doc}\n").as_bytes());
@@ -115,14 +113,14 @@ pub(crate) fn defaults() -> Value {
 /// `<home>/projects/<cwd-with-separators-as-dashes>/<session-id>.jsonl`. It must
 /// read the same home the launch sets, or the cloud pointer and the interactive
 /// tail both name a file that never exists.
-pub fn transcript(route: &Route, cwd: &Path, session: &str) -> Option<PathBuf> {
+pub fn transcript(root: &Root, route: &Route, cwd: &Path, session: &str) -> PathBuf {
     let slug: String = cwd
         .display()
         .to_string()
         .chars()
         .map(|c| if c == '/' || c == '\\' { '-' } else { c })
         .collect();
-    Some(of(route)?.join("projects").join(slug).join(format!("{session}.jsonl")))
+    of(root, route).join("projects").join(slug).join(format!("{session}.jsonl"))
 }
 
 #[cfg(test)]
@@ -143,7 +141,7 @@ mod tests {
     /// When Hanzo drives, the home is Hanzo's — never the user's own `~/.claude`.
     #[test]
     fn a_routed_run_gets_hanzos_own_home() {
-        let d = relocate(&gateway()).expect("$HOME resolves in tests");
+        let d = relocate(&Root::at("/h"), &gateway()).expect("a routed run relocates");
         assert!(d.ends_with(".hanzo/claude"), "got {}", d.display());
         // Nor `~/.hanzo` itself, where it would collide with `settings::Settings`.
         assert_ne!(d.file_name().unwrap(), ".hanzo");
@@ -157,10 +155,11 @@ mod tests {
     #[test]
     fn a_hands_off_route_keeps_the_users_own_home_and_is_never_seeded() {
         for route in [Route::Inherit, Route::FailClosed] {
-            assert!(relocate(&route).is_none(), "{route:?} must not relocate the config home");
-            assert!(prepare(&route).is_none(), "{route:?} must seed nothing");
+            let root = Root::at("/h");
+            assert!(relocate(&root, &route).is_none(), "{route:?} must not relocate the config home");
+            assert!(prepare(&root, &route).is_none(), "{route:?} must seed nothing");
             // ...and the files it reads are Claude's own.
-            assert!(of(&route).unwrap().ends_with(".claude"), "{route:?} reads Claude's own home");
+            assert_eq!(of(&root, &route), Path::new("/h/.claude"), "{route:?} reads Claude's own home");
         }
     }
 
@@ -200,7 +199,7 @@ mod tests {
     /// routes — the bug a fixed path would reintroduce on one of them.
     #[test]
     fn the_transcript_pointer_follows_the_home_of_its_route() {
-        let at = |r: &Route| transcript(r, Path::new("/home/z/proj"), "sid-1").unwrap().display().to_string();
+        let at = |r: &Route| transcript(&Root::at("/h"), r, Path::new("/home/z/proj"), "sid-1").display().to_string();
         assert!(at(&gateway()).ends_with("/.hanzo/claude/projects/-home-z-proj/sid-1.jsonl"), "got {}", at(&gateway()));
         assert!(at(&Route::Inherit).ends_with("/.claude/projects/-home-z-proj/sid-1.jsonl"), "got {}", at(&Route::Inherit));
     }

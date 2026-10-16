@@ -42,6 +42,7 @@ use hanzo_client::{Http, Method, Request, Transport};
 
 use super::backend::{BackendKind, Remote, Route};
 use super::home;
+use crate::root::Root;
 
 /// Seconds a fetched kit stands in for a fresh one.
 const TTL: i64 = 60;
@@ -188,16 +189,16 @@ fn trusted(api: &str, local: bool) -> bool {
 }
 
 /// Where the kit is cached: `~/.hanzo/kit.json`, owner-only.
-pub fn cache() -> Option<PathBuf> {
-    Some(dirs::home_dir()?.join(".hanzo").join("kit.json"))
+pub fn cache(at: &Root) -> PathBuf {
+    at.hanzo().join("kit.json")
 }
 
 /// Where `kind` reads its user's skills under `route`, or `None` for a backend
 /// that carries no kit (the agents of [`super::agents`] read neither).
-pub fn root(kind: BackendKind, route: &Route) -> Option<PathBuf> {
+pub fn root(at: &Root, kind: BackendKind, route: &Route) -> Option<PathBuf> {
     match kind {
-        BackendKind::Dev | BackendKind::Codex => Some(dirs::home_dir()?.join(".agents").join("skills")),
-        BackendKind::Claude => Some(home::of(route)?.join("skills")),
+        BackendKind::Dev | BackendKind::Codex => Some(at.home().join(".agents").join("skills")),
+        BackendKind::Claude => Some(home::of(at, route).join("skills")),
         BackendKind::Interpreter | BackendKind::Tool(_) => None,
     }
 }
@@ -792,12 +793,11 @@ mod tests {
     #[test]
     fn only_the_backends_that_read_skills_carry_a_kit() {
         let via = Route::Inherit;
-        assert!(root(BackendKind::parse("agy").unwrap(), &via).is_none());
-        assert!(root(BackendKind::parse("cursor").unwrap(), &via).is_none());
-        if let Some(home) = dirs::home_dir() {
-            assert_eq!(root(BackendKind::Dev, &via), Some(home.join(".agents/skills")));
-            assert_eq!(root(BackendKind::Codex, &via), Some(home.join(".agents/skills")));
-            assert_eq!(root(BackendKind::Claude, &via), Some(home.join(".claude/skills")));
-        }
+        let at = Root::at("/h");
+        assert!(root(&at, BackendKind::parse("agy").unwrap(), &via).is_none());
+        assert!(root(&at, BackendKind::parse("cursor").unwrap(), &via).is_none());
+        assert_eq!(root(&at, BackendKind::Dev, &via), Some(PathBuf::from("/h/.agents/skills")));
+        assert_eq!(root(&at, BackendKind::Codex, &via), Some(PathBuf::from("/h/.agents/skills")));
+        assert_eq!(root(&at, BackendKind::Claude, &via), Some(PathBuf::from("/h/.claude/skills")));
     }
 }

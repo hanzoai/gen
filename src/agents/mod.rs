@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use super::backend::{Approval, Backend, Launch, McpAttach, Mode, Route, Routing, Spec};
+use crate::root::Root;
 use super::event::{Mapped, Usage};
 
 mod agy;
@@ -143,22 +144,24 @@ pub fn find(name: &str) -> Option<&'static Agent> {
 
 /// Where `hanzo upgrade` installs agents that ship on npm: `~/.hanzo`, so their
 /// binaries land in `~/.hanzo/bin` and nothing global is touched.
-pub fn prefix() -> Option<PathBuf> {
-    Some(dirs::home_dir()?.join(".hanzo"))
+pub fn prefix(root: &Root) -> PathBuf {
+    root.hanzo()
 }
 
 /// The binary that runs one of `programs`: the copy `hanzo upgrade` keeps in
 /// `~/.hanzo/bin` first, so upgrading it changes what runs, else the first on PATH.
-pub fn find_program(programs: &[&str]) -> Option<PathBuf> {
-    let managed = prefix().map(|p| p.join("bin"));
-    managed
-        .and_then(|bin| programs.iter().map(|p| bin.join(p)).find(|p| p.is_file()))
+pub fn find_program(root: &Root, programs: &[&str]) -> Option<PathBuf> {
+    let bin = prefix(root).join("bin");
+    programs
+        .iter()
+        .map(|p| bin.join(p))
+        .find(|p| p.is_file())
         .or_else(|| programs.iter().find_map(|p| which::which(p).ok()))
 }
 
 /// The binary that runs `a`.
-pub fn program(a: &Agent) -> Option<PathBuf> {
-    find_program(a.programs)
+pub fn program(root: &Root, a: &Agent) -> Option<PathBuf> {
+    find_program(root, a.programs)
 }
 
 /// The variable a routed agent's configuration names for the bearer, so the key is never written down.
@@ -183,14 +186,14 @@ impl Gateway<'_> {
 pub struct Run<'a> {
     spec: &'a Spec,
     cmd: tokio::process::Command,
-    cleanup: Vec<tempfile::TempPath>,
+    cleanup: super::backend::Scratch,
 }
 
 impl<'a> Run<'a> {
     fn new(spec: &'a Spec, program: &str) -> Run<'a> {
         let mut cmd = tokio::process::Command::new(program);
         cmd.current_dir(&spec.cwd);
-        Run { spec, cmd, cleanup: Vec::new() }
+        Run { spec, cmd, cleanup: Default::default() }
     }
 
     pub fn arg(&mut self, a: impl AsRef<OsStr>) -> &mut Self {
@@ -246,15 +249,24 @@ impl<'a> Run<'a> {
         f.write_all(doc.to_string().as_bytes()).context("writing a config file")?;
         let path = f.into_temp_path();
         let p = path.to_path_buf();
-        self.cleanup.push(path);
+        self.cleanup.files.push(path);
         Ok(p)
     }
 
-    /// A directory of Hanzo's own for an agent's state, `~/.hanzo/<name>`.
-    pub fn home(&self, name: &str) -> Result<PathBuf> {
-        let d = prefix().context("no home directory")?.join(name);
-        super::kit::private_dir(&d)?;
-        Ok(d)
+    /// A home of Hanzo's own for this one run of an agent, under
+    /// `~/.hanzo/<name>/`, owner-only, removed when the session ends. Its config
+    /// names this session's project and ledger, so a second session of the same
+    /// agent gets a home of its own rather than rewriting this one's.
+    pub fn home(&mut self, name: &str) -> Result<PathBuf> {
+        let parent = self.spec.root.hanzo().join(name);
+        super::kit::private_dir(&parent)?;
+        let d = tempfile::Builder::new()
+            .prefix("run-")
+            .tempdir_in(&parent)
+            .with_context(|| format!("making a home for {name} in {}", parent.display()))?;
+        let path = d.path().to_path_buf();
+        self.cleanup.dirs.push(d);
+        Ok(path)
     }
 
     /// Write `doc` to `path`, readable by this user only.
@@ -331,14 +343,14 @@ impl Backend for Session {
         self.agent.name
     }
 
-    fn version(&self) -> Option<String> {
-        let p = program(self.agent)?;
+    fn version(&self, root: &Root) -> Option<String> {
+        let p = program(root, self.agent)?;
         super::backend::backend_version(&p.display().to_string())
     }
 
     fn build(&self, spec: &Spec) -> Result<Launch> {
         let a = self.agent;
-        let program = program(a).map(|p| p.display().to_string()).unwrap_or_else(|| a.programs[0].to_string());
+        let program = program(&spec.root, a).map(|p| p.display().to_string()).unwrap_or_else(|| a.programs[0].to_string());
         let mut run = Run::new(spec, &program);
         (a.build)(&mut run)?;
         run.cmd.args(&spec.passthrough);
@@ -350,7 +362,7 @@ impl Backend for Session {
         (self.agent.read)(&mut reader, line)
     }
 
-    fn transcript_path(&self, _route: &Route, _cwd: &Path, _backend_session_id: &str) -> Option<PathBuf> {
+    fn transcript_path(&self, _root: &Root, _route: &Route, _cwd: &Path, _backend_session_id: &str) -> Option<PathBuf> {
         None
     }
 }
@@ -376,6 +388,7 @@ pub(crate) mod test {
             resume: None,
             passthrough: vec![],
             refresh: vec!["hanzo".into(), "auth".into(), "token".into()],
+            root: crate::root::scratch(),
         }
     }
 
@@ -448,6 +461,23 @@ pub(crate) mod test {
 mod tests {
     use super::test::*;
     use super::*;
+
+    /// Two sessions of one agent never share a home: each is pointed at its own,
+    /// whose config names that session's project and ledger, and the home is gone
+    /// when its session is. A shared `~/.hanzo/<agent>` let one session's tools act
+    /// on the other's repository.
+    #[test]
+    fn each_session_of_an_agent_has_a_home_of_its_own() {
+        let s = test::spec(Mode::Headless, test::gateway());
+        let (one, two) = (test::build("grok", &s), test::build("grok", &s));
+        let (h1, h2) = (test::env(&one, "GROK_HOME").unwrap(), test::env(&two, "GROK_HOME").unwrap());
+        assert_ne!(h1, h2, "one home for two sessions");
+        assert!(Path::new(&h1).starts_with(s.root.hanzo().join("grok")), "{h1}");
+        assert!(Path::new(&h2).join("config.toml").is_file());
+        drop(one);
+        assert!(!Path::new(&h1).exists(), "a session's home outlived it");
+        assert!(Path::new(&h2).join("config.toml").is_file(), "ending one session ended the other's home");
+    }
 
     #[test]
     fn every_spelling_is_one_agent_and_no_two_rows_share_one() {

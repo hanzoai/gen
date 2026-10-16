@@ -23,7 +23,8 @@ use std::time::Duration;
 
 use super::context::{hostname, machine_id, Machine, Metrics, Spec, TargetRecord};
 use super::sample::Sampler;
-use crate::host::{Host, BRAND};
+use crate::host::Host;
+use crate::root::Root;
 
 #[derive(Clone)]
 pub struct TargetClient {
@@ -132,7 +133,7 @@ fn id_of(v: &Value) -> Result<String> {
 /// failure is logged at debug and swallowed — the coding session never depends on
 /// this. The caller runs it detached so neither the capture nor the cloud write is
 /// on the session's critical path.
-pub async fn sync(api: &str, token: &str, org: Option<&str>, machine_id: &str, host: &str, machine: &Machine) {
+pub async fn sync(root: &Root, api: &str, token: &str, org: Option<&str>, machine_id: &str, host: &str, machine: &Machine) {
     let client = match TargetClient::new(api, token) {
         Ok(c) => c.with_org(org),
         Err(e) => {
@@ -144,7 +145,7 @@ pub async fn sync(api: &str, token: &str, org: Option<&str>, machine_id: &str, h
 
     // Reuse the stored id ONLY for the same machine + host + api, so a copied data
     // dir or a renamed host re-registers instead of clobbering another target.
-    let stored = TargetRecord::load(machine_id)
+    let stored = TargetRecord::load(root, machine_id)
         .ok()
         .flatten()
         .filter(|r| r.host == host && r.api == api);
@@ -169,7 +170,7 @@ pub async fn sync(api: &str, token: &str, org: Option<&str>, machine_id: &str, h
                 api: api.to_string(),
                 updated_at: chrono::Utc::now().timestamp(),
             };
-            if let Err(e) = rec.save() {
+            if let Err(e) = rec.save(root) {
                 tracing::debug!("could not persist target id ({e})");
             }
         }
@@ -220,9 +221,11 @@ impl Drop for Beat {
 /// process is still running and still serving, which is the exact symptom the
 /// heartbeat exists to prevent. [`Host::account`] is the ONE accessor, and it
 /// refreshes: the credential is the host's shared state, not a value held here.
-pub fn beat(host: Arc<dyn Host>, api: &str, machine_id: &str, name: &str) -> Beat {
+/// It is asked for `brand`'s account, the one the session it beats for runs as.
+pub fn beat(host: Arc<dyn Host>, root: &Root, brand: &str, api: &str, machine_id: &str, name: &str) -> Beat {
     let org = host.profile().org;
-    beat_every(BEAT, Creds::Refreshing(host), org, api, machine_id, name)
+    let creds = Creds::Refreshing { host, brand: brand.to_string() };
+    beat_every(BEAT, creds, org, root, api, machine_id, name)
 }
 
 /// Where a beat gets its bearer.
@@ -232,7 +235,7 @@ pub fn beat(host: Arc<dyn Host>, api: &str, machine_id: &str, name: &str) -> Bea
 /// credential path to drift. It exists because the loop is what needs observing,
 /// and a unit test must not read the developer's real credential.
 enum Creds {
-    Refreshing(Arc<dyn Host>),
+    Refreshing { host: Arc<dyn Host>, brand: String },
     #[cfg(test)]
     Fixed(String),
 }
@@ -240,7 +243,7 @@ enum Creds {
 impl Creds {
     async fn bearer(&mut self) -> Option<String> {
         match self {
-            Creds::Refreshing(host) => host.account(BRAND).await.ok().flatten().map(|a| a.token),
+            Creds::Refreshing { host, brand } => host.account(brand).await.ok().flatten().map(|a| a.token),
             #[cfg(test)]
             Creds::Fixed(t) => Some(t.clone()),
         }
@@ -257,10 +260,10 @@ impl Creds {
 /// sampler, nothing else. Foreground until interrupted, so a service manager owns
 /// the lifetime; dropping the guard aborts it and the row goes stale on its own,
 /// which is how cloud decides a machine left.
-pub async fn present(host: Arc<dyn Host>) -> Result<()> {
+pub async fn present(host: Arc<dyn Host>, root: &Root, brand: &str) -> Result<()> {
     let api = host.profile().api;
-    let name = hostname();
-    let _beat = beat(host, api.trim_end_matches('/'), &machine_id(), &name);
+    let name = hostname(root);
+    let _beat = beat(host, root, brand, api.trim_end_matches('/'), &machine_id(root), &name);
     println!(
         "● {name} present in the fleet — one beat every {}s, no shell, no session. Ctrl-C leaves.",
         BEAT.as_secs()
@@ -272,7 +275,8 @@ pub async fn present(host: Arc<dyn Host>) -> Result<()> {
 /// [`beat`] with the period as a parameter, so a test can watch the loop repeat
 /// without waiting minutes for it. `BEAT` is the ONE period production uses — this
 /// is the mechanism, not a setting.
-fn beat_every(period: Duration, mut creds: Creds, org: Option<String>, api: &str, machine_id: &str, host: &str) -> Beat {
+fn beat_every(period: Duration, mut creds: Creds, org: Option<String>, root: &Root, api: &str, machine_id: &str, host: &str) -> Beat {
+    let root = root.clone();
     let api = api.to_string();
     let (machine_id, host) = (machine_id.to_string(), host.to_string());
     Beat(tokio::spawn(async move {
@@ -285,7 +289,7 @@ fn beat_every(period: Duration, mut creds: Creds, org: Option<String>, api: &str
             match creds.bearer().await {
                 Some(token) => {
                     let machine = sampler.machine().await;
-                    sync(&api, &token, org.as_deref(), &machine_id, &host, &machine).await;
+                    sync(&root, &api, &token, org.as_deref(), &machine_id, &host, &machine).await;
                 }
                 None => tracing::debug!("no credential for this beat; the machine will read offline"),
             }
@@ -391,15 +395,16 @@ mod tests {
     #[tokio::test]
     async fn sync_registers_when_no_id_is_stored_and_persists_it() {
         let mock = MockCloud::start().await;
+        let root = crate::root::scratch();
         let machine = format!("syncfresh_{}", std::process::id());
-        let _ = std::fs::remove_file(super::super::context::target_path_for_test(&machine));
-        sync(&mock.base_url(), "T", None, &machine, "evo", &gpu_machine()).await;
+        let _ = std::fs::remove_file(crate::context::target_path_for_test(&root, &machine));
+        sync(&root, &mock.base_url(), "T", None, &machine, "evo", &gpu_machine()).await;
 
         assert!(mock.requests().iter().any(|r| r.method == "POST" && r.path == "/v1/agent/targets"));
-        let rec = TargetRecord::load(&machine).unwrap().unwrap();
+        let rec = TargetRecord::load(&root, &machine).unwrap().unwrap();
         assert_eq!(rec.id, "tgt_mock");
         assert_eq!(rec.host, "evo");
-        let _ = std::fs::remove_file(super::super::context::target_path_for_test(&machine));
+        let _ = std::fs::remove_file(crate::context::target_path_for_test(&root, &machine));
     }
 
     /// A stored id is heartbeated (PATCH); if the target is gone (404) we fall back
@@ -407,6 +412,7 @@ mod tests {
     #[tokio::test]
     async fn sync_falls_back_to_register_when_the_stored_target_is_gone() {
         let mock = MockCloud::start_target_missing().await;
+        let root = crate::root::scratch();
         let machine = format!("syncgone_{}", std::process::id());
         // Seed a stored id that the server will 404 on PATCH.
         TargetRecord {
@@ -416,17 +422,17 @@ mod tests {
             api: mock.base_url(),
             updated_at: 1,
         }
-        .save()
+        .save(&root)
         .unwrap();
 
-        sync(&mock.base_url(), "T", None, &machine, "evo", &gpu_machine()).await;
+        sync(&root, &mock.base_url(), "T", None, &machine, "evo", &gpu_machine()).await;
 
         let reqs = mock.requests();
         assert!(reqs.iter().any(|r| r.method == "PATCH" && r.path == "/v1/agent/targets/tgt_stale"), "tries the heartbeat first");
         assert!(reqs.iter().any(|r| r.method == "POST" && r.path == "/v1/agent/targets"), "falls back to register");
         // The freshly registered id replaced the stale one.
-        assert_eq!(TargetRecord::load(&machine).unwrap().unwrap().id, "tgt_mock");
-        let _ = std::fs::remove_file(super::super::context::target_path_for_test(&machine));
+        assert_eq!(TargetRecord::load(&root, &machine).unwrap().unwrap().id, "tgt_mock");
+        let _ = std::fs::remove_file(crate::context::target_path_for_test(&root, &machine));
     }
 
     /// The beat has to land INSIDE cloud's window, repeatedly. One register is what
@@ -462,14 +468,15 @@ mod tests {
     #[tokio::test]
     async fn a_held_machine_keeps_saying_so() {
         let mock = MockCloud::start().await;
+        let root = crate::root::scratch();
         let machine = format!("beat_{}", std::process::id());
-        let _ = std::fs::remove_file(super::super::context::target_path_for_test(&machine));
+        let _ = std::fs::remove_file(crate::context::target_path_for_test(&root, &machine));
 
-        let held = beat_every(Duration::from_millis(10), Creds::Fixed("T".into()), None, &mock.base_url(), &machine, "evo");
+        let held = beat_every(Duration::from_millis(10), Creds::Fixed("T".into()), None, &root, &mock.base_url(), &machine, "evo");
         until("a machine to keep beating", || mock.requests().len() >= 3).await;
         drop(held);
 
-        let _ = std::fs::remove_file(super::super::context::target_path_for_test(&machine));
+        let _ = std::fs::remove_file(crate::context::target_path_for_test(&root, &machine));
     }
 
     /// A beat asks for its bearer EVERY time, so a credential that changes under
@@ -480,13 +487,15 @@ mod tests {
     #[tokio::test]
     async fn every_beat_re_reads_the_credential() {
         let mock = MockCloud::start().await;
+        let root = crate::root::scratch();
         let machine = format!("beatcred_{}", std::process::id());
-        let _ = std::fs::remove_file(super::super::context::target_path_for_test(&machine));
+        let _ = std::fs::remove_file(crate::context::target_path_for_test(&root, &machine));
 
         let held = beat_every(
             Duration::from_millis(10),
             Creds::Fixed("T".into()),
             None,
+            &root,
             &mock.base_url(),
             &machine,
             "evo",
@@ -501,7 +510,41 @@ mod tests {
             reqs.iter().all(|r| r.header("authorization").as_deref() == Some("Bearer T")),
             "a beat must carry a freshly-read credential",
         );
-        let _ = std::fs::remove_file(super::super::context::target_path_for_test(&machine));
+        let _ = std::fs::remove_file(crate::context::target_path_for_test(&root, &machine));
+    }
+
+    /// A beat speaks as the brand of the session it beats for: a `--brand lux`
+    /// session's machine registers to lux, with lux's token, never the default's.
+    #[tokio::test]
+    async fn a_beat_asks_for_its_sessions_brand() {
+        struct Asked(std::sync::Mutex<Vec<String>>);
+        impl Host for Asked {
+            fn profile(&self) -> crate::Profile {
+                crate::Profile::unread()
+            }
+            fn account<'a>(&'a self, brand: &'a str) -> crate::host::Pending<'a, Result<Option<crate::Account>>> {
+                self.0.lock().unwrap().push(brand.to_string());
+                Box::pin(async { Ok(Some(crate::Account { owner: "lux".into(), name: "z".into(), token: "T".into() })) })
+            }
+            fn refresh(&self, _: &str) -> Vec<String> {
+                Vec::new()
+            }
+            fn key(&self, _: crate::Provider) -> Result<Option<String>> {
+                Ok(None)
+            }
+            fn meter<'a>(&'a self, _: &'a [String]) -> crate::host::Pending<'a, std::result::Result<Value, String>> {
+                Box::pin(async { Err("no meter".to_string()) })
+            }
+        }
+        let mock = MockCloud::start().await;
+        let root = crate::root::scratch();
+        let machine = format!("beatbrand_{}", std::process::id());
+        let host = Arc::new(Asked(std::sync::Mutex::new(Vec::new())));
+        let held = beat(host.clone(), &root, "lux", &mock.base_url(), &machine, "evo");
+        until("the first beat", || !mock.requests().is_empty()).await;
+        drop(held);
+        assert_eq!(host.0.lock().unwrap().first().map(String::as_str), Some("lux"));
+        let _ = std::fs::remove_file(crate::context::target_path_for_test(&root, &machine));
     }
 
     /// Letting go stops the beat, and stopping is the whole ending: cloud's window
@@ -509,10 +552,11 @@ mod tests {
     #[tokio::test]
     async fn letting_go_stops_it() {
         let mock = MockCloud::start().await;
+        let root = crate::root::scratch();
         let machine = format!("beatdrop_{}", std::process::id());
-        let _ = std::fs::remove_file(super::super::context::target_path_for_test(&machine));
+        let _ = std::fs::remove_file(crate::context::target_path_for_test(&root, &machine));
 
-        let held = beat_every(Duration::from_millis(10), Creds::Fixed("T".into()), None, &mock.base_url(), &machine, "evo");
+        let held = beat_every(Duration::from_millis(10), Creds::Fixed("T".into()), None, &root, &mock.base_url(), &machine, "evo");
         until("the first beat", || !mock.requests().is_empty()).await;
         drop(held);
         // A beat already in flight may still land, so settle before reading the mark.
@@ -521,6 +565,6 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(500)).await; // 50 periods' worth
         assert_eq!(mock.requests().len(), after_drop, "a dropped beat writes nothing more");
-        let _ = std::fs::remove_file(super::super::context::target_path_for_test(&machine));
+        let _ = std::fs::remove_file(crate::context::target_path_for_test(&root, &machine));
     }
 }

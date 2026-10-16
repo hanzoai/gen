@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 
 use super::backend::Route;
 use super::home;
+use crate::root::Root;
 
 const DRACULA: &str = include_str!("../assets/themes/claude/dracula.json");
 const ALUCARD: &str = include_str!("../assets/themes/claude/alucard.json");
@@ -57,9 +58,10 @@ pub fn effective(flag: Option<&str>, persisted: &str) -> Option<String> {
 /// otherwise. `route` names the config home this session actually reads, so the
 /// theme lands where the session will look for it. Best-effort — never blocks or
 /// fails the session.
-pub fn apply(route: &Route, flag: Option<&str>, persisted: &str) -> Restore {
-    let (Some(home), Some(mut name)) = (home::of(route), effective(flag, persisted)) else {
-        return Restore(None); // theming off (or no $HOME): nothing applied, nothing to restore
+pub fn apply(root: &Root, route: &Route, flag: Option<&str>, persisted: &str) -> Restore {
+    let home = home::of(root, route);
+    let Some(mut name) = effective(flag, persisted) else {
+        return Restore(None); // theming off: nothing applied, nothing to restore
     };
     let prev = current_theme(&home);
     if name == "auto" {

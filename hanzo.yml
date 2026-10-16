@@ -16,11 +16,24 @@ test:
       ./target/debug/gen --version
       ./target/debug/gen --help >/dev/null
 
+  # The suite never touches a home. It runs twice, neither time in the runner's
+  # own: against an empty HOME it cannot write, and against an empty one it can,
+  # which must still be empty after. The runner is a person's machine (evo runs
+  # as its user), and a test that wrote there rewrote that person's agent
+  # configs. Cargo and rustup keep their own homes, named before HOME moves.
   - name: test
     run: |
       set -euo pipefail
-      export PATH="$HOME/.cargo/bin:$PATH"
-      cargo test --locked
+      export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+      export PATH="$CARGO_HOME/bin:$PATH" RUSTC_WRAPPER=
+      unset XDG_DATA_HOME XDG_CONFIG_HOME XDG_CACHE_HOME XDG_STATE_HOME
+      ro=$(mktemp -d); tmp=$(mktemp -d)
+      trap 'chmod u+w "$ro"; rm -rf "$ro" "$tmp"' EXIT
+      chmod 0555 "$ro"
+      HOME="$ro" cargo test --locked
+      HOME="$tmp" cargo test --locked
+      left=$(find "$tmp" -mindepth 1 | head -20)
+      [ -z "$left" ] || { echo "::error::the test suite wrote into HOME:"; echo "$left"; exit 1; }
 
   - name: clippy
     run: |

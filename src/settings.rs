@@ -9,6 +9,7 @@
 //! (precedence lives in [`super::run`] / [`super::resolve_model`], not here).
 
 use serde::{Deserialize, Serialize};
+use crate::root::Root;
 use std::path::{Path, PathBuf};
 
 /// The parsed `~/.hanzo/settings.json`. Every field is `Option`, so "unset" is
@@ -66,10 +67,9 @@ pub struct Settings {
 }
 
 impl Settings {
-    /// The settings home: `~/.hanzo/settings.json` (`None` only when `$HOME` is
-    /// unresolvable — a headless/odd environment, which then uses built-in defaults).
-    pub fn path() -> Option<PathBuf> {
-        Some(dirs::home_dir()?.join(".hanzo").join("settings.json"))
+    /// The settings home: `~/.hanzo/settings.json` under `root`.
+    pub fn path(root: &Root) -> PathBuf {
+        root.hanzo().join("settings.json")
     }
 
     /// Load the settings, best-effort — the coding agent must start even if `$HOME`
@@ -77,10 +77,8 @@ impl Settings {
     /// gets a discoverable, editable config) and read back as all-default; an
     /// unreadable or malformed file degrades to defaults WITHOUT clobbering it —
     /// a parse slip must never destroy a user's hand-edit.
-    pub fn load() -> Settings {
-        let Some(path) = Self::path() else {
-            return Settings::default();
-        };
+    pub fn load(root: &Root) -> Settings {
+        let path = Self::path(root);
         match std::fs::read_to_string(&path) {
             Ok(body) => serde_json::from_str(&body).unwrap_or_default(),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -94,11 +92,9 @@ impl Settings {
     /// Remember which coding agent a bare `hanzo` should launch. Sets `agent`
     /// on the existing document and leaves every other key alone, including
     /// ones this struct does not know.
-    pub fn remember_agent(agent: &str) -> anyhow::Result<()> {
+    pub fn remember_agent(root: &Root, agent: &str) -> anyhow::Result<()> {
         use serde_json::Value;
-        let path = Self::path().ok_or_else(|| {
-            anyhow::anyhow!("no home directory — cannot remember the coding agent")
-        })?;
+        let path = Self::path(root);
         let mut doc = match std::fs::read_to_string(&path) {
             Ok(body) => serde_json::from_str::<Value>(&body).map_err(|e| {
                 anyhow::anyhow!("~/.hanzo/settings.json could not be read ({e}) — the coding agent was not changed")
@@ -124,11 +120,9 @@ impl Settings {
 
     /// Pin which connected account the harness uses (`harness` in the same
     /// document). Other keys, including ones this struct does not know, stay.
-    pub fn pin_account(account: &str) -> anyhow::Result<()> {
+    pub fn pin_account(root: &Root, account: &str) -> anyhow::Result<()> {
         use serde_json::Value;
-        let path = Self::path().ok_or_else(|| {
-            anyhow::anyhow!("no home directory — cannot pin the harness account")
-        })?;
+        let path = Self::path(root);
         let mut doc = match std::fs::read_to_string(&path) {
             Ok(body) => serde_json::from_str::<Value>(&body).map_err(|e| {
                 anyhow::anyhow!("~/.hanzo/settings.json could not be read ({e}) — the harness account was not changed")
@@ -239,8 +233,7 @@ mod tests {
     /// from Claude's `~/.claude/settings.json`.
     #[test]
     fn path_is_dot_hanzo_settings_json() {
-        if let Some(p) = Settings::path() {
-            assert!(p.ends_with(".hanzo/settings.json"), "got {}", p.display());
-        }
+        let p = Settings::path(&Root::at("/h"));
+        assert_eq!(p, std::path::Path::new("/h/.hanzo/settings.json"));
     }
 }

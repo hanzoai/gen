@@ -18,6 +18,7 @@
 //! The proxy adds no capability: it forwards bytes between the agent and the one
 //! command it was given, with the environment the agent gave it.
 
+use crate::root::Root;
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -82,9 +83,9 @@ impl Manifest {
     }
 }
 
-/// `~/.hanzo/mcp`.
-pub fn cache_dir() -> Option<PathBuf> {
-    Some(dirs::home_dir()?.join(".hanzo").join("mcp"))
+/// `~/.hanzo/mcp` under `root`: what the proxy remembers of each server.
+pub fn cache_dir(root: &Root) -> PathBuf {
+    root.hanzo().join("mcp")
 }
 
 /// The identity of an answer: which server, how it is run, and which protocol the agent speaks.
@@ -152,7 +153,10 @@ pub async fn main(argv: &[String]) -> Result<()> {
     let ledger = head.iter().position(|a| a == "--ledger").and_then(|i| head.get(i + 1)).map(PathBuf::from);
     let (program, args) = rest.split_first().ok_or_else(|| anyhow!("usage: hanzo __mcp [--ledger FILE] -- <server> [args…]"))?;
     let spawn = command(program, args);
-    serve(tokio::io::stdin(), tokio::io::stdout(), spawn, program, args, cache_dir(), ledger).await
+    // Its own process, so its own entry point: the proxy runs as the user who
+    // started the session, and keeps its answers under that user's home.
+    let cache = Root::user().map(|r| cache_dir(&r));
+    serve(tokio::io::stdin(), tokio::io::stdout(), spawn, program, args, cache, ledger).await
 }
 
 /// One message to the agent.

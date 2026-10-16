@@ -42,6 +42,7 @@ pub mod ledger;
 pub mod mcp;
 pub mod native;
 pub mod private;
+pub mod root;
 pub mod sample;
 pub mod savings;
 pub mod session;
@@ -65,6 +66,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncSeekExt};
 
 pub use args::Args;
 pub use host::{Account, Host, Profile, Provider};
+pub use root::Root;
 
 use backend::{resolve, resolve_mcp, Approval, BackendKind, Backend, Launch, Mode, Route, Routing, Spec};
 use context::{ResumeRecord, Snapshot};
@@ -112,6 +114,8 @@ pub struct Options {
     pub model: Option<String>,
     pub task: Option<String>,
     pub passthrough: Vec<String>,
+    /// Where this session keeps what it writes, decided by the launcher.
+    pub root: Root,
 }
 
 /// Decide whether to stream to cloud: an explicit `--no-link` always wins, then
@@ -246,9 +250,9 @@ struct GatewayModels {
 ///
 /// A narrow accessor rather than a public settings module: the caller needs exactly
 /// this one value, and `select` is a pure function that takes it as an argument.
-pub fn configured_agent() -> Option<String> {
+pub fn configured_agent(root: &Root) -> Option<String> {
     let from_env = std::env::var("HANZO_HARNESS_ACCOUNT").ok();
-    let settings = Settings::load();
+    let settings = Settings::load(root);
     harness::agent_for(
         from_env.as_deref().or(settings.harness.as_deref()),
         settings.agent.as_deref(),
@@ -451,6 +455,7 @@ pub async fn run(host: Arc<dyn Host>, opts: Options) -> Result<()> {
     let backend = resolve(kind);
     let mode = if opts.task.is_some() { Mode::Headless } else { Mode::Interactive };
     let profile = host.profile();
+    let root = opts.root.clone();
     let api = profile.api.clone();
     // The one network whose api may be plain http (the kit's bearer check).
     let local = profile.local;
@@ -476,7 +481,7 @@ pub async fn run(host: Arc<dyn Host>, opts: Options) -> Result<()> {
             // Accept the id with or without the `sess_` prefix (the resume line prints
             // the bare form), so `hanzo --resume <id>` matches either way.
             let id = &(if raw.starts_with("sess_") { raw.clone() } else { format!("sess_{raw}") });
-            let rec = ResumeRecord::load(id)?.ok_or_else(|| {
+            let rec = ResumeRecord::load(&root, id)?.ok_or_else(|| {
                 anyhow!(
                     "no local record for session {id} on this machine — resume runs where the session was created"
                 )
@@ -521,7 +526,7 @@ pub async fn run(host: Arc<dyn Host>, opts: Options) -> Result<()> {
     // Loaded once, read below; every value still yields to an explicit CLI flag /
     // process env. Best-effort: a missing file is created with the defaults, a bad
     // one degrades to them.
-    let settings = Settings::load();
+    let settings = Settings::load(&root);
 
     // Auto-approve: run the agent's actions without a per-action prompt by default
     // (the confirmed default). `--ask`/`--safe` opt out; `--no-sandbox` escalates to
@@ -539,9 +544,9 @@ pub async fn run(host: Arc<dyn Host>, opts: Options) -> Result<()> {
     // Where the proxy records each tool call, for the summary to say what the
     // toolset did. Named here because the server is attached before the cloud
     // session exists.
-    let ledger = ledger::path(&format!("{}-{:08x}", chrono::Utc::now().format("%Y%m%dT%H%M%S"), rand::random::<u32>()));
+    let ledger = ledger::path(&root, &format!("{}-{:08x}", chrono::Utc::now().format("%Y%m%dT%H%M%S"), rand::random::<u32>()));
     let mcp = if mcp_on {
-        let m = resolve_mcp(&cwd, ledger.as_deref());
+        let m = resolve_mcp(&cwd, Some(&ledger));
         if m.is_none() {
             crate::warn("hanzo-mcp not found — install it with `hanzo upgrade mcp` (or `curl -fsSL hanzo.sh/mcp | sh`); continuing without the Hanzo toolset.");
         }
@@ -557,8 +562,7 @@ pub async fn run(host: Arc<dyn Host>, opts: Options) -> Result<()> {
     let tools: std::result::Result<std::path::PathBuf, String> = match (&mcp, takes, ledger) {
         (_, false, _) => Err(format!("{} takes no MCP server for one run", kind.as_str())),
         (None, _, _) => Err("not attached (`--no-mcp`, or hanzo-mcp is not installed)".into()),
-        (Some(_), true, Some(l)) => Ok(l),
-        (Some(_), true, None) => Err("attached; no home directory to keep a ledger in".into()),
+        (Some(_), true, l) => Ok(l),
     };
 
     // Routing: which model endpoint this run's calls go to, and with what
@@ -584,7 +588,7 @@ pub async fn run(host: Arc<dyn Host>, opts: Options) -> Result<()> {
         .map(|(owner, name)| (owner.as_str(), name.as_str()))
         .chain(identity.as_ref().map(|id| (id.owner.as_str(), id.name.as_str())))
         .collect();
-    if let Err(e) = harness::track(&ids, active.as_deref(), pin.as_deref(), &used) {
+    if let Err(e) = harness::track(&root, &ids, active.as_deref(), pin.as_deref(), &used) {
         crate::warn(&e.to_string());
     }
     // A SELECTED provider with no usable key fails closed: the backend clears its
@@ -607,7 +611,7 @@ pub async fn run(host: Arc<dyn Host>, opts: Options) -> Result<()> {
     // is the one WRITE; `claude::build` and the transcript pointer only READ the
     // same pure function, so they cannot disagree about where the home is.
     if kind == BackendKind::Claude {
-        home::prepare(&routing);
+        home::prepare(&root, &routing);
     }
 
     // For a linked interactive Claude run, pre-set the session id so its
@@ -618,7 +622,7 @@ pub async fn run(host: Arc<dyn Host>, opts: Options) -> Result<()> {
         None
     };
 
-    let snapshot = Snapshot::capture(&cwd, backend.label(), backend.version());
+    let snapshot = Snapshot::capture(&root, &cwd, backend.label(), backend.version(&root));
 
     let client = if do_link {
         Some(SessionClient::new(&api, bearer.as_deref().unwrap())?.with_org(profile.org.as_deref()))
@@ -637,8 +641,9 @@ pub async fn run(host: Arc<dyn Host>, opts: Options) -> Result<()> {
     // every run through a short cache; no kit never stops a run, and the banner
     // says so once.
     let equip = async {
-        match (kit::root(kind, &routing), kit::cache()) {
-            (Some(skills), Some(cache)) => {
+        match kit::root(&root, kind, &routing) {
+            Some(skills) => {
+                let cache = kit::cache(&root);
                 let caller = identity.as_ref().zip(bearer.as_deref()).map(|(_, token)| kit::Caller {
                     api: &api,
                     who: &who,
@@ -649,7 +654,7 @@ pub async fn run(host: Arc<dyn Host>, opts: Options) -> Result<()> {
                 // banner never claims a server the backend will not be handed.
                 Some(kit::equip(&cache, &skills, caller.as_ref(), mcp_on && routing.hanzo()).await)
             }
-            _ => None,
+            None => None,
         }
     };
 
@@ -692,7 +697,7 @@ pub async fn run(host: Arc<dyn Host>, opts: Options) -> Result<()> {
     // wrote, so announcing once and going quiet reads offline ninety seconds into a
     // session that is still running. The guard beats until this run returns.
     let _machine = links_target(do_link, bearer.is_some())
-        .then(|| target::beat(host.clone(), &api, &snapshot.machine_id, &snapshot.host));
+        .then(|| target::beat(host.clone(), &root, &opts.brand, &api, &snapshot.machine_id, &snapshot.host));
 
     // Claude theme (Dracula dark / Alucard light, auto by the user's preference).
     // Native — writes `<config home>/themes` + selects it; never patches Claude. The
@@ -700,7 +705,7 @@ pub async fn run(host: Arc<dyn Host>, opts: Options) -> Result<()> {
     // has no Claude themes. Held to end-of-run so plain `claude` keeps its theme.
     // Takes the ROUTE because that is what decides which home this session reads.
     let _theme_guard = (kind == BackendKind::Claude)
-        .then(|| theme::apply(&routing, opts.theme.as_deref(), &profile.theme));
+        .then(|| theme::apply(&root, &routing, opts.theme.as_deref(), &profile.theme));
 
     banner(
         &opts,
@@ -733,7 +738,8 @@ pub async fn run(host: Arc<dyn Host>, opts: Options) -> Result<()> {
         trust_project: opts.project_mcp,
         resume: resume_handle.clone(),
         passthrough: opts.passthrough.clone(),
-        refresh: profile.refresh.clone(),
+        refresh: host.refresh(&opts.brand),
+        root: root.clone(),
     };
     // The route also decides which config home the backend wrote its transcript in,
     // so keep it for the pointer recorded after the child exits — the supervisor
@@ -761,9 +767,9 @@ pub async fn run(host: Arc<dyn Host>, opts: Options) -> Result<()> {
                 let transcript = outcome
                     .backend_session
                     .as_ref()
-                    .and_then(|bs| backend.transcript_path(&route, &cwd, bs))
+                    .and_then(|bs| backend.transcript_path(&root, &route, &cwd, bs))
                     .map(|p| p.display().to_string());
-                finalize(c, id, &outcome, status, &snapshot, &api, &who, transcript).await;
+                finalize(c, id, &outcome, status, &snapshot, &api, &who, transcript, &root).await;
             }
             spent.end(&*host, backend.label(), kind == BackendKind::Claude, &outcome.usage, session_id.as_deref(), tools.as_deref().map_err(String::as_str)).await;
             if let Some(id) = &session_id {
@@ -777,7 +783,7 @@ pub async fn run(host: Arc<dyn Host>, opts: Options) -> Result<()> {
             }
         }
         Mode::Interactive => {
-            let run = run_interactive(&*backend, launch, client.clone(), session_id.clone(), &route, &cwd, watch_sid).await;
+            let run = run_interactive(&*backend, launch, client.clone(), session_id.clone(), &root, &route, &cwd, watch_sid).await;
             if let (Some(c), Some(id)) = (&client, &session_id) {
                 // Interactive per-event stream arrives via the transcript tail;
                 // the resume handle here is what we pre-set / resumed.
@@ -786,7 +792,7 @@ pub async fn run(host: Arc<dyn Host>, opts: Options) -> Result<()> {
                 let transcript = outcome
                     .backend_session
                     .as_ref()
-                    .and_then(|s| backend.transcript_path(&route, &cwd, s))
+                    .and_then(|s| backend.transcript_path(&root, &route, &cwd, s))
                     .map(|p| p.display().to_string());
                 // An interactive session SUSPENDS rather than completes: the
                 // transcript and its resume handle outlive the TUI, so the same
@@ -796,7 +802,7 @@ pub async fn run(host: Arc<dyn Host>, opts: Options) -> Result<()> {
                     Ok(true) => Status::Paused,
                     _ => Status::Error,
                 };
-                finalize(c, id, &outcome, status, &snapshot, &api, &who, transcript).await;
+                finalize(c, id, &outcome, status, &snapshot, &api, &who, transcript, &root).await;
             }
             // The tool's own screen was the stream, so nothing was reported here.
             spent.end(&*host, backend.label(), kind == BackendKind::Claude, &Usage::default(), session_id.as_deref(), tools.as_deref().map_err(String::as_str)).await;
@@ -1012,6 +1018,7 @@ pub(crate) async fn finalize(
     // cloud, and the CLI never sends an org — cloud derives it from the JWT.
     identity: &str,
     transcript_path: Option<String>,
+    root: &Root,
 ) {
     if !outcome.usage.is_empty() {
         let mut p = serde_json::to_value(&outcome.usage).unwrap_or_else(|_| json!({}));
@@ -1032,7 +1039,7 @@ pub(crate) async fn finalize(
             transcript_path,
             created_at: now(),
         };
-        let _ = rec.save();
+        let _ = rec.save(root);
         let _ = client.event(session_id, Kind::Status, rec.resume_payload()).await;
     }
 
@@ -1186,11 +1193,13 @@ async fn supervise(
     Ok((acc, status))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_interactive(
     backend: &dyn Backend,
     launch: Launch,
     client: Option<SessionClient>,
     session_id: Option<String>,
+    root: &Root,
     // The route this run launched with — it names the config home the transcript
     // is written in, so the tail must resolve against the same one.
     route: &Route,
@@ -1204,7 +1213,7 @@ async fn run_interactive(
     // Linked interactive per-event streaming rides the backend transcript tail.
     let stop = Arc::new(AtomicBool::new(false));
     let tail = match (&client, &session_id, &watch_sid) {
-        (Some(c), Some(id), Some(sid)) => backend.transcript_path(route, cwd, sid).map(|path| {
+        (Some(c), Some(id), Some(sid)) => backend.transcript_path(root, route, cwd, sid).map(|path| {
             tokio::spawn(tail_transcript(path, c.clone(), id.clone(), stop.clone()))
         }),
         _ => None,
@@ -1731,7 +1740,8 @@ mod tests {
             saw_error: false,
             final_summary: None,
         };
-        finalize(&client, "sess_9", &outcome, Status::Done, &snapshot, "https://api.hanzo.ai", "hanzo/z", None).await;
+        let root = crate::root::scratch();
+        finalize(&client, "sess_9", &outcome, Status::Done, &snapshot, "https://api.hanzo.ai", "hanzo/z", None, &root).await;
 
         let reqs = mock.requests();
         // usage log event
@@ -1740,10 +1750,10 @@ mod tests {
         assert!(reqs.iter().any(|r| r.path.ends_with("/events") && r.json()["kind"] == "status" && r.json()["payload"]["type"] == "resume" && r.json()["payload"]["backendSessionId"] == "sid-x"));
         // terminal status
         assert!(reqs.iter().any(|r| r.method == "PATCH" && r.json()["status"] == "done"));
-        // clean up the resume record this finalize persisted
-        let _ = std::fs::remove_file(
-            dirs::data_local_dir().unwrap().join("hanzo/code/sessions/sess_9.json"),
-        );
+        // The resume record lands in the session's own root, and nowhere else.
+        let record = root.data().join("code/sessions/sess_9.json");
+        assert!(record.is_file(), "{}", record.display());
+        let _ = std::fs::remove_file(record);
     }
 
     #[tokio::test]
@@ -1752,12 +1762,12 @@ mod tests {
         let client = SessionClient::new(&mock.base_url(), "T").unwrap();
         let snapshot = snapshot("dev");
         let outcome = Outcome::default();
-        finalize(&client, "sess_i", &outcome, Status::Paused, &snapshot, "https://api.hanzo.ai", "hanzo/z", None).await;
+        finalize(&client, "sess_i", &outcome, Status::Paused, &snapshot, "https://api.hanzo.ai", "hanzo/z", None, &crate::root::scratch()).await;
         assert!(mock.requests().iter().any(|r| r.method == "PATCH" && r.json()["status"] == "paused"));
 
         let mock2 = MockCloud::start().await;
         let client2 = SessionClient::new(&mock2.base_url(), "T").unwrap();
-        finalize(&client2, "sess_e", &outcome, Status::Error, &snapshot, "https://api.hanzo.ai", "hanzo/z", None).await;
+        finalize(&client2, "sess_e", &outcome, Status::Error, &snapshot, "https://api.hanzo.ai", "hanzo/z", None, &crate::root::scratch()).await;
         assert!(mock2.requests().iter().any(|r| r.method == "PATCH" && r.json()["status"] == "error"));
     }
 
@@ -1780,7 +1790,7 @@ mod tests {
         fn label(&self) -> &'static str {
             "claude"
         }
-        fn version(&self) -> Option<String> {
+        fn version(&self, _: &Root) -> Option<String> {
             None
         }
         fn build(&self, _spec: &Spec) -> Result<Launch> {
@@ -1790,12 +1800,12 @@ mod tests {
             let path = f.into_temp_path();
             let mut command = tokio::process::Command::new("cat");
             command.arg(&*path);
-            Ok(Launch { command, cleanup: vec![path] })
+            Ok(Launch { command, cleanup: crate::backend::Scratch { files: vec![path], dirs: Vec::new() } })
         }
         fn parse(&self, line: &str) -> Vec<Mapped> {
             Claude.parse(line)
         }
-        fn transcript_path(&self, _: &Route, _: &Path, _: &str) -> Option<PathBuf> {
+        fn transcript_path(&self, _: &Root, _: &Route, _: &Path, _: &str) -> Option<PathBuf> {
             None
         }
     }
@@ -1815,6 +1825,7 @@ mod tests {
             resume: None,
             passthrough: vec![],
             refresh: Vec::new(),
+            root: crate::root::scratch(),
         }
     }
 
@@ -1863,6 +1874,7 @@ mod tests {
             theme: None,
             model: None,
             passthrough: vec![],
+            root: crate::root::scratch(),
         };
         // Routing ON (gateway), stream OFF — the case that regressed:
         // --no-link but model calls still ship code to the gateway.
@@ -1917,6 +1929,7 @@ mod tests {
             theme: None,
             model: None,
             passthrough: vec![],
+            root: crate::root::scratch(),
         };
         let anthropic = Routing::Anthropic { key: "sk-ant-x".into() };
         let (route, _) = status_lines(&opts, Some(&anthropic), true, None);
@@ -2198,7 +2211,7 @@ mod control_tests {
         fn label(&self) -> &'static str {
             "claude"
         }
-        fn version(&self) -> Option<String> {
+        fn version(&self, _: &Root) -> Option<String> {
             None
         }
         fn build(&self, spec: &Spec) -> Result<Launch> {
@@ -2220,14 +2233,14 @@ mod control_tests {
                     Ok(())
                 });
             }
-            Ok(Launch { command, cleanup: Vec::new() })
+            Ok(Launch { command, cleanup: Default::default() })
         }
         /// The real Claude parser — so these tests exercise the SAME mapping the
         /// production stream does, on the same recorded shapes.
         fn parse(&self, line: &str) -> Vec<Mapped> {
             Claude.parse(line)
         }
-        fn transcript_path(&self, _: &Route, _: &Path, _: &str) -> Option<PathBuf> {
+        fn transcript_path(&self, _: &Root, _: &Route, _: &Path, _: &str) -> Option<PathBuf> {
             None
         }
     }
@@ -2247,6 +2260,7 @@ mod control_tests {
             resume: None,
             passthrough: Vec::new(),
             refresh: Vec::new(),
+            root: crate::root::scratch(),
         }
     }
 

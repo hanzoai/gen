@@ -1,21 +1,24 @@
 //! What a session needs from the program it runs in.
 //!
 //! Gen launches agents; it signs nobody in and stores no credential. Hanzo IAM
-//! owns the account, and the Hanzo CLI owns IAM's tokens. So the account, the
-//! keys a user saved, and the cloud's usage meter all come from the host: the
-//! `hanzo` CLI in its own process when Gen is its library, or the `hanzo`
-//! command on PATH when Gen runs as `gen` ([`Command`]).
+//! owns the account, and the Hanzo CLI owns IAM's tokens and the user's settings.
+//! So the account, what is on file, the keys a user saved, and the cloud's usage
+//! meter all come from the host: the `hanzo` CLI in its own process when Gen is
+//! its library, or the `hanzo` command on PATH when Gen runs as `gen` ([`Command`]).
 
+use std::ffi::OsStr;
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
+use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use base64::Engine;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// The brand a session signs in under unless `--brand` names another, and the
-/// one a machine's run-target beats under.
+/// The brand a session signs in under unless `--brand` names another.
 pub const BRAND: &str = "hanzo";
 
 /// A host's answer that takes a moment: a credential refresh, a cloud read.
@@ -53,8 +56,9 @@ impl std::fmt::Debug for Account {
     }
 }
 
-/// What the host has on file for a session.
-#[derive(Debug, Clone)]
+/// What the host has on file for a session. It carries no secret, which is what
+/// lets the CLI hand it over on stdout (`hanzo config profile`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Profile {
     /// The origin every cloud call goes to, e.g. `https://api.hanzo.ai`.
     pub api: String,
@@ -70,9 +74,23 @@ pub struct Profile {
     pub link: bool,
     /// The Claude theme a session applies when `--theme` names none.
     pub theme: String,
-    /// The command that prints the signed-in account's access token, fresh: an
-    /// agent that outlives one token (they last an hour) runs it for the next.
-    pub refresh: Vec<String>,
+}
+
+impl Profile {
+    /// What a session runs on when the host cannot say what it has on file: the
+    /// public cloud, and NOT linked — a setting that could not be read may be an
+    /// opt-out, and streaming a session someone opted out of is not recoverable.
+    pub fn unread() -> Profile {
+        Profile {
+            api: hanzo_client::API.into(),
+            local: false,
+            org: None,
+            provider: None,
+            identities: Vec::new(),
+            link: false,
+            theme: "auto".into(),
+        }
+    }
 }
 
 /// The program Gen runs in.
@@ -84,6 +102,11 @@ pub trait Host: Send + Sync {
     /// nobody is signed in, never some other account.
     fn account<'a>(&'a self, brand: &'a str) -> Pending<'a, Result<Option<Account>>>;
 
+    /// The command that prints `brand`'s access token, fresh: what an agent that
+    /// outlives one token (they last an hour) runs for the next. Empty when there
+    /// is none to run, and the agent keeps the token it was started with.
+    fn refresh(&self, brand: &str) -> Vec<String>;
+
     /// The key the user stored for `provider`, read only when a route needs it.
     fn key(&self, provider: Provider) -> Result<Option<String>>;
 
@@ -92,82 +115,180 @@ pub trait Host: Send + Sync {
     fn meter<'a>(&'a self, query: &'a [String]) -> Pending<'a, std::result::Result<Value, String>>;
 }
 
-/// The host `gen` runs under: the `hanzo` command on PATH, which holds the Hanzo
-/// IAM account, refreshes its token and reads the cloud for it. Gen asks it the
-/// way Hanzo Dev does (`hanzo auth token`), so signing in to one signs in to both.
-pub struct Command {
-    program: String,
+/// The Hanzo CLI's arguments that print `brand`'s access token. Every host asks
+/// the CLI the same way, so the brand rides every token a session is handed.
+pub fn token(brand: &str) -> Vec<String> {
+    ["auth", "token", "--brand", brand].map(String::from).to_vec()
 }
 
-impl Default for Command {
-    /// The `hanzo` PATH finds now, by its full path, so the agents a session
-    /// starts ask the same binary for a fresh token whatever their PATH says.
-    fn default() -> Self {
-        let program = which::which("hanzo").map(|p| p.display().to_string()).unwrap_or_else(|_| "hanzo".into());
-        Command { program }
+/// One part of an `owner/name` a token claims, refused if it could leave its
+/// slot. The ONE check: the CLI files credentials under these parts, and Gen
+/// labels its records with them, so both ask this.
+///
+/// A claim is attacker-influenced data: an `owner` of `../hanzo` or `a/b` would
+/// let a forged token address ANOTHER identity's storage slot. Structure over
+/// trust — and ONLY structure: IAM mints usernames like "Grace Hopper" or "José",
+/// so the rule is a deny-list of what actually escapes a slot (separators,
+/// control bytes, non-space whitespace), never an allowlist of blessed ASCII.
+pub fn claim(field: &str, v: &str) -> Result<()> {
+    if v.is_empty() {
+        bail!("token claim `{field}` is empty");
     }
+    if v.len() > 128 {
+        bail!("token claim `{field}` is too long ({} > 128)", v.len());
+    }
+    if !v.starts_with(|c: char| c.is_alphanumeric()) {
+        bail!("token claim `{field}` must start with a letter or digit: {v:?}");
+    }
+    if v.ends_with(' ') {
+        bail!("token claim `{field}` ends with a space: {v:?}");
+    }
+    if let Some(bad) = v
+        .chars()
+        .find(|&c| c == '/' || c == '\\' || c.is_control() || (c.is_whitespace() && c != ' '))
+    {
+        bail!("token claim `{field}` contains an unsupported character {bad:?}: {v:?}");
+    }
+    Ok(())
+}
+
+/// How long the CLI has to answer one question. A refresh that IAM is slow to
+/// answer takes seconds; a CLI that has not answered in this long is not going to.
+const PATIENCE: Duration = Duration::from_secs(20);
+
+/// Why the CLI did not answer.
+#[derive(Debug)]
+enum Asked {
+    /// There is no `hanzo` to ask.
+    Missing,
+    /// It answered no, in its own words.
+    Refused(String),
+    /// It could not be asked, or did not answer in time.
+    Failed(String),
+}
+
+impl std::fmt::Display for Asked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Asked::Missing => f.write_str("the Hanzo CLI is not installed (`curl -fsSL hanzo.sh | sh` installs it)"),
+            Asked::Refused(said) | Asked::Failed(said) => f.write_str(said),
+        }
+    }
+}
+
+/// The host `gen` runs under: the `hanzo` command on PATH, which holds the Hanzo
+/// IAM account, refreshes its token, reads the user's settings and reads the cloud
+/// for it. Gen asks it the way Hanzo Dev does (`hanzo auth token`), so signing in
+/// to one signs in to both.
+pub struct Command {
+    program: Option<PathBuf>,
+    profile: Profile,
 }
 
 impl Command {
-    /// Ask `program` instead of `hanzo`.
-    pub fn new(program: impl Into<String>) -> Self {
-        Command { program: program.into() }
+    /// The `hanzo` PATH finds, and what it has on file.
+    pub async fn found() -> Command {
+        Command::at(std::env::var_os("PATH").and_then(|p| find(&p))).await
     }
 
-    /// Run the program and keep what it printed, or why it printed nothing.
-    /// Both streams are captured, so a credential never reaches a terminal or a log.
-    async fn ask(&self, args: &[String]) -> std::result::Result<String, String> {
-        let out = tokio::process::Command::new(&self.program)
+    /// Ask `program` (`None`: there is no CLI, so signed out and unlinked), and
+    /// read what it has on file once, for the whole session.
+    pub async fn at(program: Option<PathBuf>) -> Command {
+        let mut c = Command { program, profile: Profile::unread() };
+        let read = match c.ask(&["config".into(), "profile".into()]).await {
+            Ok(out) => serde_json::from_str(&out).map_err(|e| Asked::Failed(format!("its profile did not read: {e}"))),
+            Err(e) => Err(e),
+        };
+        match read {
+            Ok(p) => c.profile = p,
+            Err(Asked::Missing) => {}
+            Err(why) => crate::warn(&format!(
+                "the Hanzo CLI did not say what it has on file ({why}), so this session stays local on {} — `hanzo upgrade` brings a CLI that does",
+                c.profile.api
+            )),
+        }
+        c
+    }
+
+    /// Run the CLI and keep what it printed, or why it printed nothing. Both
+    /// streams are captured, so a credential never reaches a terminal or a log.
+    async fn ask(&self, args: &[String]) -> std::result::Result<String, Asked> {
+        self.ask_within(args, PATIENCE).await
+    }
+
+    async fn ask_within(&self, args: &[String], patience: Duration) -> std::result::Result<String, Asked> {
+        let program = self.program.as_ref().ok_or(Asked::Missing)?;
+        let run = tokio::process::Command::new(program)
             .args(args)
             .stdin(Stdio::null())
             .kill_on_drop(true)
-            .output()
-            .await
-            .map_err(|e| match e.kind() {
-                std::io::ErrorKind::NotFound => format!(
-                    "`{}` is not installed (`curl -fsSL hanzo.sh | sh` installs it)",
-                    self.program
-                ),
-                _ => format!("`{}` did not start: {e}", self.program),
-            })?;
+            .output();
+        let out = match tokio::time::timeout(patience, run).await {
+            Err(_) => {
+                return Err(Asked::Failed(format!(
+                    "`hanzo {}` did not answer in {}s",
+                    args.join(" "),
+                    patience.as_secs_f32()
+                )))
+            }
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => return Err(Asked::Missing),
+            Ok(Err(e)) => return Err(Asked::Failed(format!("`{}` did not start: {e}", program.display()))),
+            Ok(Ok(out)) => out,
+        };
         if !out.status.success() {
             let said = String::from_utf8_lossy(&out.stderr);
             let said: String = said.split_whitespace().collect::<Vec<_>>().join(" ");
-            return Err(said.chars().take(120).collect());
+            let said = said.strip_prefix("Error: ").unwrap_or(&said);
+            return Err(Asked::Refused(said.chars().take(240).collect()));
         }
-        String::from_utf8(out.stdout).map_err(|_| format!("`{}` printed something that is not text", self.program))
+        String::from_utf8(out.stdout).map_err(|_| Asked::Failed(format!("`{}` printed something that is not text", program.display())))
     }
+}
+
+/// `hanzo` on `path`, by its full path, from absolute entries only. An empty or
+/// relative entry names a directory that depends on where the session happens to
+/// start, so a repo could plant the program that hands out the token.
+fn find(path: &OsStr) -> Option<PathBuf> {
+    let dirs: Vec<PathBuf> = std::env::split_paths(path).filter(|d| d.is_absolute()).collect();
+    if dirs.is_empty() {
+        return None;
+    }
+    let joined = std::env::join_paths(&dirs).ok()?;
+    which::which_in("hanzo", Some(joined), Path::new("/")).ok().filter(|p| p.is_absolute())
 }
 
 impl Host for Command {
     fn profile(&self) -> Profile {
-        Profile {
-            api: hanzo_client::API.into(),
-            local: false,
-            org: None,
-            provider: None,
-            identities: Vec::new(),
-            link: true,
-            theme: "auto".into(),
-            refresh: vec![self.program.clone(), "auth".into(), "token".into()],
-        }
+        self.profile.clone()
     }
 
     fn account<'a>(&'a self, brand: &'a str) -> Pending<'a, Result<Option<Account>>> {
         Box::pin(async move {
-            let mut args = vec!["auth".to_string(), "token".to_string()];
-            if brand != BRAND {
-                args.extend(["--brand".to_string(), brand.to_string()]);
-            }
-            let Ok(out) = self.ask(&args).await else {
-                return Ok(None);
+            let out = match self.ask(&token(brand)).await {
+                Ok(out) => out,
+                Err(Asked::Missing) => return Ok(None),
+                // Nobody signed in is a session that runs locally and says so;
+                // anything else the CLI refused (a session that ended, a brand it
+                // does not know) is its own words, and the session stops on them.
+                Err(Asked::Refused(said)) if said.contains("not signed in") => return Ok(None),
+                Err(why) => bail!("{why}"),
             };
             let token = out.trim();
             if token.is_empty() || token.len() > 16_384 || token.chars().any(|c| c.is_whitespace() || c.is_control()) {
-                return Ok(None);
+                bail!("`hanzo auth token` printed something that is not a token");
             }
-            Ok(claims(token).map(|(owner, name)| Account { owner, name, token: token.to_string() }))
+            match claims(token) {
+                Some((owner, name)) => Ok(Some(Account { owner, name, token: token.to_string() })),
+                None => bail!("`hanzo auth token` printed a token that names no account"),
+            }
         })
+    }
+
+    fn refresh(&self, brand: &str) -> Vec<String> {
+        match &self.program {
+            Some(p) => std::iter::once(p.display().to_string()).chain(token(brand)).collect(),
+            None => Vec::new(),
+        }
     }
 
     fn key(&self, provider: Provider) -> Result<Option<String>> {
@@ -187,15 +308,15 @@ impl Host for Command {
                 let (k, v) = pair.split_once('=').ok_or_else(|| format!("not a query pair: {pair}"))?;
                 args.extend([format!("--{k}"), v.to_string()]);
             }
-            let out = self.ask(&args).await?;
+            let out = self.ask(&args).await.map_err(|e| e.to_string())?;
             serde_json::from_str(&out).map_err(|e| format!("the usage summary did not read: {e}"))
         })
     }
 }
 
-/// The `owner` and `name` an IAM access token states. A label for the records
-/// this machine keeps, never a decision: the server verifies every token it is
-/// sent, and a claim read here grants nothing.
+/// The `owner` and `name` an IAM access token states, each held to [`claim`]. A
+/// label for the records this machine keeps, never a decision: the server
+/// verifies every token it is sent, and a claim read here grants nothing.
 fn claims(token: &str) -> Option<(String, String)> {
     #[derive(serde::Deserialize)]
     struct Claims {
@@ -209,8 +330,7 @@ fn claims(token: &str) -> Option<(String, String)> {
     };
     let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(body.trim_end_matches('=')).ok()?;
     let c: Claims = serde_json::from_slice(&raw).ok()?;
-    let fits = |v: &str| !v.is_empty() && v.len() <= 128 && !v.contains(['/', '\\']) && !v.chars().any(char::is_control);
-    (fits(&c.owner) && fits(&c.name)).then_some((c.owner, c.name))
+    (claim("owner", &c.owner).is_ok() && claim("name", &c.name).is_ok()).then_some((c.owner, c.name))
 }
 
 #[cfg(test)]
@@ -222,30 +342,71 @@ mod tests {
         format!("{}.{}.sig", b(r#"{"alg":"RS256"}"#), b(claims))
     }
 
-    /// A stand-in `hanzo` that prints `out` and exits `code`, in a directory of its own.
+    fn profile() -> Profile {
+        Profile {
+            api: "http://localhost:8080".into(),
+            local: true,
+            org: None,
+            provider: Some("hanzo".into()),
+            identities: vec![("hanzo".into(), "z".into())],
+            link: true,
+            theme: "dracula".into(),
+        }
+    }
+
+    /// A stand-in `hanzo` in a directory of its own: each `(first two words, out,
+    /// status)` answers that question, and every call's arguments land in
+    /// `<program>.args`, one line per call.
     #[cfg(unix)]
-    fn program(out: &str, code: i32) -> (tempfile::TempDir, String) {
+    fn program(answers: &[(&str, &str, i32)]) -> (tempfile::TempDir, PathBuf) {
+        let mut sh = String::from("echo \"$@\" >> \"$0.args\"\ncase \"$1 $2\" in\n");
+        for (q, out, code) in answers {
+            sh.push_str(&format!("  \"{q}\") printf '%s' '{out}'; exit {code} ;;\n"));
+        }
+        sh.push_str("esac\necho \"Error: unrecognized subcommand '$2'\" >&2\nexit 2\n");
+        script(&sh)
+    }
+
+    /// A stand-in `hanzo` that runs `body`.
+    #[cfg(unix)]
+    fn script(body: &str) -> (tempfile::TempDir, PathBuf) {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("hanzo");
-        std::fs::write(&path, format!("#!/bin/sh\necho \"$@\" > \"$0.args\"\nprintf '%s' '{out}'\nexit {code}\n")).unwrap();
+        std::fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         // A thread of another test that forks while this file is open for writing
         // carries that descriptor until it execs, and the kernel refuses to run a
-        // file held open for writing. Run it once that has passed.
-        while let Err(e) = std::process::Command::new(&path).output() {
-            assert_eq!(e.kind(), std::io::ErrorKind::ExecutableFileBusy, "{e}");
-            std::thread::sleep(std::time::Duration::from_millis(10));
+        // file held open for writing. Start it once that has passed.
+        loop {
+            match std::process::Command::new(&path).stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
+                Ok(mut child) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break;
+                }
+                Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::ExecutableFileBusy, "{e}"),
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
-        let p = path.display().to_string();
-        (dir, p)
+        let _ = std::fs::remove_file(dir.path().join("hanzo.args"));
+        (dir, path)
+    }
+
+    #[cfg(unix)]
+    fn calls(p: &Path) -> Vec<String> {
+        std::fs::read_to_string(format!("{}.args", p.display())).unwrap_or_default().lines().map(String::from).collect()
     }
 
     #[test]
     fn an_account_is_the_tokens_own_owner_and_name() {
         assert_eq!(claims(&jwt(r#"{"owner":"hanzo","name":"z"}"#)), Some(("hanzo".into(), "z".into())));
+        assert_eq!(claims(&jwt(r#"{"owner":"hanzo","name":"Grace Hopper"}"#)), Some(("hanzo".into(), "Grace Hopper".into())));
         assert_eq!(claims(&jwt(r#"{"owner":"hanzo"}"#)), None, "a token naming no one names no account");
-        assert_eq!(claims(&jwt(r#"{"owner":"../x","name":"z"}"#)), None, "a claim cannot address another slot");
+        for bad in ["../x", "a/b", "a\\b", "", " lead", "trail ", "tab\there", "x\u{7}"] {
+            let doc = serde_json::json!({ "owner": bad, "name": "z" }).to_string();
+            assert_eq!(claims(&jwt(&doc)), None, "{bad:?} cannot name a slot");
+        }
         assert_eq!(claims("hk-0123456789"), None, "a gateway key is not an account");
     }
 
@@ -256,50 +417,100 @@ mod tests {
         assert!(!format!("{a:?}").contains("SECRET"));
     }
 
-    /// `gen` signs in as Hanzo Dev does: the CLI's `auth token`, the brand named
-    /// only when it is not the default.
+    /// Only an absolute PATH entry can supply `hanzo`: an empty or relative one is
+    /// wherever the session starts, which a repo controls.
+    #[cfg(unix)]
+    #[test]
+    fn hanzo_is_found_by_its_full_path_in_absolute_entries_only() {
+        let (dir, p) = program(&[]);
+        let rel = std::ffi::OsString::from("::.:bin:rel/dir");
+        assert_eq!(find(&rel), None, "relative entries are never searched");
+        let mixed = std::env::join_paths([PathBuf::from(""), PathBuf::from("."), dir.path().to_path_buf()]).unwrap();
+        let got = find(&mixed).expect("found in the absolute entry");
+        assert!(got.is_absolute(), "{}", got.display());
+        assert_eq!(got, p);
+    }
+
+    /// `gen` signs in as Hanzo Dev does: the CLI's `auth token`, for the session's brand.
     #[cfg(unix)]
     #[tokio::test]
-    async fn the_account_is_the_clis_token() {
+    async fn the_account_is_the_clis_token_for_the_sessions_brand() {
         let token = jwt(r#"{"owner":"hanzo","name":"z"}"#);
-        let (_dir, p) = program(&format!("{token}\n"), 0);
-        let host = Command::new(&p);
+        let out = format!("{token}\n");
+        let (_dir, p) = program(&[("auth token", out.as_str(), 0)]);
+        let host = Command::at(Some(p.clone())).await;
         let a = host.account(BRAND).await.unwrap().expect("signed in");
         assert_eq!((a.owner.as_str(), a.name.as_str(), a.token.as_str()), ("hanzo", "z", token.as_str()));
-        assert_eq!(std::fs::read_to_string(format!("{p}.args")).unwrap().trim(), "auth token");
         host.account("lux").await.unwrap();
-        assert_eq!(std::fs::read_to_string(format!("{p}.args")).unwrap().trim(), "auth token --brand lux");
+        let c = calls(&p);
+        assert_eq!(c[c.len() - 2..], ["auth token --brand hanzo", "auth token --brand lux"]);
     }
 
-    /// An agent that outlives a token asks the same `hanzo` Gen asked, never `gen`.
-    #[test]
-    fn a_fresh_token_comes_from_the_cli() {
-        assert_eq!(Command::new("/opt/bin/hanzo").profile().refresh, ["/opt/bin/hanzo", "auth", "token"]);
-        let found = Command::default().profile().refresh;
-        assert_eq!(found[1..], ["auth", "token"]);
-        assert!(found[0].ends_with("hanzo") || found[0].ends_with("hanzo.exe"), "{found:?}");
-    }
-
+    /// An agent that outlives a token asks the same `hanzo`, for the same brand —
+    /// never `gen`, and never the default brand on a session that named another.
     #[cfg(unix)]
     #[tokio::test]
-    async fn a_cli_that_refuses_or_is_missing_is_signed_out() {
-        let (_dir, p) = program("", 1);
-        assert!(Command::new(&p).account(BRAND).await.unwrap().is_none());
-        assert!(Command::new("/nonexistent/hanzo").account(BRAND).await.unwrap().is_none());
+    async fn a_fresh_token_comes_from_the_cli_for_the_sessions_brand() {
+        let (_dir, p) = program(&[]);
+        let host = Command::at(Some(p.clone())).await;
+        let mut want = vec![p.display().to_string()];
+        want.extend(token("lux"));
+        assert_eq!(host.refresh("lux"), want);
+        assert!(Command::at(None).await.refresh(BRAND).is_empty(), "no CLI, no command to run");
+    }
+
+    /// Signed out is a session that runs locally; any other refusal is the CLI's own
+    /// words, surfaced; a CLI that is not there is signed out.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_clis_refusal_is_said_in_its_own_words() {
+        let (_d1, out) = script("echo 'Error: not signed in — run `hanzo auth login`' >&2\nexit 1\n");
+        assert!(Command::at(Some(out)).await.account(BRAND).await.unwrap().is_none());
+
+        let (_d2, ended) = script("echo 'Error: the hanzo/z session has ended; sign in again: hanzo auth login' >&2\nexit 1\n");
+        let err = Command::at(Some(ended)).await.account(BRAND).await.unwrap_err().to_string();
+        assert_eq!(err, "the hanzo/z session has ended; sign in again: hanzo auth login");
+
+        assert!(Command::at(None).await.account(BRAND).await.unwrap().is_none());
+    }
+
+    /// A CLI that hangs costs a session `PATIENCE`, then a sentence — never forever.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_cli_that_hangs_is_given_up_on() {
+        let (_d, hang) = script("exec sleep 3600\n");
+        let c = Command { program: Some(hang), profile: Profile::unread() };
+        let started = std::time::Instant::now();
+        let err = c.ask_within(&token(BRAND), Duration::from_millis(300)).await.unwrap_err().to_string();
+        assert!(err.contains("did not answer in 0.3s"), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(10), "it gave up when it said it would");
+    }
+
+    /// `gen` reads what the CLI has on file through the CLI, the one reader of its
+    /// config — and a CLI that cannot say leaves the session unlinked.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn what_is_on_file_is_the_clis_and_unreadable_is_unlinked() {
+        let doc = serde_json::to_string(&profile()).unwrap();
+        let (_d1, p) = program(&[("config profile", doc.as_str(), 0)]);
+        assert_eq!(Command::at(Some(p)).await.profile(), profile());
+
+        let (_d2, old) = program(&[]); // a CLI from before `config profile`
+        let unread = Command::at(Some(old)).await.profile();
+        assert_eq!(unread, Profile::unread());
+        assert!(!unread.link, "a setting that could not be read is never a link");
+        assert!(!Command::at(None).await.profile().link);
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn the_meter_is_the_clis_usage_summary() {
-        let (_dir, p) = program(r#"{"llm":{"available":false}}"#, 0);
+        let (_dir, p) = program(&[("usage summary", r#"{"llm":{"available":false}}"#, 0)]);
         let q = ["range=custom".to_string(), "start=a".to_string(), "end=b".to_string()];
-        let doc = Command::new(&p).meter(&q).await.unwrap();
+        let doc = Command::at(Some(p.clone())).await.meter(&q).await.unwrap();
         assert_eq!(doc["llm"]["available"], false);
-        assert_eq!(
-            std::fs::read_to_string(format!("{p}.args")).unwrap().trim(),
-            "usage summary --range custom --start a --end b"
-        );
-        let missing = Command::new("/nonexistent/hanzo").meter(&q).await.unwrap_err();
+        assert_eq!(calls(&p).last().unwrap(), "usage summary --range custom --start a --end b");
+        let missing = Command::at(None).await.meter(&q).await.unwrap_err();
         assert!(missing.contains("not installed"), "{missing}");
     }
 }

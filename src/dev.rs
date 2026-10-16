@@ -30,6 +30,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use super::backend::{Approval, Backend, Launch, Mode, Remote, Route, Routing, Spec};
+use crate::root::Root;
 use super::event::{cap, clamp, Mapped, Usage};
 
 /// The driver for the two agents that speak this protocol: our own `dev`
@@ -65,7 +66,7 @@ impl Backend for Agent {
         self.program
     }
 
-    fn version(&self) -> Option<String> {
+    fn version(&self, _: &Root) -> Option<String> {
         super::backend::backend_version(self.program)
     }
 
@@ -74,7 +75,7 @@ impl Backend for Agent {
         cmd.current_dir(&spec.cwd);
 
         let mut args: Vec<String> = Vec::new();
-        let mut cleanup: Vec<tempfile::TempPath> = Vec::new();
+        let mut cleanup = super::backend::Scratch::default();
         let headless = spec.mode == Mode::Headless;
 
         // Subcommand + resume selection. The JSONL event stream (`--json`) is
@@ -93,7 +94,7 @@ impl Backend for Agent {
         // sandbox; `Bypass` (`--no-sandbox`) drops it entirely; `Ask` leaves the
         // user's own mode. codex 0.144.x has no `--full-auto`/`--yolo`.
         match spec.approval {
-            Approval::Auto => args.extend(auto_overrides(user_config(self.program).as_ref())),
+            Approval::Auto => args.extend(auto_overrides(user_config(&spec.root, self.program).as_ref())),
             Approval::Bypass => args.push("--dangerously-bypass-approvals-and-sandbox".into()),
             Approval::Ask => {}
         }
@@ -147,7 +148,7 @@ impl Backend for Agent {
                     let path = file.into_temp_path();
                     args.push("-c".into());
                     args.push(cfg_string("model_catalog_json", &path.to_string_lossy()));
-                    cleanup.push(path);
+                    cleanup.files.push(path);
                 }
                 // Only `dev` ships a native `hanzo` provider. codex and Open Interpreter
                 // are told about the gateway on every run, or they call api.openai.com.
@@ -245,7 +246,7 @@ impl Backend for Agent {
         }
     }
 
-    fn transcript_path(&self, _route: &Route, _cwd: &Path, _backend_session_id: &str) -> Option<PathBuf> {
+    fn transcript_path(&self, _root: &Root, _route: &Route, _cwd: &Path, _backend_session_id: &str) -> Option<PathBuf> {
         // `dev`'s rollout files are date-bucketed under CODEX_HOME; native
         // `dev exec resume <id>` locates them itself, so we don't tail them.
         None
@@ -403,7 +404,7 @@ fn auto_overrides(user: Option<&toml::Table>) -> Vec<String> {
 /// `~/.hanzo/dev`) for `dev`, `CODEX_HOME` (else `~/.codex`) for `codex`, and
 /// `CODEX_HOME` (else `~/.openinterpreter`) for Open Interpreter.
 #[cfg(not(test))]
-fn user_config(program: &str) -> Option<toml::Table> {
+fn user_config(root: &Root, program: &str) -> Option<toml::Table> {
     let (var, default) = match program {
         "dev" => ("DEV_HOME", ".hanzo/dev"),
         "interpreter" => ("CODEX_HOME", ".openinterpreter"),
@@ -412,14 +413,14 @@ fn user_config(program: &str) -> Option<toml::Table> {
     let home = std::env::var_os(var)
         .filter(|home| !home.is_empty())
         .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|home| home.join(default)))?;
+        .unwrap_or_else(|| root.home().join(default));
     std::fs::read_to_string(home.join("config.toml")).ok()?.parse().ok()
 }
 
 /// Tests describe the user's config through [`auto_overrides`] directly, never
 /// through the machine running them.
 #[cfg(test)]
-fn user_config(_program: &str) -> Option<toml::Table> {
+fn user_config(_root: &Root, _program: &str) -> Option<toml::Table> {
     None
 }
 
@@ -459,6 +460,7 @@ mod tests {
             resume: None,
             passthrough: vec![],
             refresh: vec!["hanzo".into(), "auth".into(), "token".into()],
+            root: crate::root::scratch(),
         }
     }
 
@@ -508,7 +510,7 @@ mod tests {
         // The gateway model's real (1M) window is named as dev's own setting
         // (the true-1M path), since the default window exceeds the 272K fallback.
         assert!(args.iter().any(|a| a.starts_with("model_context_window=")), "gateway route must name the model window: {args:?}");
-        assert!(l.cleanup.is_empty(), "dev takes the window as a setting, not a file");
+        assert!(l.cleanup.files.is_empty(), "dev takes the window as a setting, not a file");
     }
 
     /// The caller's cloud tools ride as ONE streamable-HTTP server beside hanzo-mcp:
@@ -804,7 +806,7 @@ mod tests {
         assert_eq!(v["models"][0]["slug"], "enso");
         assert_eq!(v["models"][0]["context_window"], 1_000_000);
         assert_eq!(v["models"][0]["max_context_window"], 1_000_000, "the ceiling must be raised or codex clamps");
-        assert_eq!(l.cleanup.len(), 1);
+        assert_eq!(l.cleanup.files.len(), 1);
 
         // EVERY field the agents' catalog parser requires must be present. It
         // refuses the whole document on the first missing one, and that refusal
@@ -838,13 +840,13 @@ mod tests {
         s.routing = Route::Via(Routing::Gateway { api: "https://api.hanzo.ai".into(), token: "JWT".into(), model: "enso".into(), small_fast_model: "enso-flash".into(), context_window: 200_000 });
         let l = Agent::CODEX.build(&s).unwrap();
         assert!(!argv(&l).iter().any(|a| a.starts_with("model_catalog_json=")), "no catalog below codex's fallback");
-        assert!(l.cleanup.is_empty());
+        assert!(l.cleanup.files.is_empty());
 
         // dev has the setting itself: the window rides in as `model_context_window`,
         // and no file is written for it.
         let l = Agent::DEV.build(&spec(Mode::Headless, "https://api.hanzo.ai")).unwrap();
         assert!(argv(&l).iter().any(|a| a == "model_context_window=1000000"), "{:?}", argv(&l));
         assert!(!argv(&l).iter().any(|a| a.starts_with("model_catalog_json=")));
-        assert!(l.cleanup.is_empty());
+        assert!(l.cleanup.files.is_empty());
     }
 }

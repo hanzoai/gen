@@ -47,7 +47,10 @@ and a handful more) and always use their own account. `--model enso-ultra` picks
 the model on the Hanzo route.
 
 When you are signed in, a session is registered with Hanzo cloud and its events
-stream to mission control; `--no-link` keeps it local.
+stream to mission control; `--no-link` keeps it local. Gen reads what the Hanzo
+CLI has on file (`hanzo config profile`): `hanzo config set code.link false` keeps
+every session local, and `hanzo network use local` points Gen at your own cloud. A
+CLI too old to say keeps the session local on api.hanzo.ai until `hanzo upgrade`.
 
 ## Build
 
