@@ -100,8 +100,11 @@ pub struct Command {
 }
 
 impl Default for Command {
+    /// The `hanzo` PATH finds now, by its full path, so the agents a session
+    /// starts ask the same binary for a fresh token whatever their PATH says.
     fn default() -> Self {
-        Command { program: "hanzo".into() }
+        let program = which::which("hanzo").map(|p| p.display().to_string()).unwrap_or_else(|_| "hanzo".into());
+        Command { program }
     }
 }
 
@@ -227,6 +230,13 @@ mod tests {
         let path = dir.path().join("hanzo");
         std::fs::write(&path, format!("#!/bin/sh\necho \"$@\" > \"$0.args\"\nprintf '%s' '{out}'\nexit {code}\n")).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // A thread of another test that forks while this file is open for writing
+        // carries that descriptor until it execs, and the kernel refuses to run a
+        // file held open for writing. Run it once that has passed.
+        while let Err(e) = std::process::Command::new(&path).output() {
+            assert_eq!(e.kind(), std::io::ErrorKind::ExecutableFileBusy, "{e}");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         let p = path.display().to_string();
         (dir, p)
     }
@@ -259,6 +269,15 @@ mod tests {
         assert_eq!(std::fs::read_to_string(format!("{p}.args")).unwrap().trim(), "auth token");
         host.account("lux").await.unwrap();
         assert_eq!(std::fs::read_to_string(format!("{p}.args")).unwrap().trim(), "auth token --brand lux");
+    }
+
+    /// An agent that outlives a token asks the same `hanzo` Gen asked, never `gen`.
+    #[test]
+    fn a_fresh_token_comes_from_the_cli() {
+        assert_eq!(Command::new("/opt/bin/hanzo").profile().refresh, ["/opt/bin/hanzo", "auth", "token"]);
+        let found = Command::default().profile().refresh;
+        assert_eq!(found[1..], ["auth", "token"]);
+        assert!(found[0].ends_with("hanzo") || found[0].ends_with("hanzo.exe"), "{found:?}");
     }
 
     #[cfg(unix)]
