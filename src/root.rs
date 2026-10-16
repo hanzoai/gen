@@ -119,14 +119,15 @@ mod tests {
     /// THE gate for keeping tests out of the developer's home, and programs out of
     /// a repository's reach. Gen links no crate that resolves a home, so the only
     /// way in is the environment, and only this file reads a home from it; only a
-    /// binary's `main` asks for the user's root; and only `exe.rs` searches PATH.
+    /// binary's `main` asks for the user's root; and only `exe.rs` searches PATH
+    /// or makes a `Command`, so every child gets the PATH Gen searched.
     #[test]
     fn root_is_the_one_resolver() {
         let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let rules: [(&[&str], &[&str]); 3] = [
             (&["src/root.rs"], &["\"HOME\"", "\"USERPROFILE\"", "\"LOCALAPPDATA\"", "\"XDG_", "home_dir", "dirs::"]),
             (&["src/main.rs", "src/root.rs"], &["Root::user(", "Root::need("]),
-            (&["src/exe.rs"], &["which::", "\"PATH\""]),
+            (&["src/exe.rs"], &["which::", "\"PATH\"", "Command::new(", "env_clear("]),
         ];
         let mut found = Vec::new();
         let mut left = vec![src];

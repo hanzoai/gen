@@ -71,7 +71,7 @@ impl Backend for Agent {
     }
 
     fn build(&self, spec: &Spec) -> Result<Launch> {
-        let mut cmd = tokio::process::Command::new(crate::exe::find(self.program).unwrap_or_else(|| self.program.into()));
+        let mut cmd = tokio::process::Command::from(crate::exe::command(crate::exe::find(self.program).unwrap_or_else(|| self.program.into())));
         cmd.current_dir(&spec.cwd);
 
         let mut args: Vec<String> = Vec::new();

@@ -1078,9 +1078,10 @@ async fn run_turn(
     if control.is_some() {
         control::hear(&mut command);
     }
+    let mut relay = control::relay();
     let mut child = spawn(&mut command, backend.label())?;
     let pid = child.id();
-    let relay = control::relay(pid);
+    relay.to(pid);
     let mut acted: Option<Act> = None;
 
     let outcome = match (structured, control) {
@@ -1122,9 +1123,7 @@ async fn run_turn(
     };
 
     let status = child.wait().await.context("waiting for backend")?;
-    if let Some(r) = relay {
-        r.abort();
-    }
+    drop(relay);
     drop(cleanup);
     Ok((outcome, status.success(), acted))
 }
@@ -1213,8 +1212,9 @@ async fn run_interactive(
 ) -> Result<bool> {
     let Launch { mut command, cleanup } = launch;
     command.stdin(Stdio::inherit()).stdout(Stdio::inherit()).stderr(Stdio::inherit());
+    let mut relay = control::relay();
     let mut child = spawn(&mut command, backend.label())?;
-    let relay = control::relay(child.id());
+    relay.to(child.id());
 
     // Linked interactive per-event streaming rides the backend transcript tail.
     let stop = Arc::new(AtomicBool::new(false));
@@ -1226,9 +1226,7 @@ async fn run_interactive(
     };
 
     let status = child.wait().await.context("waiting for backend")?;
-    if let Some(r) = relay {
-        r.abort();
-    }
+    drop(relay);
     stop.store(true, Ordering::Relaxed);
     if let Some(h) = tail {
         let _ = h.await;
@@ -1817,9 +1815,9 @@ mod tests {
             let mut f = tempfile::Builder::new().suffix(".jsonl").tempfile().unwrap();
             f.write_all(self.fixture.as_bytes()).unwrap();
             let path = f.into_temp_path();
-            let mut command = tokio::process::Command::new(crate::exe::find("cat").expect("cat"));
+            let mut command = tokio::process::Command::from(crate::exe::command(crate::exe::find("cat").expect("cat")));
             command.arg(&*path);
-            Ok(Launch { command, cleanup: crate::backend::Scratch { files: vec![path], dirs: Vec::new() } })
+            Ok(Launch { command, cleanup: crate::backend::Scratch { files: vec![path], ..Default::default() } })
         }
         fn parse(&self, line: &str) -> Vec<Mapped> {
             Claude.parse(line)
@@ -2237,7 +2235,7 @@ mod control_tests {
             let mut b = self.built.lock().unwrap();
             let idx = b.len().min(self.scripts.len() - 1);
             b.push((spec.resume.clone(), spec.task.clone()));
-            let mut command = tokio::process::Command::new(crate::exe::find("sh").expect("sh"));
+            let mut command = tokio::process::Command::from(crate::exe::command(crate::exe::find("sh").expect("sh")));
             command.arg("-c").arg(self.scripts[idx]);
             // Every turn starts with both control signals ignored, as a
             // supervisor launched in the background hands them down, so these

@@ -18,7 +18,7 @@ sandbox run`, so every launcher takes the same flags and runs `hanzo_gen::run`.
 | `src/args.rs` | `Args` (the clap flags), `Args::dev(command)` (tool is a flag), `Args::into_options`, `expand` (`--<agent>` → `--backend <agent>`). |
 | `src/host.rs` | `Host` trait, `Account`, `Profile`, `Provider`, `BRAND`, `token(brand)`, `claim` (THE owner/name validator, the CLI's too), and `host::Command` (the standalone host). |
 | `src/root.rs` | `Root`: every path Gen writes under a home, from one value the launcher picks (`Root::user()` / `Root::need()` in a `main`, `Root::at(dir)` in tests). Reads `$HOME` itself: an unset, empty or relative home is no home. |
-| `src/exe.rs` | THE program resolver: `find` (full path, absolute PATH entries only), `confine` (a child's PATH), `version` (with a time limit). Every spawn and lookup goes through it; `lib.rs`'s `spawn` refuses a program not named by full path. |
+| `src/exe.rs` | THE program resolver: `find` (full path, absolute PATH entries only), `command` / `bare` (THE way to make a `Command`: the child gets only those entries, so a `#!/usr/bin/env node` finds no `./node`; on Windows `NoDefaultCurrentDirectoryInExePath=1`), `version` (in the program's own directory, first line only, with a time limit). `root_is_the_one_resolver` fails the build on a `Command::new` anywhere else; `lib.rs`'s `spawn` refuses a program not named by full path. |
 | `src/main.rs` | the `gen` binary: `__mcp` proxy, `expand`, parse, `dev("gen")`, `into_options(Root::need()?)`, `run(host::Command::found())`. |
 | `src/backend.rs` | `BackendKind`, `select` (THE one place a backend is resolved), `Spec`, `Route`/`Routing`, `resolve_mcp`. |
 | `src/agents/` | one adapter per third-party agent + `wire.rs`; `testdata/*.jsonl` are real captured streams. |
@@ -81,15 +81,25 @@ fails the build if anything else resolves `$HOME`; tests use `root::scratch()`, 
 temp dir per test process.
 
 **Each Hanzo-routed launch of an agent that reads a home (grok, cline, hermes,
-omp, pi, crush) gets its own**, `~/.hanzo/<agent>/run-<pid>-XXXX`, mode 0700, held
-in `Launch.cleanup` (`Scratch { files, dirs }`) and removed when the session ends.
-Its config names that session's `--project-dir` and `--ledger`; a shared home let
-one session's tools act on another's repository. On its own account an agent gets
-no home of ours (crush keeps its own data directory and history). While a child
-runs, `control::relay` holds SIGINT, SIGTERM and SIGHUP (passing TERM and HUP to
-the child) so the session always closes out and removes its homes; a SIGKILLed
-one leaves `run-<pid>-*`, which the next run of that agent sweeps once the pid is
-gone.
+omp, pi, crush) gets its own**, `~/.hanzo/<agent>/run-XXXX`, mode 0700, held in
+`Launch.cleanup` (`Scratch { files, locks, dirs }`) and removed when the session
+ends. Its config names that session's `--project-dir` and `--ledger`; a shared home
+let one session's tools act on another's repository. On its own account an agent
+gets no home of ours (crush keeps its own data directory and history).
+
+A home's `gen.lock` is locked (`File::try_lock`) for the session's life, by Gen and
+by the agent, which inherits the descriptor; the next run of that agent sweeps only
+homes whose lock it can take. So a session on another host, in another pid
+namespace, or whose agent outlived Gen keeps its home, and a SIGKILLed one's home
+goes. A home with no lock file yet is being made and is left.
+
+`control::relay()` is made before the child starts and named with `Relay::to(pid)`:
+while the child runs, SIGTERM and SIGHUP go to it, and SIGINT too unless Gen is in
+its terminal's foreground group (the child heard that Ctrl-C already). A signal Gen
+was started ignoring (`nohup`) stays ignored. Dropping the relay once the child is
+reaped puts each signal back as Gen started with it, so one that comes while the
+session closes out ends Gen at once. `tests/signals.rs` holds all of it against the
+built binary. On Windows only Ctrl-C is held.
 
 ## Rules
 
@@ -117,26 +127,39 @@ gone.
 The version is set by hand in Cargo.toml and the tag `vX.Y.Z` names it;
 `.github/workflows/release.yml` refuses a mismatch and mints nothing. It builds
 five targets from one amd64 runner (musl + darwin via cargo-zigbuild, msvc via
-cargo-xwin), verifies all ten files, smokes the linux binary, attests the five
-archives and publishes. hanzo.sh installs `gen` once a release carries this
-machine's archive.
+cargo-xwin), smokes the linux binary in a job that holds nothing, verifies all ten
+files, attests the five archives and publishes. hanzo.sh installs `gen` once a
+release carries this machine's archive.
 
 Permissions are per job: nothing by default; `version` and `build` read only,
 hold no secret and restore no cache (builds run cold: a build compiles
 third-party build scripts, and a cache it trusted would be code anyone who can
-write the store could plant). Each build hands publish its archive as an artifact
-named for its target and the archive's sha256 as a job output; publish downloads
-each artifact by exact name, refuses an archive whose digest is not its build's,
-attests the five archives (`actions/attest-build-provenance`), and only then
-opens, fills and publishes the release. Actions, and hanzoai/ci in `cicd.yml`,
-are pinned by commit. hanzoai/cli's install.sh verifies a gen download's
-attestation against `.github/workflows/release.yml` at its tag with a signed-in
-`gh` (hanzo.sh names the signer in gen's row).
+write the store could plant). Each build hands on its archive as an artifact
+named for its target and the archive's sha256 as a job output. `smoke`
+(`permissions: {}`) runs the linux binary; `publish` needs it, runs nothing it was
+handed, downloads each artifact by exact name into `dist/<target>/` (which must
+hold exactly that target's two files), refuses an archive whose digest is not its
+build's, attests the five archives (`actions/attest-build-provenance`), and only
+then opens, fills and publishes the release; the write token is in that one step's
+environment. Actions, and hanzoai/ci in `cicd.yml`, are pinned by commit; hanzoai/ci
+at that commit still names `actions/checkout@v4` and `dtolnay/rust-toolchain@stable`
+by tag, which is hanzoai/ci's to pin.
 
-Repository: immutable releases on; rulesets keep `main` from force-push and
-deletion (no bypass), require a pull request on `main` from anyone but an admin,
-and let only an admin create `v*` tags, which nobody can move or delete; the
-default workflow token is read-only.
+hanzoai/cli's install.sh verifies a gen download's attestation against
+`.github/workflows/release.yml` at its tag with a signed-in `gh` that has
+`attestation verify --source-ref` (hanzo.sh names the signer in gen's row); with
+none, or an older gh (Ubuntu's 2.45.0), the install says "provenance not checked"
+and why. A tool with a signer installs from `vX.Y.Z` tags only. hanzo.sh passes
+the signer only once that install.sh is on hanzoai/cli main.
+
+Repository, as set: immutable releases on, so a published release's assets and
+tag stay as published. Ruleset "main" keeps `main` from force-push and deletion,
+no bypass. "main through a pull request" requires a pull request with 0 approvals;
+the admin role bypasses it. "release tags" blocks creating, updating, deleting and
+force-pushing `refs/tags/v*`; the admin role bypasses all four, always. Every
+hanzoai member is an org admin (11 of 11), so in practice any member can push a
+`v*` tag and cut a release. The default workflow token is read-only and Actions
+are off until the owner turns them on.
 
 **The org build cache is code a build trusts, and more can write it than any one
 repository (which is why this release does not use it).** hanzoai/ci `bin/cache`

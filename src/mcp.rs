@@ -134,7 +134,7 @@ pub fn command(program: &str, args: &[String]) -> Spawn {
     let (program, args) = (program.to_string(), args.to_vec());
     Arc::new(move || {
         let bin = crate::exe::find(&program).ok_or_else(|| anyhow!("{program} is not installed (not found by its full path)"))?;
-        let mut child = Command::new(bin)
+        let mut child = Command::from(crate::exe::command(bin))
             .args(&args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -668,6 +668,7 @@ mod tests {
         assert_ne!(a, key("/bin/ls", &["--project-dir".into(), "/a".into(), "--x".into()], "v"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_kept_answer_is_owner_only() {
         use std::os::unix::fs::PermissionsExt;

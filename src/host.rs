@@ -220,7 +220,7 @@ impl Command {
 
     async fn ask_within(&self, args: &[String], patience: Duration) -> std::result::Result<String, Asked> {
         let program = self.program.as_ref().ok_or(Asked::Missing)?;
-        let run = tokio::process::Command::new(program)
+        let run = tokio::process::Command::from(crate::exe::command(program))
             .args(args)
             .stdin(Stdio::null())
             .kill_on_drop(true)
@@ -337,6 +337,7 @@ mod tests {
         format!("{}.{}.sig", b(r#"{"alg":"RS256"}"#), b(claims))
     }
 
+    #[cfg(unix)]
     fn profile() -> Profile {
         Profile {
             api: "http://localhost:8080".into(),
@@ -365,25 +366,8 @@ mod tests {
     /// A stand-in `hanzo` that runs `body`.
     #[cfg(unix)]
     fn script(body: &str) -> (tempfile::TempDir, PathBuf) {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("hanzo");
-        std::fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        // A thread of another test that forks while this file is open for writing
-        // carries that descriptor until it execs, and the kernel refuses to run a
-        // file held open for writing. Start it once that has passed.
-        loop {
-            match std::process::Command::new(&path).stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
-                Ok(mut child) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    break;
-                }
-                Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::ExecutableFileBusy, "{e}"),
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        let path = crate::exe::stub(dir.path(), "hanzo", body);
         let _ = std::fs::remove_file(dir.path().join("hanzo.args"));
         (dir, path)
     }

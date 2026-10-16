@@ -391,6 +391,8 @@ pub struct Launch {
 #[derive(Default)]
 pub struct Scratch {
     pub files: Vec<tempfile::TempPath>,
+    /// Held while the session lives, released before its homes go.
+    pub locks: Vec<std::fs::File>,
     pub dirs: Vec<tempfile::TempDir>,
 }
 

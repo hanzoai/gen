@@ -191,7 +191,7 @@ pub struct Run<'a> {
 
 impl<'a> Run<'a> {
     fn new(spec: &'a Spec, program: &str) -> Run<'a> {
-        let mut cmd = tokio::process::Command::new(program);
+        let mut cmd = tokio::process::Command::from(crate::exe::command(program));
         cmd.current_dir(&spec.cwd);
         Run { spec, cmd, cleanup: Default::default() }
     }
@@ -259,23 +259,31 @@ impl<'a> Run<'a> {
     /// agent gets a home of its own rather than rewriting this one's.
     ///
     /// The session removes it on any ending it lives through (a signal included,
-    /// see `control::relay`); one it does not (SIGKILL, power) leaves it behind,
-    /// named for its process, and the next run of that agent sweeps it.
+    /// see `control::relay`). One it does not (SIGKILL, power) is left behind with
+    /// its lock free, and the next run of that agent sweeps it.
     pub fn home(&mut self, name: &str) -> Result<PathBuf> {
         let parent = self.spec.root.hanzo().join(name);
         super::kit::private_dir(&parent)?;
         sweep(&parent);
-        let d = tempfile::Builder::new()
-            .prefix(&format!("run-{}-", std::process::id()))
-            .tempdir_in(&parent)
-            .with_context(|| format!("making a home for {name} in {}", parent.display()))?;
+        let (d, lock) = claim(&parent).with_context(|| format!("making a home for {name} in {}", parent.display()))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
+            use std::os::unix::io::AsRawFd;
             std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o700))
                 .with_context(|| format!("making {} owner-only", d.path().display()))?;
+            // The agent holds the lock too, so its home outlives Gen as long as it does.
+            let fd = lock.as_raw_fd();
+            // SAFETY: fcntl(2) is async-signal-safe, which is all pre_exec asks.
+            unsafe {
+                self.cmd.pre_exec(move || match libc::fcntl(fd, libc::F_SETFD, 0) {
+                    -1 => Err(std::io::Error::last_os_error()),
+                    _ => Ok(()),
+                });
+            }
         }
         let path = d.path().to_path_buf();
+        self.cleanup.locks.push(lock);
         self.cleanup.dirs.push(d);
         Ok(path)
     }
@@ -286,35 +294,40 @@ impl<'a> Run<'a> {
     }
 }
 
-/// Remove the run homes in `parent` whose process is gone. Only a home named
-/// `run-<pid>-…` for a pid that no longer exists goes; anything else is left.
-fn sweep(parent: &Path) {
-    let Ok(entries) = std::fs::read_dir(parent) else { return };
-    for e in entries.flatten() {
-        let name = e.file_name();
-        let pid = name
-            .to_str()
-            .and_then(|n| n.strip_prefix("run-"))
-            .and_then(|r| r.split('-').next())
-            .and_then(|p| p.parse::<u32>().ok());
-        if pid.is_some_and(gone) {
-            let _ = std::fs::remove_dir_all(e.path());
+/// The file in a run home whose lock says a session lives in it.
+const LOCK: &str = "gen.lock";
+
+/// A new run home in `parent` with its lock held. A sweep may take a home in the
+/// moment between its lock file being made and being locked, so a lock is good
+/// only if its file is still there once it is held.
+fn claim(parent: &Path) -> std::io::Result<(tempfile::TempDir, std::fs::File)> {
+    loop {
+        let d = tempfile::Builder::new().prefix("run-").tempdir_in(parent)?;
+        let lock = std::fs::File::create_new(d.path().join(LOCK))?;
+        match lock.try_lock() {
+            Ok(()) if d.path().join(LOCK).is_file() => return Ok((d, lock)),
+            Ok(()) | Err(std::fs::TryLockError::WouldBlock) => continue,
+            // Where nothing can be locked, nothing is swept either.
+            Err(std::fs::TryLockError::Error(_)) => return Ok((d, lock)),
         }
     }
 }
 
-/// Whether no process has this pid: the one answer that lets a home go.
-#[cfg(unix)]
-fn gone(pid: u32) -> bool {
-    let Ok(pid) = i32::try_from(pid) else { return false };
-    // SAFETY: signal 0 delivers nothing; it asks whether the pid exists.
-    unsafe { libc::kill(pid, 0) != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) }
-}
-
-/// Without a cheap way to ask, no home is taken for gone.
-#[cfg(not(unix))]
-fn gone(_pid: u32) -> bool {
-    false
+/// Remove the run homes in `parent` that no session holds: a home goes only once
+/// its lock can be taken, which no pid can answer for — a session on another
+/// host, in another pid namespace, or whose agent outlived Gen holds it still.
+/// One whose lock file is not there yet is being made, and is left.
+fn sweep(parent: &Path) {
+    let Ok(entries) = std::fs::read_dir(parent) else { return };
+    for e in entries.flatten() {
+        if !e.file_name().to_str().is_some_and(|n| n.starts_with("run-")) {
+            continue;
+        }
+        let Ok(lock) = std::fs::File::open(e.path().join(LOCK)) else { continue };
+        if lock.try_lock().is_ok() {
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
 }
 
 /// What an agent's reader keeps between lines: text that arrives in pieces, and
@@ -527,23 +540,59 @@ mod tests {
         }
     }
 
-    /// A home whose session died without cleaning up (SIGKILL) is swept by the
-    /// next run of that agent; a live session's home is never touched.
-    #[cfg(unix)]
+    /// A home is swept once no session holds its lock, whatever pid made it: one
+    /// whose session died without cleaning up (SIGKILL) goes with the next run of
+    /// that agent; one held elsewhere (another host, another pid namespace), one
+    /// being made, and this session's own are kept.
     #[test]
-    fn a_dead_sessions_home_is_swept_and_a_live_ones_kept() {
+    fn a_home_is_swept_once_its_lock_is_free() {
         let s = test::spec(Mode::Headless, test::gateway());
         let parent = s.root.hanzo().join("pi");
         std::fs::create_dir_all(&parent).unwrap();
-        // A pid that cannot be running: past the kernel's limit.
-        let dead = parent.join("run-4194999-abc");
-        std::fs::create_dir_all(dead.join("x")).unwrap();
+        let home = |name: &str, lock: bool| {
+            let d = parent.join(name);
+            std::fs::create_dir_all(d.join("x")).unwrap();
+            lock.then(|| std::fs::File::create(d.join(LOCK)).unwrap())
+        };
+        drop(home("run-dead", true));
+        let held = home("run-held", true).unwrap();
+        held.lock().unwrap();
+        home("run-new", false);
         let live = test::build("pi", &s);
         let mine = test::env(&live, "PI_CODING_AGENT_DIR").unwrap();
         let other = test::build("pi", &s);
-        assert!(!dead.exists(), "a dead session's home was left behind");
+        assert!(!parent.join("run-dead").exists(), "a dead session's home was left behind");
+        assert!(parent.join("run-held").is_dir(), "a home held elsewhere was swept");
+        assert!(parent.join("run-new").is_dir(), "a home being made was swept");
         assert!(Path::new(&mine).is_dir(), "a live session's home was swept");
-        drop((live, other));
+        drop((live, other, held));
+        sweep(&parent);
+        assert!(!parent.join("run-held").exists(), "a home was kept after its lock was let go");
+        let _ = std::fs::remove_dir_all(parent.join("run-new"));
+    }
+
+    /// The agent holds its home's lock as well, so a home outlives a Gen that died
+    /// while its agent runs on, and goes once the agent does.
+    #[cfg(unix)]
+    #[test]
+    fn a_home_lives_as_long_as_its_agent() {
+        let s = test::spec(Mode::Headless, test::gateway());
+        let sh = crate::exe::find("sh").unwrap();
+        let mut run = Run::new(&s, sh.to_str().unwrap());
+        let home = run.home("hold").unwrap();
+        run.args(["-c", "read x"]).cmd.stdin(std::process::Stdio::piped()).current_dir(&home);
+        let mut agent = run.cmd.as_std_mut().spawn().unwrap();
+        let crate::backend::Scratch { locks, dirs, .. } = std::mem::take(&mut run.cleanup);
+        drop(locks);
+        let kept: Vec<PathBuf> = dirs.into_iter().map(tempfile::TempDir::keep).collect();
+        let parent = s.root.hanzo().join("hold");
+        sweep(&parent);
+        assert!(home.is_dir(), "a home was swept while its agent ran");
+        drop(agent.stdin.take());
+        agent.wait().unwrap();
+        sweep(&parent);
+        assert!(!home.exists(), "a home outlived its agent");
+        assert_eq!(kept, vec![home]);
     }
 
     #[test]

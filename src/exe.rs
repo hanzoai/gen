@@ -32,14 +32,35 @@ pub fn find_in(name: &str, path: &OsStr) -> Option<PathBuf> {
     which::which_in(name, Some(joined), Path::new("/")).ok().filter(|p| p.is_absolute())
 }
 
-/// Hand `cmd`'s child the PATH Gen searches, its empty and relative entries
-/// dropped, so the child finds its own helpers the same way (a probe runs with
-/// nothing else in its environment). Without one, the child gets none.
-pub fn confine(cmd: &mut std::process::Command) {
+/// THE way Gen starts a program: `program` (a full path, from [`find`]) with the
+/// PATH Gen searches, its empty and relative entries dropped. The child's own
+/// lookups — an interpreter named by a `#!/usr/bin/env node` line, the tools an
+/// agent runs — then search the same absolute entries, so a repository's `./node`
+/// is never one of them. On Windows, where cmd.exe looks in the working directory
+/// before PATH (an npm `.cmd` shim runs `"node"` through it), that look is turned
+/// off for the child and everything it starts. Nothing else makes a `Command`.
+pub fn command(program: impl AsRef<OsStr>) -> std::process::Command {
+    let mut cmd = std::process::Command::new(program);
+    confine(&mut cmd);
+    cmd
+}
+
+/// [`command`] with nothing else in its environment: a probe hands a program no
+/// value of the session's.
+pub fn bare(program: impl AsRef<OsStr>) -> std::process::Command {
+    let mut cmd = std::process::Command::new(program);
+    cmd.env_clear();
+    confine(&mut cmd);
+    cmd
+}
+
+fn confine(cmd: &mut std::process::Command) {
     match std::env::var_os("PATH").and_then(|p| search(&p)) {
         Some(p) => cmd.env("PATH", p),
         None => cmd.env_remove("PATH"),
     };
+    #[cfg(windows)]
+    cmd.env("NoDefaultCurrentDirectoryInExePath", "1");
 }
 
 fn search(path: &OsStr) -> Option<OsString> {
@@ -50,22 +71,34 @@ fn search(path: &OsStr) -> Option<OsString> {
     std::env::join_paths(dirs).ok()
 }
 
-/// The first line `program --version` prints, given `patience` to print it. A
-/// program that is not found, fails, or hangs has no version.
+/// The first line `program --version` prints, given `patience` to print it and
+/// exit. A program that is not found, fails, or takes longer has no version. It
+/// runs in its own directory, never the session's: a version is the program's,
+/// and a repository has no say in it. Only the first line is read, so a child it
+/// leaves holding the output open costs nothing.
 pub fn version(program: &str, patience: Duration) -> Option<String> {
     let bin = find(program)?;
-    let mut child = std::process::Command::new(bin)
+    let mut child = command(&bin)
         .arg("--version")
+        .current_dir(bin.parent()?)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
     let deadline = Instant::now() + patience;
+    let out = child.stdout.take()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let mut first = std::io::BufReader::new(std::io::Read::take(out, 4096));
+        let _ = tx.send(std::io::BufRead::read_line(&mut first, &mut line).map(|_| line));
+    });
+    let read = rx.recv_timeout(deadline.saturating_duration_since(Instant::now()));
     let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+        match (&read, child.try_wait()) {
+            (Ok(Ok(_)), Ok(Some(status))) => break status,
+            (Ok(Ok(_)), Ok(None)) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -73,12 +106,31 @@ pub fn version(program: &str, patience: Duration) -> Option<String> {
             }
         }
     };
-    if !status.success() {
-        return None;
+    let line = read.ok()?.ok()?.trim().to_string();
+    (status.success() && !line.is_empty()).then_some(line)
+}
+
+/// A stand-in program `name` running `body` in `dir`, once the kernel will run it.
+#[cfg(all(test, unix))]
+pub(crate) fn stub(dir: &Path, name: &str, body: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let p = dir.join(name);
+    std::fs::write(&p, format!("#!/bin/sh\n{body}")).unwrap();
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // A thread of another test that forks while this file is open for writing
+    // carries that descriptor until it execs, and the kernel refuses to run a
+    // file held open for writing. Hand it over once that has passed.
+    loop {
+        match command(&p).stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
+            Ok(mut c) => {
+                let _ = c.kill();
+                let _ = c.wait();
+                return p;
+            }
+            Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::ExecutableFileBusy, "{e}"),
+        }
+        std::thread::sleep(Duration::from_millis(10));
     }
-    let mut out = String::new();
-    std::io::Read::read_to_string(&mut child.stdout.take()?, &mut out).ok()?;
-    out.lines().next().map(|l| l.trim().to_string()).filter(|l| !l.is_empty())
 }
 
 #[cfg(test)]
@@ -88,23 +140,8 @@ mod tests {
     /// A stand-in program in a directory of its own.
     #[cfg(unix)]
     fn program(name: &str, body: &str) -> (tempfile::TempDir, PathBuf) {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join(name);
-        std::fs::write(&p, format!("#!/bin/sh\n{body}")).unwrap();
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
-        // Another test's fork may hold the file open for writing until it execs.
-        loop {
-            match std::process::Command::new(&p).stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
-                Ok(mut c) => {
-                    let _ = c.kill();
-                    let _ = c.wait();
-                    break;
-                }
-                Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::ExecutableFileBusy, "{e}"),
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        let p = stub(dir.path(), name, body);
         (dir, p)
     }
 
@@ -135,5 +172,39 @@ mod tests {
         assert_eq!(version(hang.to_str().unwrap(), Duration::from_millis(200)), None);
         assert!(started.elapsed() < Duration::from_secs(5), "it gave up when it said it would");
         assert_eq!(version("./quick", Duration::from_secs(1)), None);
+        // A child left holding the output open is no reason to wait for it.
+        let (_d3, linger) = program("linger", "sleep 5 &\necho 'linger 2.0'\n");
+        let started = Instant::now();
+        assert_eq!(version(linger.to_str().unwrap(), Duration::from_secs(3)).as_deref(), Some("linger 2.0"));
+        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+        // Nor is endless output: only the first line is ever read.
+        let (_d4, flood) = program("flood", "exec yes\n");
+        assert_eq!(version(flood.to_str().unwrap(), Duration::from_millis(500)), None);
+    }
+
+    /// A version is the program's own: it is asked in the program's directory,
+    /// never the session's, which a repository controls.
+    #[cfg(unix)]
+    #[test]
+    fn a_version_is_asked_where_the_program_lives() {
+        let (dir, pwd) = program("pwd", "pwd -P\n");
+        let here = std::fs::canonicalize(dir.path()).unwrap();
+        assert_eq!(version(pwd.to_str().unwrap(), Duration::from_secs(5)), Some(here.display().to_string()));
+    }
+
+    /// Every child is handed the PATH Gen searched, so an interpreter a `#!` line
+    /// names by a bare word is found where Gen would find it, never in `.`.
+    #[test]
+    fn a_child_is_handed_only_the_absolute_entries_of_path() {
+        let cmd = command("/bin/true");
+        let handed = cmd.get_envs().find(|(k, _)| *k == "PATH").and_then(|(_, v)| v).map(OsStr::to_os_string);
+        let expected = std::env::var_os("PATH").and_then(|p| search(&p));
+        assert_eq!(handed, expected);
+        for d in std::env::split_paths(handed.as_deref().unwrap_or_default()) {
+            assert!(d.is_absolute(), "{}", d.display());
+        }
+        let bare = bare("/bin/true");
+        let names: Vec<_> = bare.get_envs().map(|(k, _)| k.to_os_string()).collect();
+        assert!(names.iter().all(|k| k == "PATH" || k == "NoDefaultCurrentDirectoryInExePath"), "{names:?}");
     }
 }

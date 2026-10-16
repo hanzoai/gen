@@ -15,10 +15,12 @@
 # `version` and the five `build` jobs read the repository and nothing else: they
 # compile code from crates and toolchains, and a build that could write the
 # release could ship whatever one of those injected. Builds hand their archives
-# to `publish` as artifacts. `publish` alone writes: it verifies every archive
-# against its checksum and runs the linux one, attests all ten (build provenance,
-# `gh attestation verify gen-linux-amd64.tar.gz -R hanzoai/gen`), and only then
-# opens, fills and publishes the release. No checkout keeps its credential.
+# on as artifacts. `smoke` runs what was built, so it holds nothing at all.
+# `publish` alone writes, and it executes nothing it was handed: it checks every
+# archive against the digest its build reported, attests all ten (build
+# provenance, `gh attestation verify gen-linux-amd64.tar.gz -R hanzoai/gen`), and
+# only then opens, fills and publishes the release. No checkout keeps its
+# credential.
 #
 # The runners are this org's own (`linux-amd64`); the image carries cc, make,
 # curl, jq, tar, xz, zip, git and python3, and no Rust and no LLVM, so Rust comes
@@ -35,10 +37,14 @@
 # could plant (LLM.md: the build cache). Gen is small enough that this costs
 # minutes, once per release.
 #
-# What a build hands publish is its archive, as an artifact named for its target,
-# and the archive's sha256 as a job output. Publish downloads each artifact by
-# its exact name and refuses an archive whose digest is not the one its build
-# reported, before it checks the `.sha256` beside it.
+# What a build hands on is its archive, as an artifact named for its target, and
+# the archive's sha256 as a job output. Each artifact is downloaded by its exact
+# name into a directory of its own, which must hold exactly that target's two
+# files, so no leg can put a file where another target's goes; and an archive
+# whose digest is not the one its build reported is refused, before the
+# `.sha256` beside it is read. A leg that reports another target's digest can
+# only fail the release, since that target's archive comes from that target's
+# artifact.
 name: Release
 on:
   push:
@@ -191,7 +197,7 @@ jobs:
           (cd dist && sha256sum "gen-$short.tar.gz" > "gen-$short.tar.gz.sha256")
           echo "$short=$(cut -d' ' -f1 "dist/gen-$short.tar.gz.sha256")" >> "$GITHUB_OUTPUT"
           ls -la dist
-      - name: Hand the archive to publish
+      - name: Hand the archive on
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: gen-${{ matrix.target.id }}
@@ -199,8 +205,30 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  publish:
+  # Runs what the release ships, holding nothing: the linux binary is native to
+  # this runner, so it answers for the matrix that the artifacts are programs.
+  smoke:
     needs: [version, build]
+    runs-on: [linux-amd64]
+    permissions: {}
+    timeout-minutes: 10
+    env:
+      V: ${{ needs.version.outputs.version }}
+      DIGESTS: ${{ toJSON(needs.build.outputs) }}
+    steps:
+      - { name: gen-linux-amd64, uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093, with: { name: gen-linux-amd64, path: dist/linux-amd64 } } # v4.3.0
+      - name: The shipped binary says its version
+        run: |
+          set -euo pipefail
+          want=$(printf '%s' "$DIGESTS" | jq -r '."linux-amd64" // empty')
+          [ "$(sha256sum dist/linux-amd64/gen-linux-amd64.tar.gz | cut -d' ' -f1)" = "$want" ] || { echo "::error::gen-linux-amd64.tar.gz is not the archive its build made"; exit 1; }
+          x=$(mktemp -d); tar -xzf dist/linux-amd64/gen-linux-amd64.tar.gz -C "$x"
+          "$x/gen" --version | grep -qF "$V" || { echo "::error::the shipped binary does not say $V"; "$x/gen" --version; exit 1; }
+          "$x/gen" --help >/dev/null
+          echo "smoked: $("$x/gen" --version)"
+
+  publish:
+    needs: [version, build, smoke]
     runs-on: [linux-amd64]
     permissions:
       contents: write
@@ -209,39 +237,35 @@ jobs:
     timeout-minutes: 30
     env:
       V: ${{ needs.version.outputs.version }}
-      GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
     steps:
-      - { name: gen-linux-amd64, uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093, with: { name: gen-linux-amd64, path: dist } } # v4.3.0
-      - { name: gen-linux-arm64, uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093, with: { name: gen-linux-arm64, path: dist } } # v4.3.0
-      - { name: gen-darwin-amd64, uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093, with: { name: gen-darwin-amd64, path: dist } } # v4.3.0
-      - { name: gen-darwin-arm64, uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093, with: { name: gen-darwin-arm64, path: dist } } # v4.3.0
-      - { name: gen-windows-amd64, uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093, with: { name: gen-windows-amd64, path: dist } } # v4.3.0
-      - name: Every archive is the one its build reported, whole, and runs
+      - { name: gen-linux-amd64, uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093, with: { name: gen-linux-amd64, path: dist/linux-amd64 } } # v4.3.0
+      - { name: gen-linux-arm64, uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093, with: { name: gen-linux-arm64, path: dist/linux-arm64 } } # v4.3.0
+      - { name: gen-darwin-amd64, uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093, with: { name: gen-darwin-amd64, path: dist/darwin-amd64 } } # v4.3.0
+      - { name: gen-darwin-arm64, uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093, with: { name: gen-darwin-arm64, path: dist/darwin-arm64 } } # v4.3.0
+      - { name: gen-windows-amd64, uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093, with: { name: gen-windows-amd64, path: dist/windows-amd64 } } # v4.3.0
+      - name: Every archive is the one its build reported, whole
         env:
           DIGESTS: ${{ toJSON(needs.build.outputs) }}
         run: |
           set -euo pipefail
-          n=$(ls dist | wc -l)
-          [ "$n" -eq 10 ] || { echo "::error::$n files, want 10"; ls -la dist; exit 1; }
           for t in linux-amd64 linux-arm64 darwin-amd64 darwin-arm64 windows-amd64; do
+            have=$(ls -A "dist/$t" | sort | tr '\n' ' ')
+            [ "$have" = "gen-$t.tar.gz gen-$t.tar.gz.sha256 " ] || { echo "::error::artifact gen-$t holds: $have"; exit 1; }
             want=$(printf '%s' "$DIGESTS" | jq -r --arg t "$t" '.[$t] // empty')
             printf '%s' "$want" | grep -Eq '^[0-9a-f]{64}$' || { echo "::error::the $t build reported no digest"; exit 1; }
-            got=$(sha256sum "dist/gen-$t.tar.gz" | cut -d' ' -f1)
+            got=$(sha256sum "dist/$t/gen-$t.tar.gz" | cut -d' ' -f1)
             [ "$got" = "$want" ] || { echo "::error::gen-$t.tar.gz is $got, but its build made $want"; exit 1; }
-            [ "$(cut -d' ' -f1 "dist/gen-$t.tar.gz.sha256")" = "$want" ] || { echo "::error::gen-$t.tar.gz.sha256 does not name the archive its build made"; exit 1; }
+            [ "$(cut -d' ' -f1 "dist/$t/gen-$t.tar.gz.sha256")" = "$want" ] || { echo "::error::gen-$t.tar.gz.sha256 does not name the archive its build made"; exit 1; }
           done
-          # The release runs what it ships: the linux binary is native to this
-          # runner, so it answers for the matrix that the artifacts are programs.
-          x=$(mktemp -d); tar -xzf dist/gen-linux-amd64.tar.gz -C "$x"
-          "$x/gen" --version | grep -qF "$V" || { echo "::error::the shipped binary does not say $V"; "$x/gen" --version; exit 1; }
-          "$x/gen" --help >/dev/null
-          echo "10 files, each the archive its build reported; smoked: $("$x/gen" --version)"
+          echo "10 files, each the archive its build reported"
       - name: Attest what was built
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
-          subject-path: 'dist/gen-*.tar.gz'
+          subject-path: 'dist/*/gen-*.tar.gz'
       - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           auth=(-H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json")
@@ -257,13 +281,14 @@ jobs:
             *" true") rel=${rel% true} ;;
             *" false") echo "::error::v$V is already published: a version is never shipped twice"; exit 1 ;;
           esac
-          for f in dist/*; do
+          up=$(mktemp)
+          for f in dist/*/*; do
             n=$(basename "$f")
             old=$(curl -s "${auth[@]}" "https://api.github.com/repos/$REPO/releases/$rel/assets" | jq -r --arg n "$n" '.[]|select(.name==$n)|.id')
             for id in $old; do curl -s -X DELETE "${auth[@]}" "https://api.github.com/repos/$REPO/releases/assets/$id" >/dev/null; done
-            code=$(curl -s -o /tmp/up.json -w '%{http_code}' -X POST "${auth[@]}" -H 'Content-Type: application/octet-stream' \
+            code=$(curl -s -o "$up" -w '%{http_code}' -X POST "${auth[@]}" -H 'Content-Type: application/octet-stream' \
               --data-binary @"$f" "https://uploads.github.com/repos/$REPO/releases/$rel/assets?name=$n")
-            [ "$code" = 201 ] || { echo "::error::upload $n failed ($code)"; cat /tmp/up.json; exit 1; }
+            [ "$code" = 201 ] || { echo "::error::upload $n failed ($code)"; cat "$up"; exit 1; }
           done
           n=$(curl -s "${auth[@]}" "https://api.github.com/repos/$REPO/releases/$rel/assets?per_page=100" | jq length)
           [ "$n" -eq 10 ] || { echo "::error::the draft holds $n assets, want 10"; exit 1; }

@@ -15,7 +15,7 @@ use crate::private;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 
@@ -368,14 +368,8 @@ async fn gpus() -> (Vec<Gpu>, f64, Board) {
 /// influence a probe or round-trip into captured data — the SAME privacy hard-line
 /// the git probe holds. `kill_on_drop` guarantees a timed-out probe is reaped.
 pub(crate) async fn probe(program: &str, args: &[&str], timeout: Duration) -> Option<String> {
-    let mut cmd = tokio::process::Command::new(crate::exe::find(program)?);
-    cmd.args(args)
-        .env_clear()
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
-    crate::exe::confine(cmd.as_std_mut());
+    let mut cmd = tokio::process::Command::from(crate::exe::bare(crate::exe::find(program)?));
+    cmd.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).kill_on_drop(true);
     let mut child = cmd.spawn().ok()?;
     // Read at most PROBE_STDOUT_CAP bytes: a hostile probe that floods stdout can
     // never balloon memory. The bounded read fills, `out` drops (closing our read
@@ -684,7 +678,7 @@ pub fn machine_id(root: &Root) -> String {
 /// far weaker fact than `evo`, but it is still a fact, and it groups.
 pub fn hostname(root: &Root) -> String {
     crate::exe::find("hostname")
-        .and_then(|bin| Command::new(bin).output().ok())
+        .and_then(|bin| crate::exe::command(bin).output().ok())
         .filter(|o| o.status.success())
         .and_then(|o| named(&String::from_utf8_lossy(&o.stdout)))
         .or_else(|| std::env::var("HOSTNAME").ok().and_then(|h| named(&h)))
@@ -708,7 +702,7 @@ fn git_repo(cwd: &Path) -> Repo {
         // Neutralize the system/global gitconfig (a planted `core.fsmonitor`,
         // pager, alias or `include.path` there could otherwise run a command)
         // and never let git block on a credential/terminal prompt.
-        let out = Command::new(crate::exe::find("git")?)
+        let out = crate::exe::command(crate::exe::find("git")?)
             .arg("-C")
             .arg(cwd)
             .args(args)

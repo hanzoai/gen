@@ -89,6 +89,7 @@ pub(crate) enum Signal {
     /// Terminate — Claude still flushes, then exits 143.
     Term,
     /// The terminal went away.
+    #[cfg(unix)]
     Hup,
 }
 
@@ -261,38 +262,156 @@ pub(crate) fn hear(_command: &mut tokio::process::Command) {}
 /// Hold this process up while a child runs: a signal that would have ended it —
 /// SIGTERM from a `kill` or a service manager, SIGHUP from a terminal that went
 /// away, SIGINT — ends the CHILD instead, and this process ends when the child
-/// does, the normal way: its session closed out, its run homes removed. TERM and
-/// HUP are passed on, since a `kill` names this process alone; INT is not, since
-/// a terminal's Ctrl-C already reached the child, which shares its foreground
-/// group, and a second would cut short the abort the first began. Abort the
-/// returned task once the child has been waited for.
-#[cfg(unix)]
-pub(crate) fn relay(pid: Option<u32>) -> Option<tokio::task::JoinHandle<()>> {
-    use tokio::signal::unix::{signal, SignalKind};
-    let pid = pid?;
-    let (mut int, mut term, mut hup) = (
-        signal(SignalKind::interrupt()).ok()?,
-        signal(SignalKind::terminate()).ok()?,
-        signal(SignalKind::hangup()).ok()?,
-    );
-    Some(tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = int.recv() => {}
-                _ = term.recv() => { let _ = send(pid, Signal::Term); }
-                _ = hup.recv() => { let _ = send(pid, Signal::Hup); }
-            }
-        }
-    }))
+/// does, the normal way: its session closed out, its run homes removed.
+///
+/// TERM and HUP are passed on, since a `kill` names this process alone. INT is
+/// passed on too, except while this process is in its terminal's foreground
+/// group: a Ctrl-C reaches that whole group, the child already heard it, and a
+/// second would cut short the abort the first began. A signal this process was
+/// started ignoring (`nohup`, a background job of a non-interactive shell) stays
+/// ignored.
+///
+/// Make it before the child starts, so a signal that comes meanwhile waits for
+/// the child rather than ending this process, then name the child with
+/// [`Relay::to`]. Drop it once the child has been waited for: each signal goes
+/// back to what this process started with, so one that comes while the session
+/// closes out ends it at once.
+pub(crate) fn relay() -> Relay {
+    #[cfg(unix)]
+    let held = disposition::listen();
+    #[cfg(not(unix))]
+    let held = tokio::signal::windows::ctrl_c().ok();
+    Relay { held: Some(held), task: None }
 }
 
-/// Windows delivers Ctrl-C to the whole console, the child with it; holding it
-/// here is what keeps this process up to close the session out.
-#[cfg(not(unix))]
-pub(crate) fn relay(_pid: Option<u32>) -> Option<tokio::task::JoinHandle<()>> {
-    Some(tokio::spawn(async {
-        while tokio::signal::ctrl_c().await.is_ok() {}
-    }))
+/// The signals that would end this process, held for a child.
+pub(crate) struct Relay {
+    #[cfg(unix)]
+    held: Option<[Option<tokio::signal::unix::Signal>; 3]>,
+    #[cfg(not(unix))]
+    held: Option<Option<tokio::signal::windows::CtrlC>>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Relay {
+    /// Pass what is held on to the child `pid`.
+    #[cfg(unix)]
+    pub(crate) fn to(&mut self, pid: Option<u32>) {
+        let (Some(pid), Some([mut int, mut term, mut hup])) = (pid, self.held.take()) else { return };
+        self.task = Some(tokio::spawn(async move {
+            async fn next(s: &mut Option<tokio::signal::unix::Signal>) {
+                match s {
+                    Some(s) => {
+                        s.recv().await;
+                    }
+                    None => std::future::pending().await,
+                }
+            }
+            loop {
+                tokio::select! {
+                    _ = next(&mut int) => if !disposition::foreground() { let _ = send(pid, Signal::Int); },
+                    _ = next(&mut term) => { let _ = send(pid, Signal::Term); }
+                    _ = next(&mut hup) => { let _ = send(pid, Signal::Hup); }
+                }
+            }
+        }));
+    }
+
+    /// Windows delivers Ctrl-C to the whole console, the child with it; holding it
+    /// here is what keeps this process up to close the session out. Only Ctrl-C is
+    /// held: closing the console, logging off or shutting down still end it.
+    #[cfg(not(unix))]
+    pub(crate) fn to(&mut self, _pid: Option<u32>) {
+        let Some(Some(mut c)) = self.held.take() else { return };
+        self.task = Some(tokio::spawn(async move { while c.recv().await.is_some() {} }));
+    }
+}
+
+impl Drop for Relay {
+    fn drop(&mut self) {
+        if let Some(t) = &self.task {
+            t.abort();
+        }
+        #[cfg(unix)]
+        disposition::restore();
+    }
+}
+
+/// The actions of the three relayed signals, which tokio cannot give back: once it
+/// installs a handler it keeps it, and a signal with no listener is swallowed.
+#[cfg(unix)]
+mod disposition {
+    use std::sync::Mutex;
+    use tokio::signal::unix::{signal, Signal, SignalKind};
+
+    const RELAYED: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
+
+    /// Per signal, the action this process started with and tokio's once it has
+    /// one; and how many relays are listening.
+    struct Actions {
+        start: [Option<libc::sigaction>; 3],
+        tokio: [Option<libc::sigaction>; 3],
+        live: usize,
+    }
+
+    static ACTIONS: Mutex<Actions> = Mutex::new(Actions { start: [None; 3], tokio: [None; 3], live: 0 });
+
+    fn get(sig: libc::c_int) -> libc::sigaction {
+        // SAFETY: a null new action only reads the current one into `old`.
+        unsafe {
+            let mut old: libc::sigaction = std::mem::zeroed();
+            libc::sigaction(sig, std::ptr::null(), &mut old);
+            old
+        }
+    }
+
+    fn set(sig: libc::c_int, act: &libc::sigaction) {
+        // SAFETY: `act` is an action the kernel gave back for this signal.
+        unsafe {
+            libc::sigaction(sig, act, std::ptr::null_mut());
+        }
+    }
+
+    /// A listener for each signal this process was not started ignoring, with
+    /// tokio's handler back in place if [`restore`] took it out.
+    pub(super) fn listen() -> [Option<Signal>; 3] {
+        let mut a = ACTIONS.lock().unwrap_or_else(|e| e.into_inner());
+        a.live += 1;
+        std::array::from_fn(|i| {
+            let sig = RELAYED[i];
+            if a.start[i].get_or_insert_with(|| get(sig)).sa_sigaction == libc::SIG_IGN {
+                return None;
+            }
+            if let Some(t) = &a.tokio[i] {
+                set(sig, t);
+            }
+            let s = signal(SignalKind::from_raw(sig)).ok()?;
+            a.tokio[i].get_or_insert_with(|| get(sig));
+            Some(s)
+        })
+    }
+
+    /// Once no relay is listening, put back the action each signal had when this
+    /// process started.
+    pub(super) fn restore() {
+        let mut a = ACTIONS.lock().unwrap_or_else(|e| e.into_inner());
+        a.live = a.live.saturating_sub(1);
+        if a.live == 0 {
+            for (sig, start) in RELAYED.iter().zip(a.start.iter()) {
+                if let Some(start) = start {
+                    set(*sig, start);
+                }
+            }
+        }
+    }
+
+    /// Whether this process is in its terminal's foreground group, which a Ctrl-C
+    /// reaches whole.
+    pub(super) fn foreground() -> bool {
+        // SAFETY: getpgrp cannot fail; tcgetpgrp only reads, and fails off a terminal.
+        let own = unsafe { libc::getpgrp() };
+        [0, 1, 2].into_iter().any(|fd| unsafe { libc::tcgetpgrp(fd) } == own)
+    }
 }
 
 /// Deliver `sig` to `pid`. With [`hear`] and [`relay`], the only place this

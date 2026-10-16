@@ -47,7 +47,7 @@ impl Backend for Claude {
     }
 
     fn build(&self, spec: &Spec) -> Result<Launch> {
-        let mut cmd = tokio::process::Command::new(crate::exe::find("claude").unwrap_or_else(|| "claude".into()));
+        let mut cmd = tokio::process::Command::from(crate::exe::command(crate::exe::find("claude").unwrap_or_else(|| "claude".into())));
         cmd.current_dir(&spec.cwd);
         let mut cleanup = super::backend::Scratch::default();
 
