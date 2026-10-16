@@ -31,6 +31,7 @@ test:
       trap 'chmod u+w "$ro"; rm -rf "$ro" "$tmp"' EXIT
       chmod 0555 "$ro"
       HOME="$ro" cargo test --locked
+      env -u HOME cargo test --locked
       HOME="$tmp" cargo test --locked
       left=$(find "$tmp" -mindepth 1 | head -20)
       [ -z "$left" ] || { echo "::error::the test suite wrote into HOME:"; echo "$left"; exit 1; }

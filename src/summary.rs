@@ -196,9 +196,11 @@ impl Run {
     /// Print the block. The cloud meter is asked only when the block needs it
     /// ([`asks`]); the price list is waited for a moment. Either failing leaves its
     /// figure out, never the block.
+    #[allow(clippy::too_many_arguments)]
     pub async fn end(
         self,
         host: &dyn Host,
+        brand: &str,
         backend: &str,
         apart: bool,
         usage: &Usage,
@@ -228,7 +230,7 @@ impl Run {
         };
         let meter = if person && asks(&e) {
             let query = window(&e);
-            Some(match tokio::time::timeout(METER_WAIT, host.meter(&query)).await {
+            Some(match tokio::time::timeout(METER_WAIT, host.meter(brand, &query)).await {
                 Ok(m) => m,
                 Err(_) => Err(format!("the cloud did not answer in {}s", METER_WAIT.as_secs_f32())),
             })

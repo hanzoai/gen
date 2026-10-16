@@ -368,16 +368,14 @@ async fn gpus() -> (Vec<Gpu>, f64, Board) {
 /// influence a probe or round-trip into captured data — the SAME privacy hard-line
 /// the git probe holds. `kill_on_drop` guarantees a timed-out probe is reaped.
 pub(crate) async fn probe(program: &str, args: &[&str], timeout: Duration) -> Option<String> {
-    let mut cmd = tokio::process::Command::new(program);
+    let mut cmd = tokio::process::Command::new(crate::exe::find(program)?);
     cmd.args(args)
         .env_clear()
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true);
-    if let Some(path) = std::env::var_os("PATH") {
-        cmd.env("PATH", path);
-    }
+    crate::exe::confine(cmd.as_std_mut());
     let mut child = cmd.spawn().ok()?;
     // Read at most PROBE_STDOUT_CAP bytes: a hostile probe that floods stdout can
     // never balloon memory. The bounded read fills, `out` drops (closing our read
@@ -685,9 +683,8 @@ pub fn machine_id(root: &Root) -> String {
 /// last resort is the stable per-install [`machine_id`] — an opaque name is a
 /// far weaker fact than `evo`, but it is still a fact, and it groups.
 pub fn hostname(root: &Root) -> String {
-    Command::new("hostname")
-        .output()
-        .ok()
+    crate::exe::find("hostname")
+        .and_then(|bin| Command::new(bin).output().ok())
         .filter(|o| o.status.success())
         .and_then(|o| named(&String::from_utf8_lossy(&o.stdout)))
         .or_else(|| std::env::var("HOSTNAME").ok().and_then(|h| named(&h)))
@@ -711,7 +708,7 @@ fn git_repo(cwd: &Path) -> Repo {
         // Neutralize the system/global gitconfig (a planted `core.fsmonitor`,
         // pager, alias or `include.path` there could otherwise run a command)
         // and never let git block on a credential/terminal prompt.
-        let out = Command::new("git")
+        let out = Command::new(crate::exe::find("git")?)
             .arg("-C")
             .arg(cwd)
             .args(args)

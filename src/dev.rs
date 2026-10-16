@@ -67,11 +67,11 @@ impl Backend for Agent {
     }
 
     fn version(&self, _: &Root) -> Option<String> {
-        super::backend::backend_version(self.program)
+        crate::exe::version(self.program, super::backend::VERSION_WAIT)
     }
 
     fn build(&self, spec: &Spec) -> Result<Launch> {
-        let mut cmd = tokio::process::Command::new(self.program);
+        let mut cmd = tokio::process::Command::new(crate::exe::find(self.program).unwrap_or_else(|| self.program.into()));
         cmd.current_dir(&spec.cwd);
 
         let mut args: Vec<String> = Vec::new();

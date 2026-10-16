@@ -88,6 +88,8 @@ pub(crate) enum Signal {
     Int,
     /// Terminate — Claude still flushes, then exits 143.
     Term,
+    /// The terminal went away.
+    Hup,
 }
 
 /// Cloud's closed steering set, as the supervisor consumes it. `message` carries
@@ -256,13 +258,51 @@ pub(crate) fn hear(command: &mut tokio::process::Command) {
 #[cfg(not(unix))]
 pub(crate) fn hear(_command: &mut tokio::process::Command) {}
 
-/// Deliver `sig` to `pid`. With [`hear`], the only place this module touches
-/// the OS.
+/// Hold this process up while a child runs: a signal that would have ended it —
+/// SIGTERM from a `kill` or a service manager, SIGHUP from a terminal that went
+/// away, SIGINT — ends the CHILD instead, and this process ends when the child
+/// does, the normal way: its session closed out, its run homes removed. TERM and
+/// HUP are passed on, since a `kill` names this process alone; INT is not, since
+/// a terminal's Ctrl-C already reached the child, which shares its foreground
+/// group, and a second would cut short the abort the first began. Abort the
+/// returned task once the child has been waited for.
+#[cfg(unix)]
+pub(crate) fn relay(pid: Option<u32>) -> Option<tokio::task::JoinHandle<()>> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let pid = pid?;
+    let (mut int, mut term, mut hup) = (
+        signal(SignalKind::interrupt()).ok()?,
+        signal(SignalKind::terminate()).ok()?,
+        signal(SignalKind::hangup()).ok()?,
+    );
+    Some(tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = int.recv() => {}
+                _ = term.recv() => { let _ = send(pid, Signal::Term); }
+                _ = hup.recv() => { let _ = send(pid, Signal::Hup); }
+            }
+        }
+    }))
+}
+
+/// Windows delivers Ctrl-C to the whole console, the child with it; holding it
+/// here is what keeps this process up to close the session out.
+#[cfg(not(unix))]
+pub(crate) fn relay(_pid: Option<u32>) -> Option<tokio::task::JoinHandle<()>> {
+    Some(tokio::spawn(async {
+        while tokio::signal::ctrl_c().await.is_ok() {}
+    }))
+}
+
+/// Deliver `sig` to `pid`. With [`hear`] and [`relay`], the only place this
+/// module touches the OS.
 #[cfg(unix)]
 pub(crate) fn send(pid: u32, sig: Signal) -> Result<()> {
     let raw = match sig {
         Signal::Int => libc::SIGINT,
         Signal::Term => libc::SIGTERM,
+        Signal::Hup => libc::SIGHUP,
     };
     if unsafe { libc::kill(pid as i32, raw) } != 0 {
         // ESRCH is the ordinary race: the child finished on its own between the

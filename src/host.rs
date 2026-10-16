@@ -6,9 +6,8 @@
 //! meter all come from the host: the `hanzo` CLI in its own process when Gen is
 //! its library, or the `hanzo` command on PATH when Gen runs as `gen` ([`Command`]).
 
-use std::ffi::OsStr;
 use std::future::Future;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::Stdio;
 use std::time::Duration;
@@ -95,8 +94,10 @@ impl Profile {
 
 /// The program Gen runs in.
 pub trait Host: Send + Sync {
-    /// What is on file: the cloud, the selections, the persisted defaults.
-    fn profile(&self) -> Profile;
+    /// What is on file: the cloud, the selections, the persisted defaults. A
+    /// moment's wait, so a host can read it under the same lock its account
+    /// refresh writes under.
+    fn profile(&self) -> Pending<'_, Profile>;
 
     /// The account signed in for `brand`, its access token fresh. `None` when
     /// nobody is signed in, never some other account.
@@ -110,9 +111,10 @@ pub trait Host: Send + Sync {
     /// The key the user stored for `provider`, read only when a route needs it.
     fn key(&self, provider: Provider) -> Result<Option<String>>;
 
-    /// `GET /v1/usage/summary` for `query` (`range=custom`, `start=…`, `end=…`),
-    /// as its `data`; a refusal or a fault is the reason, never an empty document.
-    fn meter<'a>(&'a self, query: &'a [String]) -> Pending<'a, std::result::Result<Value, String>>;
+    /// `GET /v1/usage/summary` for `query` (`range=custom`, `start=…`, `end=…`) as
+    /// `brand`'s account, as its `data`; a refusal or a fault is the reason, never
+    /// an empty document, and never another brand's numbers.
+    fn meter<'a>(&'a self, brand: &'a str, query: &'a [String]) -> Pending<'a, std::result::Result<Value, String>>;
 }
 
 /// The Hanzo CLI's arguments that print `brand`'s access token. Every host asks
@@ -188,7 +190,7 @@ pub struct Command {
 impl Command {
     /// The `hanzo` PATH finds, and what it has on file.
     pub async fn found() -> Command {
-        Command::at(std::env::var_os("PATH").and_then(|p| find(&p))).await
+        Command::at(crate::exe::find("hanzo")).await
     }
 
     /// Ask `program` (`None`: there is no CLI, so signed out and unlinked), and
@@ -245,21 +247,9 @@ impl Command {
     }
 }
 
-/// `hanzo` on `path`, by its full path, from absolute entries only. An empty or
-/// relative entry names a directory that depends on where the session happens to
-/// start, so a repo could plant the program that hands out the token.
-fn find(path: &OsStr) -> Option<PathBuf> {
-    let dirs: Vec<PathBuf> = std::env::split_paths(path).filter(|d| d.is_absolute()).collect();
-    if dirs.is_empty() {
-        return None;
-    }
-    let joined = std::env::join_paths(&dirs).ok()?;
-    which::which_in("hanzo", Some(joined), Path::new("/")).ok().filter(|p| p.is_absolute())
-}
-
 impl Host for Command {
-    fn profile(&self) -> Profile {
-        self.profile.clone()
+    fn profile(&self) -> Pending<'_, Profile> {
+        Box::pin(async move { self.profile.clone() })
     }
 
     fn account<'a>(&'a self, brand: &'a str) -> Pending<'a, Result<Option<Account>>> {
@@ -301,8 +291,13 @@ impl Host for Command {
         })
     }
 
-    fn meter<'a>(&'a self, query: &'a [String]) -> Pending<'a, std::result::Result<Value, String>> {
+    fn meter<'a>(&'a self, brand: &'a str, query: &'a [String]) -> Pending<'a, std::result::Result<Value, String>> {
         Box::pin(async move {
+            // `hanzo usage summary` speaks as the CLI's default brand and takes no
+            // other, so another brand's meter is not read here rather than read wrong.
+            if brand != BRAND {
+                return Err(format!("the meter is read for {brand} by `hanzo dev --brand {brand}`, not by gen"));
+            }
             let mut args = vec!["usage".to_string(), "summary".to_string()];
             for pair in query {
                 let (k, v) = pair.split_once('=').ok_or_else(|| format!("not a query pair: {pair}"))?;
@@ -394,7 +389,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn calls(p: &Path) -> Vec<String> {
+    fn calls(p: &std::path::Path) -> Vec<String> {
         std::fs::read_to_string(format!("{}.args", p.display())).unwrap_or_default().lines().map(String::from).collect()
     }
 
@@ -415,20 +410,6 @@ mod tests {
         let a = Account { owner: "hanzo".into(), name: "z".into(), token: "SECRET".into() };
         assert_eq!(a.to_string(), "hanzo/z");
         assert!(!format!("{a:?}").contains("SECRET"));
-    }
-
-    /// Only an absolute PATH entry can supply `hanzo`: an empty or relative one is
-    /// wherever the session starts, which a repo controls.
-    #[cfg(unix)]
-    #[test]
-    fn hanzo_is_found_by_its_full_path_in_absolute_entries_only() {
-        let (dir, p) = program(&[]);
-        let rel = std::ffi::OsString::from("::.:bin:rel/dir");
-        assert_eq!(find(&rel), None, "relative entries are never searched");
-        let mixed = std::env::join_paths([PathBuf::from(""), PathBuf::from("."), dir.path().to_path_buf()]).unwrap();
-        let got = find(&mixed).expect("found in the absolute entry");
-        assert!(got.is_absolute(), "{}", got.display());
-        assert_eq!(got, p);
     }
 
     /// `gen` signs in as Hanzo Dev does: the CLI's `auth token`, for the session's brand.
@@ -493,13 +474,13 @@ mod tests {
     async fn what_is_on_file_is_the_clis_and_unreadable_is_unlinked() {
         let doc = serde_json::to_string(&profile()).unwrap();
         let (_d1, p) = program(&[("config profile", doc.as_str(), 0)]);
-        assert_eq!(Command::at(Some(p)).await.profile(), profile());
+        assert_eq!(Command::at(Some(p)).await.profile().await, profile());
 
         let (_d2, old) = program(&[]); // a CLI from before `config profile`
-        let unread = Command::at(Some(old)).await.profile();
+        let unread = Command::at(Some(old)).await.profile().await;
         assert_eq!(unread, Profile::unread());
         assert!(!unread.link, "a setting that could not be read is never a link");
-        assert!(!Command::at(None).await.profile().link);
+        assert!(!Command::at(None).await.profile().await.link);
     }
 
     #[cfg(unix)]
@@ -507,10 +488,13 @@ mod tests {
     async fn the_meter_is_the_clis_usage_summary() {
         let (_dir, p) = program(&[("usage summary", r#"{"llm":{"available":false}}"#, 0)]);
         let q = ["range=custom".to_string(), "start=a".to_string(), "end=b".to_string()];
-        let doc = Command::at(Some(p.clone())).await.meter(&q).await.unwrap();
+        let doc = Command::at(Some(p.clone())).await.meter(BRAND, &q).await.unwrap();
         assert_eq!(doc["llm"]["available"], false);
         assert_eq!(calls(&p).last().unwrap(), "usage summary --range custom --start a --end b");
-        let missing = Command::at(None).await.meter(&q).await.unwrap_err();
+        let missing = Command::at(None).await.meter(BRAND, &q).await.unwrap_err();
         assert!(missing.contains("not installed"), "{missing}");
+        let other = Command::at(Some(p.clone())).await.meter("lux", &q).await.unwrap_err();
+        assert!(other.contains("lux"), "another brand's meter is never this one's: {other}");
+        assert_eq!(calls(&p).iter().filter(|c| c.starts_with("usage")).count(), 1, "and the CLI was not asked for it");
     }
 }

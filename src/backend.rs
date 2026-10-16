@@ -441,7 +441,7 @@ pub fn resolve(kind: BackendKind) -> Box<dyn Backend> {
 /// where the proxy records each tool call for the session summary.
 pub fn resolve_mcp(cwd: &Path, ledger: Option<&Path>) -> Option<McpAttach> {
     let exe = std::env::current_exe().ok();
-    let program = beside(exe.as_deref(), MCP_BIN).or_else(|| which::which(MCP_BIN).ok())?;
+    let program = beside(exe.as_deref(), MCP_BIN).or_else(|| crate::exe::find(MCP_BIN))?;
     let direct = McpAttach {
         program: program.display().to_string(),
         args: vec!["--project-dir".into(), cwd.display().to_string()],
@@ -474,21 +474,8 @@ fn lazy(direct: McpAttach, exe: Option<std::path::PathBuf>, ledger: Option<&Path
     McpAttach { program: exe.display().to_string(), args }
 }
 
-/// Best-effort `<bin> --version` (first line), for the context snapshot.
-pub fn backend_version(bin: &str) -> Option<String> {
-    let out = std::process::Command::new(bin)
-        .arg("--version")
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let s = String::from_utf8_lossy(&out.stdout);
-    s.lines()
-        .next()
-        .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty())
-}
+/// How long a backend has to say its version at startup.
+pub const VERSION_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 
 #[cfg(test)]
 mod tests {

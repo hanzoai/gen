@@ -31,7 +31,7 @@ async fn main() -> Result<()> {
     // The lazy MCP proxy a coding agent is handed in place of hanzo-mcp: it runs
     // before the command is built, since the agent waits on it.
     if argv.get(1).map(String::as_str) == Some("__mcp") {
-        return hanzo_gen::mcp::main(&argv[2..]).await;
+        return hanzo_gen::mcp::main(hanzo_gen::Root::user(), &argv[2..]).await;
     }
     let argv = hanzo_gen::args::expand(&Cli::command(), argv);
     let cli = Cli::from_arg_matches(&Cli::command().get_matches_from(argv))?;

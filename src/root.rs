@@ -4,10 +4,12 @@
 //! agent's home, the kit, ledgers, resume and run-target records, the machine id,
 //! Claude's config home — is derived from ONE value, decided by the program that
 //! launches a session and handed down from there: the signed-in user's own
-//! ([`Root::user`]), or one directory a test or a sandbox names ([`Root::at`]).
-//! Nothing below that resolves `$HOME` for itself, which is what keeps a test
-//! suite out of the developer's home (`root_is_the_one_resolver` holds it).
+//! ([`Root::user`], called only by a binary's `main`), or one directory a test or
+//! a sandbox names ([`Root::at`]). Nothing below that reads the environment for a
+//! home, which is what keeps a test suite out of the developer's
+//! (`root_is_the_one_resolver` holds it, and Gen links no crate that guesses one).
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,15 +19,14 @@ pub struct Root {
 }
 
 impl Root {
-    /// This user's: `$HOME`, and the platform's per-user data directory
-    /// (`~/.local/share` on Linux). `None` when the process has no home, in which
-    /// case nothing is written anywhere.
+    /// This user's, from the environment and nothing else: `$HOME` (`%USERPROFILE%`
+    /// on Windows), and the platform's per-user data directory under it
+    /// (`~/.local/share` or `$XDG_DATA_HOME` on Linux, `~/Library/Application
+    /// Support` on macOS, `%LOCALAPPDATA%` on Windows). An unset, empty or relative
+    /// home is no home — never the account database's, which is how a process
+    /// told to have no home came to write into one anyway.
     pub fn user() -> Option<Root> {
-        let home = dirs::home_dir().filter(|h| h.is_absolute())?;
-        let data = dirs::data_local_dir()
-            .filter(|d| d.is_absolute())
-            .unwrap_or_else(|| home.join(".local").join("share"));
-        Some(Root { home, data: data.join("hanzo") })
+        Root::from(&|name| std::env::var_os(name))
     }
 
     /// This user's, or why there is none: the message a launcher stops on.
@@ -33,6 +34,20 @@ impl Root {
         Root::user().ok_or_else(|| {
             anyhow::anyhow!("no home directory: Hanzo keeps a session's state under $HOME — set HOME and run again")
         })
+    }
+
+    /// [`Root::user`] over `var`, so the rule is testable without the process's own environment.
+    fn from(var: &dyn Fn(&str) -> Option<OsString>) -> Option<Root> {
+        let absolute = |name: &str| var(name).map(PathBuf::from).filter(|p| p.is_absolute());
+        let home = absolute(if cfg!(windows) { "USERPROFILE" } else { "HOME" })?;
+        let data = if cfg!(windows) {
+            absolute("LOCALAPPDATA").unwrap_or_else(|| home.join("AppData").join("Local"))
+        } else if cfg!(target_os = "macos") {
+            home.join("Library").join("Application Support")
+        } else {
+            absolute("XDG_DATA_HOME").unwrap_or_else(|| home.join(".local").join("share"))
+        };
+        Some(Root { home, data: data.join("hanzo") })
     }
 
     /// Everything under `dir`, laid out as a home: `dir/.hanzo`, `dir/.local/share/hanzo`.
@@ -77,32 +92,71 @@ mod tests {
         assert_eq!(r.data(), Path::new("/h/.local/share/hanzo"));
     }
 
-    /// THE gate for keeping tests out of the developer's home: only this file
-    /// resolves a home or a data directory. A second resolver is how a test came
-    /// to rewrite the agent configs of whoever ran the suite.
+    /// No home is no root: unset, empty and relative all refuse, and nothing
+    /// falls back to the account database's idea of a home.
+    #[cfg(unix)]
+    #[test]
+    fn an_unset_empty_or_relative_home_is_no_home() {
+        fn env(home: Option<&'static str>) -> impl Fn(&str) -> Option<OsString> {
+            move |name| (name == "HOME").then_some(home).flatten().map(OsString::from)
+        }
+        assert_eq!(Root::from(&env(None)), None);
+        assert_eq!(Root::from(&env(Some(""))), None);
+        assert_eq!(Root::from(&env(Some("rel/home"))), None);
+        let r = Root::from(&env(Some("/h"))).expect("an absolute home is one");
+        assert_eq!(r.hanzo(), Path::new("/h/.hanzo"));
+        if !cfg!(target_os = "macos") {
+            assert_eq!(r.data(), Path::new("/h/.local/share/hanzo"));
+            let xdg = |name: &str| match name {
+                "HOME" => Some(OsString::from("/h")),
+                "XDG_DATA_HOME" => Some(OsString::from("/d")),
+                _ => None,
+            };
+            assert_eq!(Root::from(&xdg).unwrap().data(), Path::new("/d/hanzo"));
+        }
+    }
+
+    /// THE gate for keeping tests out of the developer's home, and programs out of
+    /// a repository's reach. Gen links no crate that resolves a home, so the only
+    /// way in is the environment, and only this file reads a home from it; only a
+    /// binary's `main` asks for the user's root; and only `exe.rs` searches PATH.
     #[test]
     fn root_is_the_one_resolver() {
         let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let rules: [(&[&str], &[&str]); 3] = [
+            (&["src/root.rs"], &["\"HOME\"", "\"USERPROFILE\"", "\"LOCALAPPDATA\"", "\"XDG_", "home_dir", "dirs::"]),
+            (&["src/main.rs", "src/root.rs"], &["Root::user(", "Root::need("]),
+            (&["src/exe.rs"], &["which::", "\"PATH\""]),
+        ];
         let mut found = Vec::new();
-        let mut dirs_left = vec![src];
-        while let Some(d) = dirs_left.pop() {
+        let mut left = vec![src];
+        while let Some(d) = left.pop() {
             for e in std::fs::read_dir(&d).unwrap().flatten() {
                 let p = e.path();
                 if p.is_dir() {
-                    dirs_left.push(p);
-                } else if p.extension().is_some_and(|x| x == "rs") && !p.ends_with("src/root.rs") {
-                    let body = std::fs::read_to_string(&p).unwrap();
-                    for (n, line) in body.lines().enumerate() {
-                        if ["dirs::home_dir", "dirs::data_local_dir", "dirs::data_dir", "dirs::config_dir", "env::home_dir", "var(\"HOME\")", "var_os(\"HOME\")"]
-                            .iter()
-                            .any(|f| line.contains(f))
-                        {
-                            found.push(format!("{}:{}", p.display(), n + 1));
+                    left.push(p);
+                    continue;
+                }
+                // This file holds the gate and the one home resolver.
+                if p.extension().is_none_or(|x| x != "rs") || p.ends_with("src/root.rs") {
+                    continue;
+                }
+                let body = std::fs::read_to_string(&p).unwrap();
+                for (n, line) in body.lines().enumerate() {
+                    if line.trim_start().starts_with("//") {
+                        continue;
+                    }
+                    for (owners, words) in &rules {
+                        if owners.iter().any(|o| p.ends_with(o)) {
+                            continue;
+                        }
+                        for w in words.iter().filter(|w| line.contains(**w)) {
+                            found.push(format!("{}:{} uses {w}, which only {owners:?} may", p.display(), n + 1));
                         }
                     }
                 }
             }
         }
-        assert!(found.is_empty(), "a home is resolved outside root.rs: {found:?}");
+        assert!(found.is_empty(), "{found:#?}");
     }
 }

@@ -223,9 +223,8 @@ impl Drop for Beat {
 /// refreshes: the credential is the host's shared state, not a value held here.
 /// It is asked for `brand`'s account, the one the session it beats for runs as.
 pub fn beat(host: Arc<dyn Host>, root: &Root, brand: &str, api: &str, machine_id: &str, name: &str) -> Beat {
-    let org = host.profile().org;
     let creds = Creds::Refreshing { host, brand: brand.to_string() };
-    beat_every(BEAT, creds, org, root, api, machine_id, name)
+    beat_every(BEAT, creds, root, api, machine_id, name)
 }
 
 /// Where a beat gets its bearer.
@@ -241,6 +240,15 @@ enum Creds {
 }
 
 impl Creds {
+    /// The org selected for this host's calls, sent as `X-Org-Id`.
+    async fn org(&self) -> Option<String> {
+        match self {
+            Creds::Refreshing { host, .. } => host.profile().await.org,
+            #[cfg(test)]
+            Creds::Fixed(_) => None,
+        }
+    }
+
     async fn bearer(&mut self) -> Option<String> {
         match self {
             Creds::Refreshing { host, brand } => host.account(brand).await.ok().flatten().map(|a| a.token),
@@ -261,7 +269,7 @@ impl Creds {
 /// the lifetime; dropping the guard aborts it and the row goes stale on its own,
 /// which is how cloud decides a machine left.
 pub async fn present(host: Arc<dyn Host>, root: &Root, brand: &str) -> Result<()> {
-    let api = host.profile().api;
+    let api = host.profile().await.api;
     let name = hostname(root);
     let _beat = beat(host, root, brand, api.trim_end_matches('/'), &machine_id(root), &name);
     println!(
@@ -275,7 +283,7 @@ pub async fn present(host: Arc<dyn Host>, root: &Root, brand: &str) -> Result<()
 /// [`beat`] with the period as a parameter, so a test can watch the loop repeat
 /// without waiting minutes for it. `BEAT` is the ONE period production uses — this
 /// is the mechanism, not a setting.
-fn beat_every(period: Duration, mut creds: Creds, org: Option<String>, root: &Root, api: &str, machine_id: &str, host: &str) -> Beat {
+fn beat_every(period: Duration, mut creds: Creds, root: &Root, api: &str, machine_id: &str, host: &str) -> Beat {
     let root = root.clone();
     let api = api.to_string();
     let (machine_id, host) = (machine_id.to_string(), host.to_string());
@@ -283,6 +291,7 @@ fn beat_every(period: Duration, mut creds: Creds, org: Option<String>, root: &Ro
         // One sampler for the life of the beat, so every beat after the first
         // carries the rates over the window since the one before it.
         let mut sampler = Sampler::new();
+        let org = creds.org().await;
         loop {
             // A beat with no credential is a beat that cannot land, so skip the
             // capture too rather than probe the machine for nothing.
@@ -472,7 +481,7 @@ mod tests {
         let machine = format!("beat_{}", std::process::id());
         let _ = std::fs::remove_file(crate::context::target_path_for_test(&root, &machine));
 
-        let held = beat_every(Duration::from_millis(10), Creds::Fixed("T".into()), None, &root, &mock.base_url(), &machine, "evo");
+        let held = beat_every(Duration::from_millis(10), Creds::Fixed("T".into()), &root, &mock.base_url(), &machine, "evo");
         until("a machine to keep beating", || mock.requests().len() >= 3).await;
         drop(held);
 
@@ -494,7 +503,6 @@ mod tests {
         let held = beat_every(
             Duration::from_millis(10),
             Creds::Fixed("T".into()),
-            None,
             &root,
             &mock.base_url(),
             &machine,
@@ -519,8 +527,8 @@ mod tests {
     async fn a_beat_asks_for_its_sessions_brand() {
         struct Asked(std::sync::Mutex<Vec<String>>);
         impl Host for Asked {
-            fn profile(&self) -> crate::Profile {
-                crate::Profile::unread()
+            fn profile(&self) -> crate::host::Pending<'_, crate::Profile> {
+                Box::pin(async { crate::Profile::unread() })
             }
             fn account<'a>(&'a self, brand: &'a str) -> crate::host::Pending<'a, Result<Option<crate::Account>>> {
                 self.0.lock().unwrap().push(brand.to_string());
@@ -532,7 +540,7 @@ mod tests {
             fn key(&self, _: crate::Provider) -> Result<Option<String>> {
                 Ok(None)
             }
-            fn meter<'a>(&'a self, _: &'a [String]) -> crate::host::Pending<'a, std::result::Result<Value, String>> {
+            fn meter<'a>(&'a self, _: &'a str, _: &'a [String]) -> crate::host::Pending<'a, std::result::Result<Value, String>> {
                 Box::pin(async { Err("no meter".to_string()) })
             }
         }
@@ -556,7 +564,7 @@ mod tests {
         let machine = format!("beatdrop_{}", std::process::id());
         let _ = std::fs::remove_file(crate::context::target_path_for_test(&root, &machine));
 
-        let held = beat_every(Duration::from_millis(10), Creds::Fixed("T".into()), None, &root, &mock.base_url(), &machine, "evo");
+        let held = beat_every(Duration::from_millis(10), Creds::Fixed("T".into()), &root, &mock.base_url(), &machine, "evo");
         until("the first beat", || !mock.requests().is_empty()).await;
         drop(held);
         // A beat already in flight may still land, so settle before reading the mark.

@@ -28,10 +28,17 @@
 # builds windows-msvc with LLVM's clang-cl. This is Hanzo Dev's release, cut down
 # to one small binary.
 #
-# A runner lives for one job, so sccache wraps every rustc call and hanzoai/ci's
-# bin/cache carries its objects and the crate downloads to the next run through
-# this org's store (/v1/s3, the IAM identity KMS mints, no bucket credential).
-# That store is code a build trusts; LLM.md names what can write it.
+# THE BUILDS RUN COLD, and hold no credential. A build job compiles every
+# crate's build script and proc macro, which is third-party code; it is handed
+# nothing it could leak or misuse — no KMS pair, no write token — and it restores
+# no cache, since a cache it trusted would be code anyone who can write the store
+# could plant (LLM.md: the build cache). Gen is small enough that this costs
+# minutes, once per release.
+#
+# What a build hands publish is its archive, as an artifact named for its target,
+# and the archive's sha256 as a job output. Publish downloads each artifact by
+# its exact name and refuses an archive whose digest is not the one its build
+# reported, before it checks the `.sha256` beside it.
 name: Release
 on:
   push:
@@ -53,12 +60,6 @@ env:
   XWIN_CRATE_VERSION: '0.23.1'
   MACOS_SDK_URL: 'https://github.com/phracker/MacOSX-SDKs/releases/download/11.3/MacOSX11.3.sdk.tar.xz'
   MACOS_SDK_SHA256: 'cd4f08a75577145b8f05245a2975f7c81401d75e9535dcffbb879ee1deefcbf4'
-  # The musl release tarball, by version and by its sha256 per runner arch.
-  SCCACHE_VERSION: '0.18.0'
-  SCCACHE_SHA256_X86_64: '45f1447fbe231e3037bde351ef70677dd212216c8d62ae7ca409fecc4d6acc89'
-  SCCACHE_SHA256_AARCH64: '2b3284d5da3b46a47dc4229e75bb7b88ac4aa99c8d754fb7d2f84997e5a4354a'
-  # hanzoai/ci at the commit whose bin/cache this release runs.
-  CI_SHA: '386b7a26942215254a1964f107ad5e8715e8349e'
 jobs:
   version:
     runs-on: [linux-amd64]
@@ -91,6 +92,15 @@ jobs:
     permissions:
       contents: read
     timeout-minutes: 180
+    # One output per target, so the five legs never overwrite each other: the
+    # digest of the archive each built, read by publish from GitHub, not from
+    # the artifact it is checking.
+    outputs:
+      linux-amd64: ${{ steps.pack.outputs.linux-amd64 }}
+      linux-arm64: ${{ steps.pack.outputs.linux-arm64 }}
+      darwin-amd64: ${{ steps.pack.outputs.darwin-amd64 }}
+      darwin-arm64: ${{ steps.pack.outputs.darwin-arm64 }}
+      windows-amd64: ${{ steps.pack.outputs.windows-amd64 }}
     strategy:
       fail-fast: false
       matrix:
@@ -104,7 +114,7 @@ jobs:
       CARGO_INCREMENTAL: "0"
       CARGO_NET_GIT_FETCH_WITH_CLI: "true"
       RUSTFLAGS: -C debuginfo=0 -C strip=symbols
-      CARGO_BUILD_JOBS: "2"
+      CARGO_BUILD_JOBS: "4"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -124,74 +134,6 @@ jobs:
           CH=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
           rustup toolchain install "$CH" --profile minimal
           rustup target add --toolchain "$CH" ${{ matrix.target.rust }}
-      - name: sccache, and the org's cache tool
-        # sccache keys an object by the hash of what went into it, never by
-        # mtime, so a fresh checkout hits wherever the bytes did not move. An
-        # accelerator, not a dependency: a download that fails or does not match
-        # its pin leaves RUSTC_WRAPPER unset and the build runs cold.
-        run: |
-          set +e   # nothing in this step may fail the build
-          set -uo pipefail
-          case "$(uname -m)" in
-            x86_64) arch=x86_64; want=$SCCACHE_SHA256_X86_64 ;;
-            aarch64) arch=aarch64; want=$SCCACHE_SHA256_AARCH64 ;;
-            *) echo "::notice::no sccache is pinned for $(uname -m), so this build runs cold"; exit 0 ;;
-          esac
-          n="sccache-v${SCCACHE_VERSION}-${arch}-unknown-linux-musl"
-          d="$RUNNER_TEMP/sccache-bin"; mkdir -p "$d"
-          curl -fsSL -m 120 "https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/$n.tar.gz" -o "$d/s.tgz" \
-            || { echo "::notice::sccache did not download, so this build runs cold"; exit 0; }
-          echo "$want  $d/s.tgz" | sha256sum -c --quiet - \
-            || { echo "::warning::$n.tar.gz does not match its pinned sha256; it is not run, and this build runs cold"; exit 0; }
-          if ! { tar -xzf "$d/s.tgz" -C "$d" --strip-components=1 "$n/sccache" && "$d/sccache" --version; }; then
-            echo "::notice::sccache did not unpack, so this build runs cold"; exit 0
-          fi
-          {
-            echo "RUSTC_WRAPPER=$d/sccache"
-            echo "SCCACHE_DIR=$RUNNER_TEMP/sccache"
-            echo "SCCACHE_CACHE_SIZE=5G"
-            echo "SCCACHE_IDLE_TIMEOUT=0"
-          } >> "$GITHUB_ENV"
-          echo "$d" >> "$GITHUB_PATH"
-          if curl -fsSL -m 60 "https://raw.githubusercontent.com/hanzoai/ci/$CI_SHA/bin/cache" -o "$RUNNER_TEMP/cache"; then
-            chmod +x "$RUNNER_TEMP/cache"
-          else
-            echo "::notice::hanzoai/ci@$CI_SHA bin/cache did not download, so nothing is carried between runs"
-          fi
-      - name: Restore the Rust cache (this org's store)
-        # The name is what an archive is only valid for: the compiler, sccache's
-        # own version, and the target. The key is what decides its contents:
-        # every tracked file that goes into the binary and every flag and
-        # cross-toolchain pin in the environment, which sccache hashes too.
-        #
-        # The IAM token is minted here and handed to bin/cache alone, never to
-        # GITHUB_ENV: the Build step runs every crate's build script and proc
-        # macro, and none of them needs this org's identity.
-        id: rustcache
-        if: env.RUSTC_WRAPPER != ''
-        env:
-          KMS_CLIENT_ID: ${{ secrets.KMS_CLIENT_ID }}
-          KMS_CLIENT_SECRET: ${{ secrets.KMS_CLIENT_SECRET }}
-          TARGET: ${{ matrix.target.rust }}
-        run: |
-          set +e   # nothing in this step may fail the build
-          set -uo pipefail
-          [ -x "$RUNNER_TEMP/cache" ] || { echo "::notice::no bin/cache, so this build starts cold"; exit 0; }
-          name="$({ rustc -vV; sccache --version; } | sha256sum | cut -c1-16)-$TARGET"
-          key=$({ git ls-tree -r HEAD -- Cargo.toml Cargo.lock rust-toolchain.toml src assets
-                  env | grep -E '^(RUSTFLAGS|CARGO_[A-Z0-9_]+|ZIG[A-Z0-9_]*|LLVM_[A-Z0-9_]+|XWIN_[A-Z0-9_]+|MACOS_SDK_[A-Z0-9_]+)=' | sort
-                } | sha256sum | cut -c1-32)
-          echo "name=$name" >> "$GITHUB_OUTPUT"; echo "key=$key" >> "$GITHUB_OUTPUT"
-          T=$(printf '{"clientId":"%s","clientSecret":"%s"}' "${KMS_CLIENT_ID:-}" "${KMS_CLIENT_SECRET:-}" \
-            | curl -sS -m 30 "${KMS_ENDPOINT:-https://api.hanzo.ai}/v1/kms/auth/login" -H 'Content-Type: application/json' -d @- \
-            | jq -r '.accessToken // empty' 2>/dev/null)
-          if [ -n "$T" ]; then echo "::add-mask::$T"; else echo "::notice::KMS gave no IAM token, so the org store is not used"; fi
-          h=${CARGO_HOME:-$HOME/.cargo}
-          HANZO_API_TOKEN=$T "$RUNNER_TEMP/cache" restore "$name" "$key" \
-            sccache="$SCCACHE_DIR" index="$h/registry/index" crates="$h/registry/cache" git="$h/git/db"
-          # What this build reads or writes from here on is its working set;
-          # everything older is pruned before the save.
-          touch "$RUNNER_TEMP/sccache.since"
       - name: Zig (the cross-linker)
         if: ${{ !matrix.target.msvc }}
         run: |
@@ -231,42 +173,14 @@ jobs:
       - name: Build
         run: |
           set -euo pipefail
-          # Hits, misses and why a call was not cacheable, on the log, whether or not the build passes.
-          trap '[ -z "${RUSTC_WRAPPER:-}" ] || sccache --show-stats || true' EXIT
           case "${{ matrix.target.rust }}" in
             *apple-darwin|*linux-musl) cargo zigbuild --release --locked --target ${{ matrix.target.rust }} --bin gen ;;
             *windows-msvc)             cargo xwin build --release --locked --target ${{ matrix.target.rust }} --bin gen ;;
           esac
-      - name: Save the Rust cache (this org's store)
-        # After a green build, so what is saved is what a passing build
-        # compiled. bin/cache writes only from main or a tag, and only a key the
-        # store does not hold yet. Whatever this build neither read nor wrote is
-        # pruned first, so an archive is one build's working set.
-        if: steps.rustcache.outputs.key != '' && steps.rustcache.outputs.hit != 'exact'
-        env:
-          KMS_CLIENT_ID: ${{ secrets.KMS_CLIENT_ID }}
-          KMS_CLIENT_SECRET: ${{ secrets.KMS_CLIENT_SECRET }}
-          NAME: ${{ steps.rustcache.outputs.name }}
-          KEY: ${{ steps.rustcache.outputs.key }}
-        run: |
-          set +e   # nothing in this step may fail the build
-          set -uo pipefail
-          sccache --stop-server >/dev/null 2>&1 || true
-          find "$SCCACHE_DIR" -type f ! -newer "$RUNNER_TEMP/sccache.since" -delete 2>/dev/null
-          h=${CARGO_HOME:-$HOME/.cargo}
-          for c in "$h"/registry/cache/*/; do
-            i=$(basename "$c")
-            for f in "$c"*.crate; do [ -d "$h/registry/src/$i/$(basename "$f" .crate)" ] || rm -f "$f"; done
-          done
-          T=$(printf '{"clientId":"%s","clientSecret":"%s"}' "${KMS_CLIENT_ID:-}" "${KMS_CLIENT_SECRET:-}" \
-            | curl -sS -m 30 "${KMS_ENDPOINT:-https://api.hanzo.ai}/v1/kms/auth/login" -H 'Content-Type: application/json' -d @- \
-            | jq -r '.accessToken // empty' 2>/dev/null)
-          if [ -n "$T" ]; then echo "::add-mask::$T"; else echo "::notice::KMS gave no IAM token, so the org store is not used"; fi
-          HANZO_API_TOKEN=$T "$RUNNER_TEMP/cache" save "$NAME" "$KEY" \
-            sccache="$SCCACHE_DIR" index="$h/registry/index" crates="$h/registry/cache" git="$h/git/db"
       - name: Package
         # One archive per platform, named and shaped as hanzo.sh installs it:
         # gen-<os>-<arch>.tar.gz unpacks to a single `gen` (`gen.exe`).
+        id: pack
         run: |
           set -euo pipefail
           t=${{ matrix.target.rust }}; short=${{ matrix.target.id }}
@@ -275,6 +189,7 @@ jobs:
           mkdir -p dist
           tar -C "target/$t/release" -czf "dist/gen-$short.tar.gz" "$bin"
           (cd dist && sha256sum "gen-$short.tar.gz" > "gen-$short.tar.gz.sha256")
+          echo "$short=$(cut -d' ' -f1 "dist/gen-$short.tar.gz.sha256")" >> "$GITHUB_OUTPUT"
           ls -la dist
       - name: Hand the archive to publish
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -297,27 +212,31 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
     steps:
-      - name: The five builds
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          pattern: gen-*
-          path: dist
-          merge-multiple: true
-      - name: Every archive is here, whole, and runs
+      - { name: gen-linux-amd64, uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093, with: { name: gen-linux-amd64, path: dist } } # v4.3.0
+      - { name: gen-linux-arm64, uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093, with: { name: gen-linux-arm64, path: dist } } # v4.3.0
+      - { name: gen-darwin-amd64, uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093, with: { name: gen-darwin-amd64, path: dist } } # v4.3.0
+      - { name: gen-darwin-arm64, uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093, with: { name: gen-darwin-arm64, path: dist } } # v4.3.0
+      - { name: gen-windows-amd64, uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093, with: { name: gen-windows-amd64, path: dist } } # v4.3.0
+      - name: Every archive is the one its build reported, whole, and runs
+        env:
+          DIGESTS: ${{ toJSON(needs.build.outputs) }}
         run: |
           set -euo pipefail
           n=$(ls dist | wc -l)
-          [ "$n" -eq 10 ] || { echo "::error::$n files, want 10 — a target is missing"; ls -la dist; exit 1; }
+          [ "$n" -eq 10 ] || { echo "::error::$n files, want 10"; ls -la dist; exit 1; }
           for t in linux-amd64 linux-arm64 darwin-amd64 darwin-arm64 windows-amd64; do
-            test -f "dist/gen-$t.tar.gz" && test -f "dist/gen-$t.tar.gz.sha256" || { echo "::error::gen-$t is missing"; exit 1; }
+            want=$(printf '%s' "$DIGESTS" | jq -r --arg t "$t" '.[$t] // empty')
+            printf '%s' "$want" | grep -Eq '^[0-9a-f]{64}$' || { echo "::error::the $t build reported no digest"; exit 1; }
+            got=$(sha256sum "dist/gen-$t.tar.gz" | cut -d' ' -f1)
+            [ "$got" = "$want" ] || { echo "::error::gen-$t.tar.gz is $got, but its build made $want"; exit 1; }
+            [ "$(cut -d' ' -f1 "dist/gen-$t.tar.gz.sha256")" = "$want" ] || { echo "::error::gen-$t.tar.gz.sha256 does not name the archive its build made"; exit 1; }
           done
-          (cd dist && for s in *.sha256; do sha256sum -c "$s" >/dev/null; done)
           # The release runs what it ships: the linux binary is native to this
           # runner, so it answers for the matrix that the artifacts are programs.
           x=$(mktemp -d); tar -xzf dist/gen-linux-amd64.tar.gz -C "$x"
           "$x/gen" --version | grep -qF "$V" || { echo "::error::the shipped binary does not say $V"; "$x/gen" --version; exit 1; }
           "$x/gen" --help >/dev/null
-          echo "10 files, checksum-clean; smoked: $("$x/gen" --version)"
+          echo "10 files, each the archive its build reported; smoked: $("$x/gen" --version)"
       - name: Attest what was built
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:

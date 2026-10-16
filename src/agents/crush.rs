@@ -1,7 +1,8 @@
-//! Crush. Its configuration for a run is a `crush.json` in a data directory of
-//! Hanzo's own (`--data-dir ~/.hanzo/crush`): the toolset, and under `--cloud`
-//! a `hanzo` provider whose key it reads from `$HANZO_API_KEY`. It prints plain
-//! text, and its `--yolo` belongs to its screen: `crush run` refuses it.
+//! Crush. On its own account it runs as itself, in its own data directory, with
+//! its history. Routed through Hanzo (`--cloud`) its configuration for the run is
+//! a `crush.json` in a data directory of this run's own (`--data-dir`): a `hanzo`
+//! provider whose key it reads from `$HANZO_API_KEY`, and the toolset. It prints
+//! plain text, and its `--yolo` belongs to its screen: `crush run` refuses it.
 
 use anyhow::Result;
 use serde_json::json;
@@ -15,30 +16,29 @@ pub const AGENT: Agent = Agent {
     programs: &["crush"],
     upgrade: Upgrade::Npm("@charmland/crush"),
     routable: true,
-    toolset: Toolset::Always,
+    toolset: Toolset::Routed,
     build,
     read: wire::plain,
 };
 
 fn build(r: &mut Run) -> Result<()> {
-    let dir = r.home("crush")?;
-    let mut doc = json!({});
-    if let Some(m) = r.mcp() {
-        doc["mcp"] = json!({ "hanzo": { "type": "stdio", "command": m.program, "args": m.args } });
-    }
     let gateway = r.gateway();
     if let Some(g) = &gateway {
-        doc["providers"] = json!({ "hanzo": {
+        let dir = r.home("crush")?;
+        let mut doc = json!({ "providers": { "hanzo": {
             "name": "Hanzo",
             "type": "openai-compat",
             "base_url": g.v1(),
             "api_key": format!("${KEY}"),
             "models": [{ "id": g.model, "name": g.model }],
-        } });
+        } } });
+        if let Some(m) = r.mcp() {
+            doc["mcp"] = json!({ "hanzo": { "type": "stdio", "command": m.program, "args": m.args } });
+        }
         r.env(KEY, g.token);
+        r.write(&dir.join("crush.json"), &doc)?;
+        r.arg("--data-dir").arg(&dir);
     }
-    r.write(&dir.join("crush.json"), &doc)?;
-    r.arg("--data-dir").arg(&dir);
     if r.headless() {
         r.arg("run");
         if let Some(g) = &gateway {
@@ -62,7 +62,8 @@ mod tests {
         let a = argv(&build("crush", &spec(Mode::Headless, gateway())));
         assert_eq!(a[0], "--data-dir");
         assert_eq!(a[2..], ["run", "-m", "hanzo/enso", "fix the test"]);
-        assert_eq!(argv(&build("crush", &spec(Mode::Interactive, Route::Inherit)))[2..], ["--yolo"]);
+        // On its own account it keeps its own data directory, and so its history.
+        assert_eq!(argv(&build("crush", &spec(Mode::Interactive, Route::Inherit))), ["--yolo"]);
     }
 
     #[test]

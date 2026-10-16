@@ -43,11 +43,11 @@ impl Backend for Claude {
     }
 
     fn version(&self, _: &Root) -> Option<String> {
-        super::backend::backend_version("claude")
+        crate::exe::version("claude", super::backend::VERSION_WAIT)
     }
 
     fn build(&self, spec: &Spec) -> Result<Launch> {
-        let mut cmd = tokio::process::Command::new("claude");
+        let mut cmd = tokio::process::Command::new(crate::exe::find("claude").unwrap_or_else(|| "claude".into()));
         cmd.current_dir(&spec.cwd);
         let mut cleanup = super::backend::Scratch::default();
 

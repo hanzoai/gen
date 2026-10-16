@@ -156,7 +156,7 @@ pub fn find_program(root: &Root, programs: &[&str]) -> Option<PathBuf> {
         .iter()
         .map(|p| bin.join(p))
         .find(|p| p.is_file())
-        .or_else(|| programs.iter().find_map(|p| which::which(p).ok()))
+        .or_else(|| programs.iter().find_map(|p| crate::exe::find(p)))
 }
 
 /// The binary that runs `a`.
@@ -257,13 +257,24 @@ impl<'a> Run<'a> {
     /// `~/.hanzo/<name>/`, owner-only, removed when the session ends. Its config
     /// names this session's project and ledger, so a second session of the same
     /// agent gets a home of its own rather than rewriting this one's.
+    ///
+    /// The session removes it on any ending it lives through (a signal included,
+    /// see `control::relay`); one it does not (SIGKILL, power) leaves it behind,
+    /// named for its process, and the next run of that agent sweeps it.
     pub fn home(&mut self, name: &str) -> Result<PathBuf> {
         let parent = self.spec.root.hanzo().join(name);
         super::kit::private_dir(&parent)?;
+        sweep(&parent);
         let d = tempfile::Builder::new()
-            .prefix("run-")
+            .prefix(&format!("run-{}-", std::process::id()))
             .tempdir_in(&parent)
             .with_context(|| format!("making a home for {name} in {}", parent.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o700))
+                .with_context(|| format!("making {} owner-only", d.path().display()))?;
+        }
         let path = d.path().to_path_buf();
         self.cleanup.dirs.push(d);
         Ok(path)
@@ -273,6 +284,37 @@ impl<'a> Run<'a> {
     pub fn write(&self, path: &Path, doc: &Value) -> Result<()> {
         crate::private::write(path, doc.to_string().as_bytes()).with_context(|| format!("writing {}", path.display()))
     }
+}
+
+/// Remove the run homes in `parent` whose process is gone. Only a home named
+/// `run-<pid>-…` for a pid that no longer exists goes; anything else is left.
+fn sweep(parent: &Path) {
+    let Ok(entries) = std::fs::read_dir(parent) else { return };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let pid = name
+            .to_str()
+            .and_then(|n| n.strip_prefix("run-"))
+            .and_then(|r| r.split('-').next())
+            .and_then(|p| p.parse::<u32>().ok());
+        if pid.is_some_and(gone) {
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
+}
+
+/// Whether no process has this pid: the one answer that lets a home go.
+#[cfg(unix)]
+fn gone(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else { return false };
+    // SAFETY: signal 0 delivers nothing; it asks whether the pid exists.
+    unsafe { libc::kill(pid, 0) != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) }
+}
+
+/// Without a cheap way to ask, no home is taken for gone.
+#[cfg(not(unix))]
+fn gone(_pid: u32) -> bool {
+    false
 }
 
 /// What an agent's reader keeps between lines: text that arrives in pieces, and
@@ -345,7 +387,7 @@ impl Backend for Session {
 
     fn version(&self, root: &Root) -> Option<String> {
         let p = program(root, self.agent)?;
-        super::backend::backend_version(&p.display().to_string())
+        crate::exe::version(&p.display().to_string(), super::backend::VERSION_WAIT)
     }
 
     fn build(&self, spec: &Spec) -> Result<Launch> {
@@ -477,6 +519,31 @@ mod tests {
         drop(one);
         assert!(!Path::new(&h1).exists(), "a session's home outlived it");
         assert!(Path::new(&h2).join("config.toml").is_file(), "ending one session ended the other's home");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&h2).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "a session's home is its user's alone, whatever the umask");
+        }
+    }
+
+    /// A home whose session died without cleaning up (SIGKILL) is swept by the
+    /// next run of that agent; a live session's home is never touched.
+    #[cfg(unix)]
+    #[test]
+    fn a_dead_sessions_home_is_swept_and_a_live_ones_kept() {
+        let s = test::spec(Mode::Headless, test::gateway());
+        let parent = s.root.hanzo().join("pi");
+        std::fs::create_dir_all(&parent).unwrap();
+        // A pid that cannot be running: past the kernel's limit.
+        let dead = parent.join("run-4194999-abc");
+        std::fs::create_dir_all(dead.join("x")).unwrap();
+        let live = test::build("pi", &s);
+        let mine = test::env(&live, "PI_CODING_AGENT_DIR").unwrap();
+        let other = test::build("pi", &s);
+        assert!(!dead.exists(), "a dead session's home was left behind");
+        assert!(Path::new(&mine).is_dir(), "a live session's home was swept");
+        drop((live, other));
     }
 
     #[test]

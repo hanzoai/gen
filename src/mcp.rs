@@ -94,7 +94,7 @@ pub fn key(program: &str, args: &[String], version: &str) -> String {
     h.update(format!("hanzo-mcp-shim/{FORMAT}\0{version}\0{program}\0").as_bytes());
     // The file the command resolves to, by its size and modification time and not its path: the same
     // server reached through a link, a bind mount or another name is the same server.
-    if let Some(m) = which::which(program).ok().and_then(|p| std::fs::metadata(p).ok()) {
+    if let Some(m) = crate::exe::find(program).and_then(|p| std::fs::metadata(p).ok()) {
         let secs = m.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
         h.update(format!("{secs}\0{}", m.len()).as_bytes());
     }
@@ -133,7 +133,8 @@ fn store(dir: &Path, m: &Manifest) -> Result<()> {
 pub fn command(program: &str, args: &[String]) -> Spawn {
     let (program, args) = (program.to_string(), args.to_vec());
     Arc::new(move || {
-        let mut child = Command::new(&program)
+        let bin = crate::exe::find(&program).ok_or_else(|| anyhow!("{program} is not installed (not found by its full path)"))?;
+        let mut child = Command::new(bin)
             .args(&args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -148,14 +149,14 @@ pub fn command(program: &str, args: &[String]) -> Spawn {
 }
 
 /// Entry point of `hanzo __mcp -- <server> <args…>` over the process's stdio.
-pub async fn main(argv: &[String]) -> Result<()> {
+pub async fn main(root: Option<Root>, argv: &[String]) -> Result<()> {
     let (head, rest) = argv.iter().position(|a| a == "--").map_or((&argv[..0], argv), |i| (&argv[..i], &argv[i + 1..]));
     let ledger = head.iter().position(|a| a == "--ledger").and_then(|i| head.get(i + 1)).map(PathBuf::from);
     let (program, args) = rest.split_first().ok_or_else(|| anyhow!("usage: hanzo __mcp [--ledger FILE] -- <server> [args…]"))?;
     let spawn = command(program, args);
-    // Its own process, so its own entry point: the proxy runs as the user who
-    // started the session, and keeps its answers under that user's home.
-    let cache = Root::user().map(|r| cache_dir(&r));
+    // The binary's `main` names the root (the proxy runs as the user who started
+    // the session), and the proxy keeps its answers under it.
+    let cache = root.map(|r| cache_dir(&r));
     serve(tokio::io::stdin(), tokio::io::stdout(), spawn, program, args, cache, ledger).await
 }
 

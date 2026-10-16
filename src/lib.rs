@@ -34,6 +34,7 @@ mod dev;
 // so anything that can hold a session — `hanzo link` as much as `hanzo dev` —
 // must be able to name the value it is setting.
 pub mod event;
+pub mod exe;
 pub mod harness;
 mod home;
 pub mod host;
@@ -454,7 +455,7 @@ pub async fn run(host: Arc<dyn Host>, opts: Options) -> Result<()> {
     let kind = opts.backend;
     let backend = resolve(kind);
     let mode = if opts.task.is_some() { Mode::Headless } else { Mode::Interactive };
-    let profile = host.profile();
+    let profile = host.profile().await;
     let root = opts.root.clone();
     let api = profile.api.clone();
     // The one network whose api may be plain http (the kit's bearer check).
@@ -771,7 +772,7 @@ pub async fn run(host: Arc<dyn Host>, opts: Options) -> Result<()> {
                     .map(|p| p.display().to_string());
                 finalize(c, id, &outcome, status, &snapshot, &api, &who, transcript, &root).await;
             }
-            spent.end(&*host, backend.label(), kind == BackendKind::Claude, &outcome.usage, session_id.as_deref(), tools.as_deref().map_err(String::as_str)).await;
+            spent.end(&*host, &opts.brand, backend.label(), kind == BackendKind::Claude, &outcome.usage, session_id.as_deref(), tools.as_deref().map_err(String::as_str)).await;
             if let Some(id) = &session_id {
                 report_link(id);
             }
@@ -805,7 +806,7 @@ pub async fn run(host: Arc<dyn Host>, opts: Options) -> Result<()> {
                 finalize(c, id, &outcome, status, &snapshot, &api, &who, transcript, &root).await;
             }
             // The tool's own screen was the stream, so nothing was reported here.
-            spent.end(&*host, backend.label(), kind == BackendKind::Claude, &Usage::default(), session_id.as_deref(), tools.as_deref().map_err(String::as_str)).await;
+            spent.end(&*host, &opts.brand, backend.label(), kind == BackendKind::Claude, &Usage::default(), session_id.as_deref(), tools.as_deref().map_err(String::as_str)).await;
             if let Some(id) = &session_id {
                 report_link(id);
             }
@@ -1077,8 +1078,9 @@ async fn run_turn(
     if control.is_some() {
         control::hear(&mut command);
     }
-    let mut child = command.spawn().map_err(spawn_err(backend.label()))?;
+    let mut child = spawn(&mut command, backend.label())?;
     let pid = child.id();
+    let relay = control::relay(pid);
     let mut acted: Option<Act> = None;
 
     let outcome = match (structured, control) {
@@ -1120,6 +1122,9 @@ async fn run_turn(
     };
 
     let status = child.wait().await.context("waiting for backend")?;
+    if let Some(r) = relay {
+        r.abort();
+    }
     drop(cleanup);
     Ok((outcome, status.success(), acted))
 }
@@ -1208,7 +1213,8 @@ async fn run_interactive(
 ) -> Result<bool> {
     let Launch { mut command, cleanup } = launch;
     command.stdin(Stdio::inherit()).stdout(Stdio::inherit()).stderr(Stdio::inherit());
-    let mut child = command.spawn().map_err(spawn_err(backend.label()))?;
+    let mut child = spawn(&mut command, backend.label())?;
+    let relay = control::relay(child.id());
 
     // Linked interactive per-event streaming rides the backend transcript tail.
     let stop = Arc::new(AtomicBool::new(false));
@@ -1220,6 +1226,9 @@ async fn run_interactive(
     };
 
     let status = child.wait().await.context("waiting for backend")?;
+    if let Some(r) = relay {
+        r.abort();
+    }
     stop.store(true, Ordering::Relaxed);
     if let Some(h) = tail {
         let _ = h.await;
@@ -1411,6 +1420,16 @@ fn session_title(opts: &Options) -> String {
         Some(t) => t.chars().take(120).collect(),
         None => "interactive coding session".to_string(),
     }
+}
+
+/// Start a launch's program, which runs by its full path or not at all: a bare
+/// name would be looked up through every PATH entry, a relative one included,
+/// and a session starts in a repository it has not read ([`exe`]).
+fn spawn(command: &mut tokio::process::Command, label: &str) -> Result<tokio::process::Child> {
+    if !Path::new(command.as_std().get_program()).is_absolute() {
+        return Err(spawn_err(label)(std::io::ErrorKind::NotFound.into()));
+    }
+    command.spawn().map_err(spawn_err(label))
 }
 
 /// A backend that is not installed is the ONE failure a user hits before any of
@@ -1798,7 +1817,7 @@ mod tests {
             let mut f = tempfile::Builder::new().suffix(".jsonl").tempfile().unwrap();
             f.write_all(self.fixture.as_bytes()).unwrap();
             let path = f.into_temp_path();
-            let mut command = tokio::process::Command::new("cat");
+            let mut command = tokio::process::Command::new(crate::exe::find("cat").expect("cat"));
             command.arg(&*path);
             Ok(Launch { command, cleanup: crate::backend::Scratch { files: vec![path], dirs: Vec::new() } })
         }
@@ -2218,7 +2237,7 @@ mod control_tests {
             let mut b = self.built.lock().unwrap();
             let idx = b.len().min(self.scripts.len() - 1);
             b.push((spec.resume.clone(), spec.task.clone()));
-            let mut command = tokio::process::Command::new("sh");
+            let mut command = tokio::process::Command::new(crate::exe::find("sh").expect("sh"));
             command.arg("-c").arg(self.scripts[idx]);
             // Every turn starts with both control signals ignored, as a
             // supervisor launched in the background hands them down, so these
