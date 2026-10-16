@@ -39,10 +39,12 @@ gen --help                   # every flag
 ## Routing
 
 Every agent's model calls go to api.hanzo.ai, which serves Enso, Zen and Kai,
-so one account and one bill cover every agent. Hanzo Dev always routes there.
-A third-party agent keeps its own login unless you pass `--cloud`; with it, its
-calls route through api.hanzo.ai like Dev's. `--model enso-ultra` picks the model
-on that route.
+so one account and one bill cover every agent. Hanzo Dev routes there whenever
+you are signed in. A third-party agent keeps its own login unless you pass
+`--cloud`; with it, its calls route through api.hanzo.ai like Dev's. A few agents
+have no way to name another endpoint (Cursor, Antigravity, Gemini, Copilot, Amp
+and a handful more) and always use their own account. `--model enso-ultra` picks
+the model on the Hanzo route.
 
 When you are signed in, a session is registered with Hanzo cloud and its events
 stream to mission control; `--no-link` keeps it local.
