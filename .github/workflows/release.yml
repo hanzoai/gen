@@ -8,8 +8,17 @@
 # What it ships is what hanzo.sh installs: per platform, `gen-<os>-<arch>.tar.gz`
 # holding one file named `gen` (`gen.exe` on Windows), and its `.sha256` beside
 # it. hanzoai/cli's install.sh picks the highest stable tag whose release carries
-# this machine's archive and checksum, so a draft is invisible to it until
-# `publish` has verified all ten assets.
+# this machine's archive and checksum, so nothing is visible to it until
+# `publish` has verified all ten assets and published the release.
+#
+# LEAST PRIVILEGE, per job. Nothing holds a token by default (`permissions: {}`).
+# `version` and the five `build` jobs read the repository and nothing else: they
+# compile code from crates and toolchains, and a build that could write the
+# release could ship whatever one of those injected. Builds hand their archives
+# to `publish` as artifacts. `publish` alone writes: it verifies every archive
+# against its checksum and runs the linux one, attests all ten (build provenance,
+# `gh attestation verify gen-linux-amd64.tar.gz -R hanzoai/gen`), and only then
+# opens, fills and publishes the release. No checkout keeps its credential.
 #
 # The runners are this org's own (`linux-amd64`); the image carries cc, make,
 # curl, jq, tar, xz, zip, git and python3, and no Rust and no LLVM, so Rust comes
@@ -22,6 +31,7 @@
 # A runner lives for one job, so sccache wraps every rustc call and hanzoai/ci's
 # bin/cache carries its objects and the crate downloads to the next run through
 # this org's store (/v1/s3, the IAM identity KMS mints, no bucket credential).
+# That store is code a build trusts; LLM.md names what can write it.
 name: Release
 on:
   push:
@@ -30,8 +40,7 @@ on:
 concurrency:
   group: release
   cancel-in-progress: false
-permissions:
-  contents: write
+permissions: {}
 env:
   ZIG_VERSION: '0.16.0'
   ZIG_SHA256: '70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00'
@@ -53,16 +62,16 @@ env:
 jobs:
   version:
     runs-on: [linux-amd64]
+    permissions:
+      contents: read
     outputs:
       version: ${{ steps.v.outputs.version }}
-      release: ${{ steps.v.outputs.release }}
     steps:
-      - uses: actions/checkout@v4
-      - name: The version is the tag's, and the draft that will hold it
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: The version is the tag's
         id: v
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           case "$GITHUB_REF" in
@@ -72,27 +81,15 @@ jobs:
           printf '%s' "$v" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "::error::$GITHUB_REF_NAME is not vX.Y.Z"; exit 1; }
           c=$(sed -n '/^\[package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)
           [ "$c" = "$v" ] || { echo "::error::the tag says $v and Cargo.toml's [package] says $c: the version is assigned by hand, in Cargo.toml, before the tag"; exit 1; }
-          auth=(-H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json")
-          # A rerun of the same tag finds its own draft; a published release at
-          # this version is a version already taken, which no run may ship again.
-          rel=$(curl -s "${auth[@]}" "https://api.github.com/repos/$REPO/releases?per_page=100" \
-            | jq -r --arg t "v$v" '.[] | select(.tag_name == $t) | "\(.id) \(.draft)"' | head -1)
-          case "$rel" in
-            "") rel=$(curl -s -X POST "${auth[@]}" "https://api.github.com/repos/$REPO/releases" \
-                  -d "$(jq -nc --arg t "v$v" --arg n "gen v$v" --arg sha "$GITHUB_SHA" \
-                    '{tag_name:$t,name:$n,target_commitish:$sha,draft:true}')" | jq -r '.id // empty')
-                [ -n "$rel" ] || { echo "::error::could not open the draft release"; exit 1; } ;;
-            *" true") rel=${rel% true} ;;
-            *" false") echo "::error::v$v is already published: a version is never shipped twice"; exit 1 ;;
-          esac
           echo "version=$v" >> "$GITHUB_OUTPUT"
-          echo "release=$rel" >> "$GITHUB_OUTPUT"
-          echo "release v$v from $GITHUB_REF_NAME — draft $rel"
+          echo "release v$v from $GITHUB_REF_NAME"
 
   build:
     name: ${{ matrix.target.id }}
     needs: version
     runs-on: [linux-amd64]
+    permissions:
+      contents: read
     timeout-minutes: 180
     strategy:
       fail-fast: false
@@ -109,7 +106,9 @@ jobs:
       RUSTFLAGS: -C debuginfo=0 -C strip=symbols
       CARGO_BUILD_JOBS: "2"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - name: Toolchain deps
         run: |
           set -euo pipefail
@@ -277,55 +276,77 @@ jobs:
           tar -C "target/$t/release" -czf "dist/gen-$short.tar.gz" "$bin"
           (cd dist && sha256sum "gen-$short.tar.gz" > "gen-$short.tar.gz.sha256")
           ls -la dist
-      - name: Upload into the draft
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          REL: ${{ needs.version.outputs.release }}
-        run: |
-          set -euo pipefail
-          auth=(-H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json")
-          for f in dist/*; do
-            n=$(basename "$f")
-            old=$(curl -s "${auth[@]}" "https://api.github.com/repos/$REPO/releases/$REL/assets" | jq -r --arg n "$n" '.[]|select(.name==$n)|.id')
-            for id in $old; do curl -s -X DELETE "${auth[@]}" "https://api.github.com/repos/$REPO/releases/assets/$id" >/dev/null; done
-            code=$(curl -s -o /tmp/up.json -w '%{http_code}' -X POST "${auth[@]}" -H 'Content-Type: application/octet-stream' \
-              --data-binary @"$f" "https://uploads.github.com/repos/$REPO/releases/$REL/assets?name=$n")
-            [ "$code" = 201 ] || { echo "::error::upload $n failed ($code)"; cat /tmp/up.json; exit 1; }
-            echo "uploaded $n"
-          done
+      - name: Hand the archive to publish
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: gen-${{ matrix.target.id }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 1
 
   publish:
     needs: [version, build]
     runs-on: [linux-amd64]
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     timeout-minutes: 30
     env:
       V: ${{ needs.version.outputs.version }}
-      REL: ${{ needs.version.outputs.release }}
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
     steps:
-      - name: Every asset is present, then the release is real
+      - name: The five builds
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: gen-*
+          path: dist
+          merge-multiple: true
+      - name: Every archive is here, whole, and runs
         run: |
           set -euo pipefail
-          auth=(-H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json")
-          mkdir -p dist
-          curl -s "${auth[@]}" "https://api.github.com/repos/$REPO/releases/$REL/assets?per_page=100" > /tmp/assets.json
-          n=$(jq length /tmp/assets.json)
-          [ "$n" -eq 10 ] || { echo "::error::draft holds $n assets, want 10 — a target is missing"; jq -r '.[].name' /tmp/assets.json; exit 1; }
-          # Bytes need octet-stream ALONE: the vnd.github Accept beside it makes
-          # GitHub answer with the asset's metadata instead of its bytes.
-          jq -r '.[] | "\(.id) \(.name)"' /tmp/assets.json | while read -r id name; do
-            curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/octet-stream" \
-              "https://api.github.com/repos/$REPO/releases/assets/$id" -o "dist/$name"
+          n=$(ls dist | wc -l)
+          [ "$n" -eq 10 ] || { echo "::error::$n files, want 10 — a target is missing"; ls -la dist; exit 1; }
+          for t in linux-amd64 linux-arm64 darwin-amd64 darwin-arm64 windows-amd64; do
+            test -f "dist/gen-$t.tar.gz" && test -f "dist/gen-$t.tar.gz.sha256" || { echo "::error::gen-$t is missing"; exit 1; }
           done
           (cd dist && for s in *.sha256; do sha256sum -c "$s" >/dev/null; done)
-          echo "10 assets present and checksum-clean"
           # The release runs what it ships: the linux binary is native to this
           # runner, so it answers for the matrix that the artifacts are programs.
           x=$(mktemp -d); tar -xzf dist/gen-linux-amd64.tar.gz -C "$x"
           "$x/gen" --version | grep -qF "$V" || { echo "::error::the shipped binary does not say $V"; "$x/gen" --version; exit 1; }
           "$x/gen" --help >/dev/null
-          echo "smoked: $("$x/gen" --version)"
-          curl -s -X PATCH "${auth[@]}" "https://api.github.com/repos/$REPO/releases/$REL" \
+          echo "10 files, checksum-clean; smoked: $("$x/gen" --version)"
+      - name: Attest what was built
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: 'dist/gen-*.tar.gz'
+      - name: Publish the release
+        run: |
+          set -euo pipefail
+          auth=(-H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json")
+          # A rerun of the same tag finds its own draft; a published release at
+          # this version is a version already taken, which no run may ship again.
+          rel=$(curl -s "${auth[@]}" "https://api.github.com/repos/$REPO/releases?per_page=100" \
+            | jq -r --arg t "v$V" '.[] | select(.tag_name == $t) | "\(.id) \(.draft)"' | head -1)
+          case "$rel" in
+            "") rel=$(curl -s -X POST "${auth[@]}" "https://api.github.com/repos/$REPO/releases" \
+                  -d "$(jq -nc --arg t "v$V" --arg n "gen v$V" --arg sha "$GITHUB_SHA" \
+                    '{tag_name:$t,name:$n,target_commitish:$sha,draft:true}')" | jq -r '.id // empty')
+                [ -n "$rel" ] || { echo "::error::could not open the draft release"; exit 1; } ;;
+            *" true") rel=${rel% true} ;;
+            *" false") echo "::error::v$V is already published: a version is never shipped twice"; exit 1 ;;
+          esac
+          for f in dist/*; do
+            n=$(basename "$f")
+            old=$(curl -s "${auth[@]}" "https://api.github.com/repos/$REPO/releases/$rel/assets" | jq -r --arg n "$n" '.[]|select(.name==$n)|.id')
+            for id in $old; do curl -s -X DELETE "${auth[@]}" "https://api.github.com/repos/$REPO/releases/assets/$id" >/dev/null; done
+            code=$(curl -s -o /tmp/up.json -w '%{http_code}' -X POST "${auth[@]}" -H 'Content-Type: application/octet-stream' \
+              --data-binary @"$f" "https://uploads.github.com/repos/$REPO/releases/$rel/assets?name=$n")
+            [ "$code" = 201 ] || { echo "::error::upload $n failed ($code)"; cat /tmp/up.json; exit 1; }
+          done
+          n=$(curl -s "${auth[@]}" "https://api.github.com/repos/$REPO/releases/$rel/assets?per_page=100" | jq length)
+          [ "$n" -eq 10 ] || { echo "::error::the draft holds $n assets, want 10"; exit 1; }
+          curl -s -X PATCH "${auth[@]}" "https://api.github.com/repos/$REPO/releases/$rel" \
             -d '{"draft":false}' | jq -r '"published: " + .html_url'
