@@ -52,6 +52,16 @@ CLI has on file (`hanzo config profile`): `hanzo config set code.link false` kee
 every session local, and `hanzo network use local` points Gen at your own cloud. A
 CLI too old to say keeps the session local on api.hanzo.ai until `hanzo upgrade`.
 
+## Examples & Integration
+
+Runnable multi-turn assistant and tool-dispatch examples in [`examples/`](examples/):
+
+- **Python**: [`examples/python/assistant.py`](examples/python/assistant.py) (Two-turn tool calling loop)
+- **TypeScript**: [`examples/typescript/assistant.ts`](examples/typescript/assistant.ts) (Native fetch assistant)
+- **Go**: [`examples/go/main.go`](examples/go/main.go) (Standard `net/http` conversational round)
+- **Rust**: [`examples/rust/`](examples/rust/) (Type-safe tool calling client with `reqwest`)
+- **cURL**: [`examples/curl/assistant.sh`](examples/curl/assistant.sh) (One-liner CLI query)
+
 ## Build
 
 ```sh
