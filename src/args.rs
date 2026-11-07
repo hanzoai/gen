@@ -95,7 +95,7 @@ pub struct Args {
     #[arg(long)]
     pub theme: Option<String>,
 
-    /// The gateway model to use, e.g. `enso`, `enso-ultra`, `zen5-coder`. Applies
+    /// The gateway model to use, e.g. `enso-auto`, `enso-ultra`, `zen5-coder`. Applies
     /// on the metered Hanzo gateway route only; a direct provider key names its own
     /// model. No client-side allowlist — the gateway validates the id.
     #[arg(long, value_name = "MODEL")]

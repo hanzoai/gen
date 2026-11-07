@@ -962,6 +962,8 @@ mod tests {
     #[test]
     fn a_tier_rides_its_recognized_carrier() {
         let env = env_of(&launch_with("enso-ultra", "enso-flash", 1_000_000));
+        assert_eq!(env.get("ANTHROPIC_MODEL").map(String::as_str), Some("claude-fable-5[1m]"));
+        let env = env_of(&launch_with("enso-max", "enso-flash", 1_000_000));
         assert_eq!(env.get("ANTHROPIC_MODEL").map(String::as_str), Some("claude-opus-4-8[1m]"));
         let env = env_of(&launch_with("enso-pro", "enso-flash", 1_000_000));
         assert_eq!(env.get("ANTHROPIC_MODEL").map(String::as_str), Some("claude-sonnet-4-6[1m]"));
@@ -984,7 +986,8 @@ mod tests {
         assert_eq!(env.get("ANTHROPIC_DEFAULT_FABLE_MODEL").map(String::as_str), Some("claude-fable-5[1m]"));
         assert_eq!(env.get("ANTHROPIC_DEFAULT_HAIKU_MODEL").map(String::as_str), Some("enso-flash"));
         assert_eq!(env.get("ANTHROPIC_DEFAULT_SONNET_MODEL_NAME").map(String::as_str), Some("Enso Pro"));
-        assert_eq!(env.get("ANTHROPIC_DEFAULT_OPUS_MODEL_NAME").map(String::as_str), Some("Enso Ultra"));
+        assert_eq!(env.get("ANTHROPIC_DEFAULT_OPUS_MODEL_NAME").map(String::as_str), Some("Enso Max"));
+        assert_eq!(env.get("ANTHROPIC_DEFAULT_FABLE_MODEL_NAME").map(String::as_str), Some("Enso Ultra"));
         assert_eq!(env.get("ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME").map(String::as_str), Some("Enso Flash"));
         assert!(env.contains_key("ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION"));
     }
@@ -1005,7 +1008,7 @@ mod tests {
     #[test]
     fn standard_window_drops_the_suffix_from_a_carrier() {
         let env = env_of(&launch_with("enso-ultra", "enso-flash", 200_000));
-        assert_eq!(env.get("ANTHROPIC_MODEL").map(String::as_str), Some("claude-opus-4-8"));
+        assert_eq!(env.get("ANTHROPIC_MODEL").map(String::as_str), Some("claude-fable-5"));
     }
 
     /// A ROUTED `hanzo dev --claude` is NOT the user's own Claude Code install: it
@@ -1073,7 +1076,7 @@ mod tests {
         let line = &args[i + 1];
         assert!(line.contains("Enso Ultra"), "must name the tier it really is: {line}");
         assert!(line.contains("enso-ultra"), "must name the served id: {line}");
-        assert!(!line.contains("claude-opus"), "must not repeat the carrier back to the model: {line}");
+        assert!(!line.contains("claude-fable"), "must not repeat the carrier back to the model: {line}");
         // An untiered id rides no carrier, so nothing is claimed on its behalf.
         let plain = argv(&launch_with("enso", "enso-flash", 1_000_000));
         assert!(!plain.iter().any(|a| a == "--append-system-prompt"), "an uncarried model needs no correction");

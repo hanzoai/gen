@@ -399,7 +399,7 @@ mod tests {
             {"id": "anthropic/claude-sonnet-4.5", "free": false, "pricing": {
                 "prompt": "0.000003165", "completion": "0.000015825",
                 "rates": {"input_cache_read": "0.0000003165", "input_cache_write": "0.00000395625"}}},
-            {"id": "enso-auto", "free": true, "pricing": {"prompt": "0", "completion": "0"}},
+            {"id": "zero-rated", "free": true, "pricing": {"prompt": "0", "completion": "0"}},
             {"id": "zen-scribe", "pricing": null},
             {"id": "gpt-5", "pricing": {"prompt": "0.00000125", "completion": "0.00001"}}
         ]})
@@ -420,7 +420,7 @@ mod tests {
         }
         assert!(book.price("zen-scribe").is_none(), "a row with no price is not priced at zero");
         assert!(book.price("no-such-model").is_none());
-        let (_, free) = book.price("enso-auto").unwrap();
+        let (_, free) = book.price("zero-rated").unwrap();
         assert!(free.free && free.input == 0.0, "a free model is priced at zero on purpose");
         assert!(!book.price("gpt-5").unwrap().1.free);
         assert!(Book::parse(&json!({"data": []})).is_none());
