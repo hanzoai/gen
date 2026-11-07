@@ -48,8 +48,10 @@ pub struct Tier {
 
 /// Every id here must be one api.hanzo.ai serves. Claude Code's own tiering is
 /// Enso's, one tier per slot: Haiku (background work and routine turns) is
-/// `enso-flash`, Sonnet `enso-pro`, Opus `enso-max`, Fable `enso-ultra`. `zen6`
-/// is the open-weights tier a user picks (`--model zen6`), in no slot.
+/// `enso-flash`, Sonnet `enso-pro`, Opus `enso-max`, Fable `enso-ultra`, each
+/// thinking at its own depth (low, medium, high, max) since no effort is seeded
+/// ([`super::home`]). `zen6` is the open-weights tier a user picks
+/// (`--model zen6`), in no slot.
 pub const TIERS: &[Tier] = &[
     Tier { zen: "enso-flash", carrier: None, slot: Some(HAIKU), name: "Enso Flash", desc: "Hanzo Enso Flash — routine turns: reads, searches, small edits" },
     Tier { zen: "enso-pro", carrier: Some("claude-sonnet-4-6[1m]"), slot: Some("ANTHROPIC_DEFAULT_SONNET_MODEL"), name: "Enso Pro", desc: "Hanzo Enso Pro — frontier coders, routed (1M context)" },

@@ -30,7 +30,7 @@
 //!   - the non-interactive blockers (`skipAutoPermissionPrompt`,
 //!     `skipDangerousModePermissionPrompt`, `hasCompletedOnboarding`) — a headless
 //!     run cannot answer a TTY dialog, so these remove prompts, not guardrails;
-//!   - first-run preferences (`effortLevel`, `includeCoAuthoredBy`, `enableWorkflows`).
+//!   - first-run preferences (`includeCoAuthoredBy`, `enableWorkflows`).
 //!
 //! Nothing per-RUN is persisted here, and that is the load-bearing rule. The
 //! carrier⇒zen `modelOverrides` map is a property of the GATEWAY ROUTE, so it rides
@@ -38,6 +38,12 @@
 //! home it would also rewrite a `--no-route` or direct-Anthropic session's model to
 //! a zen id and 404 against api.anthropic.com. A route-dependent policy cannot live
 //! in a route-independent file.
+//!
+//! `effortLevel` is deliberately absent. It is one effort for the whole session,
+//! and Enso's depth is per tier: each slot's tier thinks at its own (flash low, pro
+//! medium, max high, ultra max) and `enso-auto` leaves depth to its router, so a
+//! seeded effort would hold every slot at one depth and push `enso-auto` to the
+//! tier that depth names.
 //!
 //! Two more keys are deliberately absent. Permission policy is resolved ONCE, in
 //! [`super::resolve_approval`], and reaches the child on argv — a persisted
@@ -104,7 +110,6 @@ pub(crate) fn defaults() -> Value {
         "includeCoAuthoredBy": false,
         "skipAutoPermissionPrompt": true,
         "skipDangerousModePermissionPrompt": true,
-        "effortLevel": "max",
         "enableWorkflows": true,
     })
 }
@@ -168,7 +173,8 @@ mod tests {
     #[test]
     fn the_defaults_are_blockers_and_preferences_only() {
         let d = defaults();
-        assert_eq!(d["effortLevel"], "max");
+        // Depth is each Enso tier's own, and `enso-auto`'s router's: no session effort.
+        assert!(d.get("effortLevel").is_none(), "a seeded effort would hold every slot at one depth");
         assert_eq!(d["skipDangerousModePermissionPrompt"], true);
         assert_eq!(d["skipAutoPermissionPrompt"], true);
         // Permission policy reaches the child on argv, never from this file.
