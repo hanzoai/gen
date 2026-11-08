@@ -179,7 +179,7 @@ enum Cred {
 /// with `--model enso-ultra`. Overridable in `~/.hanzo/settings.json` (see [`Settings`]).
 ///
 /// It was `enso` until the family was renamed so every member states its role —
-/// auto, flash, ultra, free — leaving no unsuffixed id. The old name still serves
+/// auto, flash, pro, max, ultra — leaving no unsuffixed id. The old name still serves
 /// during the cutover, which matters more here than anywhere else: this constant is
 /// COMPILED IN, so every already-installed binary keeps asking for `enso` and no
 /// deploy of ours can reach them. The catalog's transitional entry may not be

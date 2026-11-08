@@ -47,16 +47,16 @@ pub struct Tier {
 }
 
 /// Every id here must be one api.hanzo.ai serves. Claude Code's own tiering is
-/// Enso's: its Haiku slot (background work and routine turns) is `enso-flash`, its
-/// Sonnet slot `enso-pro`, its Opus slot `enso-ultra`. `enso-ultra` fills TWO slots
-/// (opus and the top-effort fable tier) because the gateway has no deeper tier to
-/// put behind fable — so [`carrier`] takes the FIRST match, which is the opus
-/// carrier. `zen6` is the open-weights tier a user picks (`--model zen6`), in no slot.
+/// Enso's, one tier per slot: Haiku (background work and routine turns) is
+/// `enso-flash`, Sonnet `enso-pro`, Opus `enso-max`, Fable `enso-ultra`, each
+/// thinking at its own depth (low, medium, high, max) since no effort is seeded
+/// ([`super::home`]). `zen6` is the open-weights tier a user picks
+/// (`--model zen6`), in no slot.
 pub const TIERS: &[Tier] = &[
     Tier { zen: "enso-flash", carrier: None, slot: Some(HAIKU), name: "Enso Flash", desc: "Hanzo Enso Flash — routine turns: reads, searches, small edits" },
     Tier { zen: "enso-pro", carrier: Some("claude-sonnet-4-6[1m]"), slot: Some("ANTHROPIC_DEFAULT_SONNET_MODEL"), name: "Enso Pro", desc: "Hanzo Enso Pro — frontier coders, routed (1M context)" },
-    Tier { zen: "enso-ultra", carrier: Some("claude-opus-4-8[1m]"), slot: Some("ANTHROPIC_DEFAULT_OPUS_MODEL"), name: "Enso Ultra", desc: "Hanzo Enso Ultra — the hardest turns, routed (1M context)" },
-    Tier { zen: "enso-ultra", carrier: Some("claude-fable-5[1m]"), slot: Some("ANTHROPIC_DEFAULT_FABLE_MODEL"), name: "Enso Ultra (max effort)", desc: "Hanzo Enso Ultra at max effort (1M context)" },
+    Tier { zen: "enso-max", carrier: Some("claude-opus-4-8[1m]"), slot: Some("ANTHROPIC_DEFAULT_OPUS_MODEL"), name: "Enso Max", desc: "Hanzo Enso Max — hard turns, routed (1M context)" },
+    Tier { zen: "enso-ultra", carrier: Some("claude-fable-5[1m]"), slot: Some("ANTHROPIC_DEFAULT_FABLE_MODEL"), name: "Enso Ultra", desc: "Hanzo Enso Ultra — the hardest turns, routed (1M context)" },
     Tier { zen: "zen6", carrier: Some("claude-sonnet-5[1m]"), slot: None, name: "Zen6", desc: "Hanzo Zen6 — open weights (1M context)" },
 ];
 
@@ -101,8 +101,8 @@ pub fn wire(model: &str, context_window: u64) -> String {
 }
 
 /// The wire id for one TIER — keyed on the tier itself, never on its zen id,
-/// because two tiers may share an id (`enso-ultra` fills both the opus and the fable
-/// slot) and an id lookup would hand them both the same carrier.
+/// because an id lookup between two tiers sharing an id would hand them both the
+/// same carrier.
 fn wire_tier(t: &Tier, context_window: u64) -> String {
     let extended = context_window > STANDARD_WINDOW;
     match t.carrier {
@@ -152,8 +152,8 @@ pub fn overrides() -> BTreeMap<String, String> {
 /// picker must never name a model the slot does not hold.
 pub fn env(model: &str, small_fast: &str, context_window: u64) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
-    // Every slot is filled from ITS OWN tier — by identity, never by zen id, so the
-    // two tiers sharing `enso-ultra` keep their own carriers and their own labels.
+    // Every slot is filled from ITS OWN tier — by identity, never by zen id, so
+    // each slot keeps its own carrier and its own label.
     for t in TIERS.iter().filter(|t| t.slot.is_some()) {
         fill(&mut out, t.slot.unwrap(), wire_tier(t, context_window), Some(t));
     }
@@ -206,22 +206,24 @@ mod tests {
         }
     }
 
-    /// `enso-ultra` fills TWO slots, and each must keep its OWN carrier and label. A
-    /// lookup by zen id is ambiguous between them, so filling a slot from the id
-    /// silently gave the fable slot the opus carrier — a model the picker names
-    /// "max effort" that is not the max-effort model.
+    /// Claude Code's four tiering slots are Enso's four paid tiers, one each:
+    /// Haiku flash, Sonnet pro, Opus max, Fable ultra. Each slot is labelled with
+    /// its own tier and SERVES its own id — the carrier is client-side only.
     #[test]
-    fn two_slots_sharing_one_zen_id_keep_their_own_carriers() {
-        let e = env("enso", "enso-flash", 1_000_000);
+    fn each_slot_carries_its_own_enso_tier() {
+        let e = env("enso-auto", "enso-flash", 1_000_000);
+        assert_eq!(e[HAIKU], "enso-flash");
+        assert_eq!(e["ANTHROPIC_DEFAULT_SONNET_MODEL"], "claude-sonnet-4-6[1m]");
         assert_eq!(e["ANTHROPIC_DEFAULT_OPUS_MODEL"], "claude-opus-4-8[1m]");
         assert_eq!(e["ANTHROPIC_DEFAULT_FABLE_MODEL"], "claude-fable-5[1m]");
-        assert_eq!(e["ANTHROPIC_DEFAULT_OPUS_MODEL_NAME"], "Enso Ultra");
-        assert_eq!(e["ANTHROPIC_DEFAULT_FABLE_MODEL_NAME"], "Enso Ultra (max effort)");
-        // Both still SERVE the one id — the carrier is client-side only.
+        assert_eq!(e[&format!("{HAIKU}_NAME")], "Enso Flash");
+        assert_eq!(e["ANTHROPIC_DEFAULT_SONNET_MODEL_NAME"], "Enso Pro");
+        assert_eq!(e["ANTHROPIC_DEFAULT_OPUS_MODEL_NAME"], "Enso Max");
+        assert_eq!(e["ANTHROPIC_DEFAULT_FABLE_MODEL_NAME"], "Enso Ultra");
         let o = overrides();
-        assert_eq!(o["claude-opus-4-8"], "enso-ultra");
-        assert_eq!(o["claude-fable-5"], "enso-ultra");
         assert_eq!(o["claude-sonnet-4-6"], "enso-pro");
+        assert_eq!(o["claude-opus-4-8"], "enso-max");
+        assert_eq!(o["claude-fable-5"], "enso-ultra");
     }
 
     /// An id that already carries the `[1m]` suffix is normalized, never doubled:
@@ -254,10 +256,12 @@ mod tests {
         assert_eq!(wire("zen6", 200_000), "claude-sonnet-5");
     }
 
-    /// `enso-ultra` fills two slots; the carrier lookup is deterministic (first match).
+    /// `enso-max` and `enso-ultra` each ride their own slot's carrier.
     #[test]
-    fn a_tier_in_two_slots_resolves_to_one_carrier() {
-        assert_eq!(wire("enso-ultra", 1_000_000), "claude-opus-4-8[1m]");
+    fn max_and_ultra_ride_their_own_carriers() {
+        assert_eq!(wire("enso-max", 1_000_000), "claude-opus-4-8[1m]");
+        assert_eq!(wire("enso-ultra", 1_000_000), "claude-fable-5[1m]");
+        assert_eq!(wire("enso-ultra", 200_000), "claude-fable-5");
     }
 
     /// Every slot is filled and labelled, and the run's own models win their slots.
@@ -271,8 +275,8 @@ mod tests {
         // The tiers Claude picks from are still fully named.
         assert_eq!(e["ANTHROPIC_DEFAULT_SONNET_MODEL"], "claude-sonnet-4-6[1m]");
         assert_eq!(e["ANTHROPIC_DEFAULT_SONNET_MODEL_NAME"], "Enso Pro");
-        assert_eq!(e["ANTHROPIC_DEFAULT_OPUS_MODEL_NAME"], "Enso Ultra");
-        assert_eq!(e["ANTHROPIC_DEFAULT_FABLE_MODEL_NAME"], "Enso Ultra (max effort)");
+        assert_eq!(e["ANTHROPIC_DEFAULT_OPUS_MODEL_NAME"], "Enso Max");
+        assert_eq!(e["ANTHROPIC_DEFAULT_FABLE_MODEL_NAME"], "Enso Ultra");
     }
 
     /// The env carries no secret and no endpoint — only model ids and labels — so

@@ -259,7 +259,7 @@ mod tests {
             {"id": "anthropic/claude-sonnet-4.5", "free": false, "pricing": {
                 "prompt": "0.000003", "completion": "0.000015",
                 "rates": {"input_cache_read": "0.0000003", "input_cache_write": "0.00000375"}}},
-            {"id": "enso-auto", "free": true, "pricing": {"prompt": "0", "completion": "0"}}
+            {"id": "zero-rated", "free": true, "pricing": {"prompt": "0", "completion": "0"}}
         ]}))
         .unwrap()
     }
@@ -320,8 +320,8 @@ mod tests {
     #[test]
     fn a_free_listed_model_is_zero_and_says_why() {
         let u = reported();
-        let out = text(&lines(&ended(&u, Some("enso-auto")), Some(&book()), None));
-        assert!(out.contains("$0.00 at the listed price of enso-auto   (listed as free)"), "{out}");
+        let out = text(&lines(&ended(&u, Some("zero-rated")), Some(&book()), None));
+        assert!(out.contains("$0.00 at the listed price of zero-rated   (listed as free)"), "{out}");
     }
 
     #[test]
