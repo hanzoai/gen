@@ -24,11 +24,45 @@ pub const AGENT: Agent = Agent {
 fn build(r: &mut Run) -> Result<()> {
     if let Some(g) = r.gateway() {
         let dir = r.home("omp")?;
+        let mut hanzo_models = vec![json!({ "id": g.model, "name": g.model })];
+        for (id, name) in [
+            ("hybrid/auto", "Hanzo Hybrid Auto (Local Qwen 3.8 27B + Remote Enso Pro)"),
+            ("enso-pro", "Enso Pro"),
+            ("enso-ultra", "Enso Ultra"),
+            ("enso-flash", "Enso Flash"),
+            ("zen6", "Zen 6"),
+        ] {
+            if g.model != id {
+                hanzo_models.push(json!({ "id": id, "name": name }));
+            }
+        }
         // JSON is YAML: the file omp reads, written without a YAML writer.
-        let models = json!({ "providers": { "hanzo": {
-            "baseUrl": g.v1(), "api": "openai-completions", "apiKey": KEY,
-            "models": [{ "id": g.model, "name": g.model }],
-        } } });
+        let models = json!({
+            "providers": {
+                "hanzo": {
+                    "baseUrl": g.v1(),
+                    "api": "openai-completions",
+                    "apiKey": KEY,
+                    "models": hanzo_models,
+                },
+                "local-llamacpp": {
+                    "baseUrl": "http://127.0.0.1:8080/v1",
+                    "api": "openai-completions",
+                    "models": [{ "id": "qwen3.8-27b", "name": "Qwen 3.8 27B (llama.cpp)" }],
+                }
+            },
+            "virtualModels": {
+                "hybrid/auto": {
+                    "local": "local-llamacpp/qwen3.8-27b",
+                    "remote": "hanzo/enso-pro",
+                    "fallbackRemote": "hanzo/zen6",
+                    "classifier": "local-llamacpp/qwen3.8-27b",
+                    "classifierMode": "llamacpp-classifier",
+                    "congestionThreshold": 0.75,
+                    "busyThreshold": 0.50
+                }
+            }
+        });
         r.write(&dir.join("models.yml"), &models)?;
         let mcp = r.mcp().map(|m| json!({ "mcpServers": { "hanzo": { "command": m.program, "args": m.args } } })).unwrap_or_else(|| json!({ "mcpServers": {} }));
         r.write(&dir.join("mcp.json"), &mcp)?;
@@ -61,6 +95,8 @@ mod tests {
         let dir = std::path::PathBuf::from(env(&l, "PI_CODING_AGENT_DIR").unwrap());
         let models: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("models.yml")).unwrap()).unwrap();
         assert_eq!(models["providers"]["hanzo"]["apiKey"], "HANZO_API_KEY");
+        assert_eq!(models["virtualModels"]["hybrid/auto"]["local"], "local-llamacpp/qwen3.8-27b");
+        assert_eq!(models["virtualModels"]["hybrid/auto"]["remote"], "hanzo/enso-pro");
         let mcp: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("mcp.json")).unwrap()).unwrap();
         assert_eq!(mcp["mcpServers"]["hanzo"]["command"], "/opt/hanzo");
         // On its own account omp keeps its own directory.

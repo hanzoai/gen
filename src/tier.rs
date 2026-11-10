@@ -58,7 +58,19 @@ pub const TIERS: &[Tier] = &[
     Tier { zen: "enso-max", carrier: Some("claude-opus-4-8[1m]"), slot: Some("ANTHROPIC_DEFAULT_OPUS_MODEL"), name: "Enso Max", desc: "Hanzo Enso Max — hard turns, routed (1M context)" },
     Tier { zen: "enso-ultra", carrier: Some("claude-fable-5[1m]"), slot: Some("ANTHROPIC_DEFAULT_FABLE_MODEL"), name: "Enso Ultra", desc: "Hanzo Enso Ultra — the hardest turns, routed (1M context)" },
     Tier { zen: "zen6", carrier: Some("claude-sonnet-5[1m]"), slot: None, name: "Zen6", desc: "Hanzo Zen6 — open weights (1M context)" },
+    Tier { zen: "hybrid/auto", carrier: None, slot: None, name: "Hanzo Hybrid Auto", desc: "Hanzo Hybrid Auto — virtual model: local Qwen 3.8 27B (llama.cpp) + remote Enso Pro (Kimi K3.1 Pro / GLM 5.3) with load-aware congestion bypass" },
+    Tier { zen: "zen-ocr", carrier: None, slot: None, name: "Zen OCR", desc: "Hanzo Zen OCR — document parsing & OCR (NVIDIA Nemotron Parse)" },
+    Tier { zen: "zen-tabular", carrier: None, slot: None, name: "Zen Tabular", desc: "Hanzo Zen Tabular — structured tabular reasoning" },
+    Tier { zen: "zen-relational", carrier: None, slot: None, name: "Zen Relational", desc: "Hanzo Zen Relational — relational & SQL schema intelligence" },
 ];
+
+/// Returns true if `model` names the hybrid virtual model (`hybrid/auto` or its aliases).
+pub fn is_hybrid_virtual_model(model: &str) -> bool {
+    matches!(
+        bare(model).trim().to_ascii_lowercase().as_str(),
+        "hybrid/auto" | "hybrid" | "enso-hybrid" | "zen-hybrid" | "hanzo/hybrid"
+    )
+}
 
 /// The tier a served id belongs to, if any. The id is normalized through
 /// [`bare`] first: `ANTHROPIC_MODEL` is one of the precedence sources the run
@@ -67,6 +79,9 @@ pub const TIERS: &[Tier] = &[
 /// rather than miss the table and grow a second suffix.
 fn of(model: &str) -> Option<&'static Tier> {
     let model = bare(model);
+    if is_hybrid_virtual_model(model) {
+        return TIERS.iter().find(|t| t.zen == "hybrid/auto");
+    }
     TIERS.iter().find(|t| t.zen == model)
 }
 
@@ -288,5 +303,16 @@ mod tests {
             assert!(!k.contains("TOKEN") && !k.contains("KEY") && !k.contains("BASE_URL"), "{k} is not a model var");
             assert!(!v.contains("://"), "{k} must not carry an endpoint: {v}");
         }
+    }
+
+    #[test]
+    fn hybrid_auto_and_aliases_resolve_to_hybrid_virtual_model_tier() {
+        for alias in ["hybrid/auto", "hybrid", "enso-hybrid", "zen-hybrid", "hanzo/hybrid"] {
+            assert!(is_hybrid_virtual_model(alias));
+            let t = of(alias).expect("hybrid tier");
+            assert_eq!(t.zen, "hybrid/auto");
+        }
+        assert_eq!(wire("hybrid/auto", 1_000_000), "hybrid/auto[1m]");
+        assert_eq!(wire("hybrid/auto", 200_000), "hybrid/auto");
     }
 }

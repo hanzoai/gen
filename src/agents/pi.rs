@@ -23,10 +23,44 @@ pub const AGENT: Agent = Agent {
 fn build(r: &mut Run) -> Result<()> {
     if let Some(g) = r.gateway() {
         let dir = r.home("pi")?;
-        let models = json!({ "providers": { "hanzo": {
-            "baseUrl": g.v1(), "api": "openai-completions", "apiKey": format!("${{{KEY}}}"),
-            "models": [{ "id": g.model, "name": g.model }],
-        } } });
+        let mut hanzo_models = vec![json!({ "id": g.model, "name": g.model })];
+        for (id, name) in [
+            ("hybrid/auto", "Hanzo Hybrid Auto (Local Qwen 3.8 27B + Remote Enso Pro)"),
+            ("enso-pro", "Enso Pro"),
+            ("enso-ultra", "Enso Ultra"),
+            ("enso-flash", "Enso Flash"),
+            ("zen6", "Zen 6"),
+        ] {
+            if g.model != id {
+                hanzo_models.push(json!({ "id": id, "name": name }));
+            }
+        }
+        let models = json!({
+            "providers": {
+                "hanzo": {
+                    "baseUrl": g.v1(),
+                    "api": "openai-completions",
+                    "apiKey": format!("${{{KEY}}}"),
+                    "models": hanzo_models,
+                },
+                "local-llamacpp": {
+                    "baseUrl": "http://127.0.0.1:8080/v1",
+                    "api": "openai-completions",
+                    "models": [{ "id": "qwen3.8-27b", "name": "Qwen 3.8 27B (llama.cpp)" }],
+                }
+            },
+            "virtualModels": {
+                "hybrid/auto": {
+                    "local": "local-llamacpp/qwen3.8-27b",
+                    "remote": "hanzo/enso-pro",
+                    "fallbackRemote": "hanzo/zen6",
+                    "classifier": "local-llamacpp/qwen3.8-27b",
+                    "classifierMode": "llamacpp-classifier",
+                    "congestionThreshold": 0.75,
+                    "busyThreshold": 0.50
+                }
+            }
+        });
         r.write(&dir.join("models.json"), &models)?;
         r.env("PI_CODING_AGENT_DIR", &dir).env(KEY, g.token);
         r.args(["--provider", "hanzo", "--model"]).arg(g.model);
@@ -54,6 +88,8 @@ mod tests {
         let dir = env(&l, "PI_CODING_AGENT_DIR").unwrap();
         let doc: Value = serde_json::from_str(&std::fs::read_to_string(std::path::Path::new(&dir).join("models.json")).unwrap()).unwrap();
         assert_eq!(doc["providers"]["hanzo"]["apiKey"], "${HANZO_API_KEY}");
+        assert_eq!(doc["virtualModels"]["hybrid/auto"]["local"], "local-llamacpp/qwen3.8-27b");
+        assert_eq!(doc["virtualModels"]["hybrid/auto"]["remote"], "hanzo/enso-pro");
         assert!(env(&build("pi", &spec(Mode::Headless, Route::Inherit)), "PI_CODING_AGENT_DIR").is_none());
     }
 
