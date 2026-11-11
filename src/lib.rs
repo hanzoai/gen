@@ -44,6 +44,7 @@ pub mod mcp;
 pub mod native;
 pub mod private;
 pub mod root;
+pub mod runner;
 pub mod sample;
 pub mod savings;
 pub mod session;
@@ -812,6 +813,131 @@ pub async fn run(host: Arc<dyn Host>, opts: Options) -> Result<()> {
             }
             run?;
         }
+    }
+    Ok(())
+}
+
+
+/// Run a claimed routed task headlessly into an ALREADY-OPENED cloud `session_id`,
+/// streaming live events and usage WITHOUT setting a terminal session status
+/// (cloud's `routedFinalizer` closes the session after `/report` arrives).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_routed_agent(
+    host: Arc<dyn Host>,
+    root: &Root,
+    brand: &str,
+    cwd: &Path,
+    session_id: &str,
+    prompt: &str,
+    model: Option<&str>,
+    effort: Option<&str>,
+    instructions: Option<&str>,
+) -> Result<()> {
+    let kind = match configured_agent(root) {
+        Some(agent) => BackendKind::parse(&agent).unwrap_or(backend::DEFAULT),
+        None => backend::DEFAULT,
+    };
+    let backend = resolve(kind);
+    let profile = host.profile().await;
+    let api = profile.api.clone();
+    let local = profile.local;
+
+    let identity = host.account(brand).await?;
+    let bearer = identity.as_ref().map(|a| a.token.clone());
+    let who = identity.as_ref().map(Account::to_string).unwrap_or_default();
+    let settings = Settings::load(root);
+
+    let mcp_on = settings.mcp.unwrap_or(true);
+    let mcp = if mcp_on { resolve_mcp(cwd, None) } else { None };
+    let model_opt = model.map(str::trim).filter(|s| !s.is_empty());
+    let routing = resolve_routing(
+        &*host,
+        profile.provider.as_deref(),
+        &settings,
+        true,
+        kind,
+        &api,
+        bearer.as_deref(),
+        model_opt,
+    )?;
+
+    if kind == BackendKind::Claude {
+        home::prepare(root, &routing);
+    }
+
+    let snapshot = Snapshot::capture(root, cwd, backend.label(), backend.version(root));
+    let client = match bearer.as_deref() {
+        Some(token) => Some(SessionClient::new(&api, token)?.with_org(profile.org.as_deref())),
+        None => None,
+    };
+    if let Some(c) = &client {
+        let _ = c.event(session_id, Kind::Status, snapshot.context_payload(None)).await;
+    }
+
+    let equipped = match kit::root(root, kind, &routing) {
+        Some(skills) => {
+            let cache = kit::cache(root);
+            let caller = identity.as_ref().zip(bearer.as_deref()).map(|(_, token)| kit::Caller {
+                api: &api,
+                who: &who,
+                token,
+                local,
+            });
+            Some(kit::equip(&cache, &skills, caller.as_ref(), mcp_on && routing.hanzo()).await)
+        }
+        None => None,
+    };
+
+    let task = match instructions.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(extra) => format!("{extra}\n\n---\n\n{prompt}"),
+        None => prompt.to_string(),
+    };
+    let mut passthrough = Vec::new();
+    if kind == BackendKind::Dev {
+        if let Some(eff) = effort.map(str::trim).filter(|s| matches!(*s, "low" | "medium" | "high")) {
+            passthrough.push("-c".to_string());
+            passthrough.push(format!("model_reasoning_effort=\"{eff}\""));
+        }
+    }
+
+    let structured = client.is_some();
+    let spec = Spec {
+        mode: Mode::Headless,
+        task: Some(task),
+        cwd: cwd.to_path_buf(),
+        routing,
+        approval: Approval::Auto,
+        mcp,
+        remote: equipped.and_then(|e| e.remote),
+        structured,
+        preset_session: None,
+        trust_project: false,
+        resume: None,
+        passthrough,
+        refresh: host.refresh(brand),
+        root: root.clone(),
+    };
+    let launch = backend.build(&spec)?;
+    let (outcome, status) = supervise(
+        &*backend,
+        spec,
+        launch,
+        structured,
+        client.clone(),
+        client.as_ref().map(|_| session_id.to_string()),
+    )
+    .await?;
+
+    if let Some(c) = &client {
+        if !outcome.usage.is_empty() {
+            let mut p = serde_json::to_value(&outcome.usage).unwrap_or_else(|_| json!({}));
+            p["type"] = json!("usage");
+            let _ = c.event(session_id, Kind::Log, p).await;
+        }
+    }
+
+    if status == Status::Error {
+        bail!("{} did not finish the routed run: it exited with an error", backend.label());
     }
     Ok(())
 }

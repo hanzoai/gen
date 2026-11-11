@@ -68,6 +68,9 @@ struct Config {
     /// The body `GET /v1/tool/kit` answers. `None` is a cloud that serves no kit
     /// yet: a 404, as any unregistered `/v1` route is.
     kit: Option<String>,
+    routed_runs: Arc<Mutex<std::collections::VecDeque<crate::runner::RoutedRun>>>,
+    key_mints: Arc<std::sync::atomic::AtomicUsize>,
+    reject_first_key: bool,
 }
 
 /// The ordinary control plane: everything succeeds. Each constructor below
@@ -84,6 +87,9 @@ impl Default for Config {
             control_delay_polls: 0,
             polls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             kit: None,
+            routed_runs: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+            key_mints: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            reject_first_key: false,
         }
     }
 }
@@ -167,6 +173,20 @@ impl MockCloud {
         MockCloud { port, requests }
     }
 
+
+    /// A mock serving routed-run key minting, long-poll claim, and completion report.
+    pub async fn start_with_routed_runs(
+        runs: Vec<crate::runner::RoutedRun>,
+        reject_first_key: bool,
+    ) -> MockCloud {
+        Self::with(Config {
+            routed_runs: Arc::new(Mutex::new(runs.into())),
+            reject_first_key,
+            ..Config::default()
+        })
+        .await
+    }
+
     pub fn base_url(&self) -> String {
         format!("http://127.0.0.1:{}", self.port)
     }
@@ -239,7 +259,12 @@ async fn serve_conn(
             body,
         });
 
-        let (status, payload) = respond(&cfg, &method, &path, bearer);
+        let claim_key = reqs
+            .lock()
+            .unwrap()
+            .last()
+            .and_then(|r| r.header("x-target-key"));
+        let (status, payload) = respond(&cfg, &method, &path, bearer, claim_key.as_deref());
         let resp = format!(
             "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{payload}",
             payload.len()
@@ -255,7 +280,7 @@ async fn serve_conn(
     }
 }
 
-fn respond(cfg: &Config, method: &str, path: &str, bearer: bool) -> (String, String) {
+fn respond(cfg: &Config, method: &str, path: &str, bearer: bool, claim_key: Option<&str>) -> (String, String) {
     if let Some(code) = cfg.force_status {
         return (format!("{code} Error"), r#"{"error":"forced"}"#.to_string());
     }
@@ -291,6 +316,33 @@ fn respond(cfg: &Config, method: &str, path: &str, bearer: bool) -> (String, Str
             "201 Created".into(),
             r#"{"id":"tgt_mock","label":"evo","kind":"gpu","status":"online","sessions":0,"running":0}"#.to_string(),
         );
+    }
+    // target claim-key mint -> 200 {"targetId", "claimKey"}
+    if method == "POST" && path.starts_with("/v1/agent/targets/") && path.ends_with("/key") {
+        let id = path.trim_start_matches("/v1/agent/targets/").trim_end_matches("/key");
+        let n = cfg.key_mints.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let key = if cfg.reject_first_key && n == 0 { "ck_stale" } else { "ck_fresh" };
+        return (
+            "200 OK".into(),
+            format!(r#"{{"targetId":"{id}","claimKey":"{key}"}}"#),
+        );
+    }
+    // target routed-run claim -> 403 on wrong key, 200 on queued run, 204 when empty
+    if method == "POST" && path.starts_with("/v1/agent/targets/") && path.ends_with("/claim") {
+        if claim_key != Some("ck_fresh") {
+            return ("403 Forbidden".into(), r#"{"error":"forbidden"}"#.to_string());
+        }
+        if let Some(run) = cfg.routed_runs.lock().unwrap().pop_front() {
+            return ("200 OK".into(), serde_json::to_string(&run).unwrap());
+        }
+        return ("204 No Content".into(), String::new());
+    }
+    // target routed-run report -> 403 on wrong key, else 200 {"delivered": true}
+    if method == "POST" && path.starts_with("/v1/agent/targets/") && path.contains("/runs/") && path.ends_with("/report") {
+        if claim_key != Some("ck_fresh") {
+            return ("403 Forbidden".into(), r#"{"error":"forbidden"}"#.to_string());
+        }
+        return ("200 OK".into(), r#"{"delivered":true}"#.to_string());
     }
     // run-target detail / heartbeat -> 404 when the target is "gone", else echo id.
     if (method == "PATCH" || method == "GET") && path.starts_with("/v1/agent/targets/") {

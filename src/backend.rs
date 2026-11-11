@@ -396,7 +396,7 @@ pub struct Scratch {
     pub dirs: Vec<tempfile::TempDir>,
 }
 
-pub trait Backend {
+pub trait Backend: Send + Sync {
     /// The `agent` label recorded on the cloud session ("claude" | "dev").
     fn label(&self) -> &'static str;
 

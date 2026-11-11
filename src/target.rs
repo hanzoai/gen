@@ -268,12 +268,27 @@ impl Creds {
 /// sampler, nothing else. Foreground until interrupted, so a service manager owns
 /// the lifetime; dropping the guard aborts it and the row goes stale on its own,
 /// which is how cloud decides a machine left.
+/// Hold this machine open in the fleet AND serve routed runs (`serving: true`).
+pub fn beat_and_serve(
+    host: Arc<dyn Host>,
+    root: &Root,
+    brand: &str,
+    api: &str,
+    machine_id: &str,
+    name: &str,
+) -> (Beat, crate::runner::Runner) {
+    let api = api.trim_end_matches('/');
+    let b = beat(host.clone(), root, brand, api, machine_id, name);
+    let r = crate::runner::serve(host, root, brand, api, machine_id, name);
+    (b, r)
+}
+
 pub async fn present(host: Arc<dyn Host>, root: &Root, brand: &str) -> Result<()> {
     let api = host.profile().await.api;
     let name = hostname(root);
-    let _beat = beat(host, root, brand, api.trim_end_matches('/'), &machine_id(root), &name);
+    let (_beat, _runner) = beat_and_serve(host, root, brand, &api, &machine_id(root), &name);
     println!(
-        "● {name} present in the fleet — one beat every {}s, no shell, no session. Ctrl-C leaves.",
+        "● {name} present and serving in the fleet — one beat every {}s, ready for routed runs. Ctrl-C leaves.",
         BEAT.as_secs()
     );
     tokio::signal::ctrl_c().await.context("waiting for Ctrl-C")?;
