@@ -9,9 +9,9 @@ on:
   workflow_dispatch:
 jobs:
   cicd:
-    # By commit: hanzoai/ci keeps no rule on its tags, so `v2` is whatever was
-    # last pushed there, and this job hands it every secret (`secrets: inherit`).
-    uses: hanzoai/ci/.github/workflows/build.yml@5262d63804a4207071c05f36321396a616638797 # v2
+    # v1, the line cli and extension run on: GitHub refused to start a run on
+    # the v2 build.yml.
+    uses: hanzoai/ci/.github/workflows/build.yml@v1
     permissions:
       contents: write
       packages: write
