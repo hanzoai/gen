@@ -23,7 +23,7 @@ use crate::Host;
 
 /// Where the cloud shows a session.
 pub fn url(id: &str) -> String {
-    format!("https://hanzo.bot/sessions/{id}")
+    format!("https://hanzo.ai/tabs/{id}")
 }
 
 /// Everything the block is written from.
@@ -304,7 +304,7 @@ mod tests {
         let want = 100.0 * 3.0e-6 + 6000.0 * 0.3e-6 + 1000.0 * 3.75e-6 + 2000.0 * 15.0e-6;
         assert!(out.contains(&format!("{} at the listed price of anthropic/claude-sonnet-4.5   (estimate: tokens at the list)", usd(want))), "{out}");
         assert!(out.contains(&format!("{} cheaper than full-price input at that price   (estimate)", usd(6000.0 * 2.7e-6))), "{out}");
-        assert!(out.contains("https://hanzo.bot/sessions/sess_abc"), "{out}");
+        assert!(out.contains("https://hanzo.ai/tabs/sess_abc"), "{out}");
     }
 
     #[test]
