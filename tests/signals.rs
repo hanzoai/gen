@@ -88,6 +88,11 @@ esac
         // SAFETY: signal(2) is async-signal-safe, which is all pre_exec asks.
         unsafe {
             cmd.pre_exec(move || {
+                // Start from the defaults: a CI runner starts its jobs with
+                // SIGINT ignored, and gen rightly keeps an ignore it inherits.
+                for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+                    libc::signal(sig, libc::SIG_DFL);
+                }
                 if let Some(sig) = ignored {
                     libc::signal(sig, libc::SIG_IGN);
                 }
