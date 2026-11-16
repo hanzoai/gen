@@ -87,7 +87,7 @@ struct ClaimKeyOut {
 enum ClaimPoll {
     Empty,
     Forbidden,
-    Run(RoutedRun),
+    Run(Box<RoutedRun>),
 }
 
 pub type BoxExecFuture = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
@@ -230,7 +230,7 @@ impl RunnerClient {
             return Ok(ClaimPoll::Empty);
         }
         let run: RoutedRun = serde_json::from_str(&text).context("decoding claimed routed run")?;
-        Ok(ClaimPoll::Run(run))
+        Ok(ClaimPoll::Run(Box::new(run)))
     }
 
     pub async fn report(&self, token: &str, target_id: &str, run_id: &str, claim_key: &str, report: &RunReport) -> Result<u16> {
@@ -420,7 +420,7 @@ async fn run_loop(
                         &client,
                         &target_id,
                         &claim_key,
-                        run,
+                        *run,
                         executor,
                     )
                     .await;
