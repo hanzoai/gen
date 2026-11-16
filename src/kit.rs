@@ -358,10 +358,6 @@ pub(crate) fn private_dir(dir: &Path) -> io::Result<()> {
 pub struct Equipped {
     /// The cloud MCP server to attach: the kit answered and MCP is on.
     pub remote: Option<Remote>,
-    /// Whether the run carries a kit.
-    pub on: bool,
-    /// The banner's one line about it.
-    pub line: String,
 }
 
 /// Load the kit, reconcile `skills` to it, and decide the MCP server — the whole
@@ -369,7 +365,9 @@ pub struct Equipped {
 pub async fn equip(cache: &Path, skills: &Path, caller: Option<&Caller<'_>>, mcp: bool) -> Equipped {
     let kit = load(cache, caller).await;
     let carried = kit.as_ref().map(|k| k.skills.as_slice()).unwrap_or_default();
-    let synced = sync(skills, &cache.with_file_name(LEDGER), carried);
+    if let Err(e) = sync(skills, &cache.with_file_name(LEDGER), carried) {
+        eprintln!("  skills not written: {e}");
+    }
     let remote = match (&kit, caller) {
         (Ok(_), Some(c)) if mcp => Some(Remote {
             url: format!("{}/v1/mcp", c.api.trim_end_matches('/')),
@@ -377,37 +375,7 @@ pub async fn equip(cache: &Path, skills: &Path, caller: Option<&Caller<'_>>, mcp
         }),
         _ => None,
     };
-    Equipped { line: line(&kit, &synced, remote.as_ref()), on: kit.is_ok(), remote }
-}
-
-/// The banner line, as plain text.
-fn line(kit: &Result<Kit, Miss>, synced: &io::Result<Synced>, remote: Option<&Remote>) -> String {
-    let kit = match kit {
-        Ok(k) => k,
-        Err(m) => return format!("kit: off ({m}) — running without the org's skills and tools"),
-    };
-    let mut parts = Vec::new();
-    match synced {
-        Ok(s) if s.written.is_empty() => parts.push("no skills".to_string()),
-        Ok(s) => parts.push(format!("skills {}", s.written.join(", "))),
-        Err(e) => parts.push(format!("skills not written ({e})")),
-    }
-    if let Some(r) = remote {
-        let host = r.url.trim_start_matches("https://").trim_start_matches("http://");
-        match kit.servers.as_slice() {
-            [] => parts.push(format!("tools → {host}")),
-            names => parts.push(format!("tools → {host} ({})", names.join(", "))),
-        }
-    }
-    if !kit.omitted.is_empty() {
-        parts.push(format!("left out: {}", kit.omitted.join(", ")));
-    }
-    if let Ok(s) = synced {
-        if !s.yours.is_empty() {
-            parts.push(format!("yours kept: {}", s.yours.join(", ")));
-        }
-    }
-    format!("kit: {}", parts.join(" · "))
+    Equipped { remote }
 }
 
 #[cfg(test)]
@@ -707,29 +675,7 @@ mod tests {
         assert_eq!(load(&dir.path().join("kit.json"), Some(&remote)).await, Err(Miss::Insecure));
         assert!(mock.requests().is_empty(), "the bearer was sent over plain http");
         let e = equip(&dir.path().join("kit.json"), &dir.path().join("skills"), Some(&remote), true).await;
-        assert!(!e.on && e.remote.is_none());
-    }
-
-    #[test]
-    fn the_banner_line_says_what_the_run_carries_or_why_not() {
-        let kit = wire(serde_json::from_str(KIT).unwrap());
-        let synced = Ok(Synced { written: vec!["review".into()], yours: vec!["lint".into()] });
-        let remote = Remote { url: "https://api.hanzo.ai/v1/mcp".into(), token: "T".into() };
-        assert_eq!(
-            line(&Ok(kit.clone()), &synced, Some(&remote)),
-            "kit: skills review · tools → api.hanzo.ai/v1/mcp (github) · yours kept: lint"
-        );
-        // --no-mcp: skills only, and no claim about tools.
-        assert_eq!(line(&Ok(kit), &synced, None), "kit: skills review · yours kept: lint");
-
-        assert_eq!(
-            line(&Err(Miss::Refused(401)), &Ok(Synced::default()), None),
-            "kit: off (refused (401) — `hanzo auth login`) — running without the org's skills and tools"
-        );
-        assert_eq!(
-            line(&Err(Miss::Unreachable), &Ok(Synced::default()), None),
-            "kit: off (cloud unreachable) — running without the org's skills and tools"
-        );
+        assert!(e.remote.is_none());
     }
 
     /// The whole step against a mock kit and MCP server: the skills land where the
@@ -743,11 +689,9 @@ mod tests {
         let api = mock.base_url();
 
         let e = equip(&cache, &root, Some(&caller(&api, "hanzo/z")), true).await;
-        assert!(e.on);
         assert!(read(&root.join("review").join(DOC)).contains("description: review a diff"));
         let remote = e.remote.expect("the kit answered and MCP is on");
         assert_eq!(remote.url, format!("{api}/v1/mcp"));
-        assert!(e.line.starts_with("kit: skills review · tools → 127.0.0.1:"), "{}", e.line);
 
         // Each backend is handed this server; ask it what the harness would.
         let reply = reqwest::Client::new()
@@ -766,14 +710,13 @@ mod tests {
 
         // --no-mcp: the skills still come, the server does not.
         let e = equip(&cache, &root, Some(&caller(&api, "hanzo/z")), false).await;
-        assert!(e.on && e.remote.is_none());
+        assert!(e.remote.is_none() && root.join("review").exists());
 
         // Signed out: no server, and the org's skills are withdrawn so the run
         // truly starts without the kit the banner says it lacks.
         let e = equip(&cache, &root, None, true).await;
-        assert!(!e.on && e.remote.is_none());
+        assert!(e.remote.is_none());
         assert!(!root.join("review").exists());
-        assert!(e.line.starts_with("kit: off (not signed in"), "{}", e.line);
     }
 
     /// The MCP server refuses a call without the bearer — so the test above proves

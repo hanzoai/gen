@@ -717,7 +717,6 @@ pub async fn run(host: Arc<dyn Host>, opts: Options) -> Result<()> {
         routing.via(),
         bearer.is_some(),
         session_id.as_deref(),
-        equipped.as_ref().map(|e| (e.line.as_str(), e.on)),
     );
 
     let structured = client.is_some() && session_id.is_some();
@@ -1413,7 +1412,6 @@ fn banner(
     routing: Option<&Routing>,
     signed_in: bool,
     session: Option<&str>,
-    kit: Option<(&str, bool)>,
 ) {
     let _ = api; // the route line carries its own host
     println!(
@@ -1428,9 +1426,6 @@ fn banner(
     let stream_line = if session.is_some() { stream_line.green() } else { stream_line.dimmed() };
     println!("  {route_line}");
     println!("  {stream_line}");
-    if let Some((line, on)) = kit {
-        println!("  {}", if on { line.green() } else { line.dimmed() });
-    }
 }
 
 /// The two status lines — model-routing and session-stream — as PLAIN text.
@@ -2046,11 +2041,8 @@ mod tests {
         let (_, stream_on) = status_lines(&o2, None, true, Some("sess_x"));
         assert!(stream_on.contains("session stream: on"));
         assert!(stream_on.contains("sess_x"));
-        // Pin the canonical viewer route: the playground session page is
-        // `/sessions/:id` (plural, mirroring cloud's `/v1/agents/sessions/:id`
-        // resource and the app's `/collection/:id` house style). A singular
-        // `/session/` 404s — the route the app actually serves is `/sessions/`.
-        assert!(stream_on.contains("https://hanzo.bot/sessions/sess_x"), "got: {stream_on}");
+        // The viewer is hanzo.ai/tabs/:id.
+        assert!(stream_on.contains("https://hanzo.ai/tabs/sess_x"), "got: {stream_on}");
     }
 
     /// A direct provider route names the VENDOR endpoint + who bills — never the
