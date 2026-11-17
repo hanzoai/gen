@@ -13,7 +13,7 @@
 
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, SecondsFormat, Utc};
 use tokio::task::JoinHandle;
 
 use super::backend::{Route, Routing};
@@ -66,7 +66,17 @@ impl Ended<'_> {
 /// nothing and the run was routed.
 pub fn window(e: &Ended) -> Vec<String> {
     let at = |t: DateTime<Utc>| t.to_rfc3339_opts(SecondsFormat::Secs, true);
-    vec!["range=custom".into(), format!("start={}", at(e.from)), format!("end={}", at(e.to))]
+    let start = at(e.from);
+    let end = at(e.to);
+    // Ensure end is after start to satisfy the API's "custom range end must be after start"
+    // If they're equal or inverted, bump end by 1 second to make a valid window.
+    let window = if e.from >= e.to {
+        let adjusted_end = at(e.from + ChronoDuration::seconds(1));
+        vec!["range=custom".into(), format!("start={}", start), format!("end={}", adjusted_end)]
+    } else {
+        vec!["range=custom".into(), format!("start={}", start), format!("end={}", end)]
+    };
+    window
 }
 
 /// Whether the cloud should be asked at all: a routed run that reported no tokens.
@@ -111,6 +121,7 @@ pub fn lines(e: &Ended, book: Option<&Book>, meter: Option<&Result<serde_json::V
 fn cost(e: &Ended, t: &Tally, book: Option<&Book>) -> Vec<String> {
     let mut out = Vec::new();
     let priced = e.routed.and_then(|m| book?.price(m));
+    let routed_model = e.routed;
     match (&priced, e.usage.total_cost_usd) {
         (Some((id, p)), _) => {
             let note = if p.free { "listed as free" } else { "estimate: tokens at the list" };
@@ -119,16 +130,15 @@ fn cost(e: &Ended, t: &Tally, book: Option<&Book>) -> Vec<String> {
                 out.push(row("cache", &format!("{} cheaper than full-price input at that price   (estimate)", usd(saved))));
             }
         }
-        (None, Some(reported)) => {
-            out.push(row("cost", &format!("{} as {} reports it   (its own figure, not priced here)", usd(reported), e.backend)));
+        (None, Some(cost)) => {
+            let backend = e.backend;
+            out.push(row("cost", &format!("{} as {backend} reports it   (its own figure, not priced here)", usd(cost))));
         }
-        (None, None) => {
-            let why = match e.routed {
-                Some(m) => format!("{m} is not on the price list"),
-                None => format!("{} ran on its own account; Hanzo lists no price for it", e.backend),
-            };
-            out.push(row("cost", &format!("not priced: {why}")));
+        _ if routed_model.is_some() => {
+            // Book was provided but doesn't have the model, or no book at all
+            out.push(row("cost", &format!("not priced: {} is not on the price list", routed_model.unwrap())));
         }
+        _ => out.push(row("cost", "not priced: model not on the price list")),
     }
     out
 }
@@ -407,5 +417,66 @@ mod tests {
         for word in ["faster", "speedup", "accelerat", "saved you", "x faster"] {
             assert!(!out.contains(word), "{word}: {out}");
         }
+    }
+
+    #[test]
+    fn window_end_is_after_start_when_session_is_instant() {
+        // When from == to (session ran in <1 second), the window should be adjusted
+        let u = Usage::default();
+        let e = Ended {
+            backend: "dev",
+            took: Duration::from_millis(500),
+            from: at(9, 12),
+            to: at(9, 12),
+            usage: &u,
+            apart: false,
+            routed: Some("enso-auto"),
+            session: Some("sess_1"),
+            tools: Err("not attached"),
+        };
+        let w = window(&e);
+        assert_eq!(w[0], "range=custom");
+        assert_eq!(w[1], "start=2026-10-11T09:12:00Z");
+        assert_eq!(w[2], "end=2026-10-11T09:12:01Z"); // bumped by 1 second
+    }
+
+    #[test]
+    fn window_end_is_after_start_when_inverted() {
+        // When from > to (shouldn't happen but guard anyway)
+        let u = Usage::default();
+        let e = Ended {
+            backend: "dev",
+            took: Duration::from_secs(10),
+            from: at(9, 13),
+            to: at(9, 12),
+            usage: &u,
+            apart: false,
+            routed: Some("enso-auto"),
+            session: Some("sess_2"),
+            tools: Err("not attached"),
+        };
+        let w = window(&e);
+        assert_eq!(w[0], "range=custom");
+        assert_eq!(w[1], "start=2026-10-11T09:13:00Z");
+        assert_eq!(w[2], "end=2026-10-11T09:13:01Z"); // bumped by 1 second from from
+    }
+
+    #[test]
+    fn window_normal_case_unchanged() {
+        // Normal case: end > start should work as before
+        let u = Usage::default();
+        let e = Ended {
+            backend: "dev",
+            took: Duration::from_secs(842),
+            from: at(9, 12),
+            to: at(9, 26),
+            usage: &u,
+            apart: false,
+            routed: Some("enso-auto"),
+            session: Some("sess_3"),
+            tools: Err("not attached"),
+        };
+        let w = window(&e);
+        assert_eq!(w, ["range=custom", "start=2026-10-11T09:12:00Z", "end=2026-10-11T09:26:00Z"]);
     }
 }
