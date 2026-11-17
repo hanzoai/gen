@@ -322,7 +322,23 @@ where
                                 calls.insert(key_of(id), (tool, std::time::Instant::now()));
                             }
                         }
-                        b.tx.write_all(l.as_bytes()).await?;
+                        // If this is a tools/call, supply `server` from the configured
+                        // server name when the model's arguments omit it. The real server's
+                        // router requires `server` (cloud logs `missing field server`
+                        // otherwise), and the model never has to echo it — Gen's proxy is
+                        // the one that knows which server it wraps.
+                        let supplied = (method == "tools/call"
+                            && msg.pointer("/params/server").and_then(Value::as_str).is_none()
+                            && !program.is_empty())
+                            .then(|| {
+                                let mut m = msg.clone();
+                                if let Some(params) = m.get_mut("params").and_then(Value::as_object_mut) {
+                                    params.insert("server".into(), Value::String(program.to_string()));
+                                }
+                                m.to_string()
+                            });
+                        let out_msg = supplied.as_deref().unwrap_or(&l);
+                        b.tx.write_all(out_msg.as_bytes()).await?;
                         b.tx.write_all(b"\n").await?;
                         b.tx.flush().await?;
                     }
@@ -679,5 +695,25 @@ mod tests {
         assert_eq!(std::fs::metadata(&sub).unwrap().permissions().mode() & 0o777, 0o700);
         assert_eq!(std::fs::metadata(sub.join("k.json")).unwrap().permissions().mode() & 0o777, 0o600);
         assert_eq!(load(&sub, "k"), Some(m));
+    }
+
+    /// A `tools/call` whose arguments omit `server` still reaches the real server
+    /// with `server` filled in from the configured server name, so cloud's router
+    /// never logs `missing field server`. The proxy supplies it, not the model.
+    #[tokio::test]
+    async fn a_tools_call_without_server_is_forwarded_with_server_filled_in() {
+        // The proxy knows the server identity; a model call that omits `server`
+        // must still be forwarded with it supplied, so the real server rejects
+        // nothing and cloud's router never sees `missing field server`.
+        let dir = tempfile::tempdir().unwrap();
+        let started = Arc::new(AtomicUsize::new(0));
+        let spawn = fake(started.clone());
+        let call_no_server = json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": { "name": "read", "arguments": {} } });
+        let out = session(spawn.clone(), dir.path(), &[init(), initialized(), list(), call_no_server]).await;
+        // out[2] holds the tool-call reply (the proxy forwarded the call).
+        assert_eq!(out[2]["id"], 3, "tool call landed with id 3");
+        assert_eq!(out[2]["result"]["content"][0]["text"], "ran read", "tool executed");
+        // Cold session: server started once at handshake, then the call reuses it.
+        assert_eq!(started.load(Ordering::SeqCst), 1, "server started once for the cold session");
     }
 }
