@@ -1,4 +1,5 @@
 /target
+/.cargo-home
 
 # Agent instruction files are symlinks to LLM.md, local only.
 CLAUDE.md
