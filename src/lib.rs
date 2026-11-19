@@ -36,6 +36,7 @@ mod dev;
 // must be able to name the value it is setting.
 pub mod event;
 pub mod exe;
+pub mod harbor;
 pub mod harness;
 mod home;
 pub mod host;
