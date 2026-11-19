@@ -795,14 +795,7 @@ pub async fn run(host: Arc<dyn Host>, opts: Options) -> Result<()> {
                     .as_ref()
                     .and_then(|s| backend.transcript_path(&root, &route, &cwd, s))
                     .map(|p| p.display().to_string());
-                // An interactive session SUSPENDS rather than completes: the
-                // transcript and its resume handle outlive the TUI, so the same
-                // id is reopenable. A crash — or a TUI that never got off the
-                // ground — is an error, and either way it is over.
-                let status = match &run {
-                    Ok(true) => Status::Paused,
-                    _ => Status::Error,
-                };
+                let status = interactive_end(&run, outcome.backend_session.is_some());
                 finalize(c, id, &outcome, status, &snapshot, &api, &who, transcript, &root).await;
             }
             // The tool's own screen was the stream, so nothing was reported here.
@@ -939,6 +932,25 @@ pub(crate) async fn run_routed_agent(
         bail!("{} did not finish the routed run: it exited with an error", backend.label());
     }
     Ok(())
+}
+
+/// How an interactive session ends, from how its TUI exited and whether there is
+/// a backend session to resume it by.
+///
+/// A clean exit SUSPENDS a session only when it can be reopened: its transcript
+/// and resume handle outlive the TUI, and `--resume` finds them in the local
+/// record `finalize` writes. With no handle there is no record, so nothing can
+/// ever reopen it — a fresh Hanzo Dev TUI that quits, or exits to run its own
+/// update — and the session is DONE. Calling it paused told the cloud something
+/// was coming back, and the cloud billed it as alive (hanzo-inc/cloud#768).
+///
+/// A crash, or a TUI that never got off the ground, is an error either way.
+fn interactive_end(run: &Result<bool>, resumable: bool) -> Status {
+    match run {
+        Ok(true) if resumable => Status::Paused,
+        Ok(true) => Status::Done,
+        _ => Status::Error,
+    }
 }
 
 fn preset_session_of(spec: &Spec) -> Option<String> {
@@ -1907,6 +1919,23 @@ mod tests {
         let client2 = SessionClient::new(&mock2.base_url(), "T").unwrap();
         finalize(&client2, "sess_e", &outcome, Status::Error, &snapshot, "https://api.hanzo.ai", "hanzo/z", None, &crate::root::scratch()).await;
         assert!(mock2.requests().iter().any(|r| r.method == "PATCH" && r.json()["status"] == "error"));
+    }
+
+    /// hanzo-inc/cloud#768: a clean exit suspends a session only when there is a
+    /// handle to resume it by. `--resume` needs the local record, and `finalize`
+    /// writes one only for a backend session, so a fresh Hanzo Dev TUI that quits
+    /// (or exits to run its own update) has nothing anyone can reopen: it is done,
+    /// not paused — a paused row says something is coming back, and the cloud kept
+    /// billing it as alive.
+    #[test]
+    fn an_interactive_exit_pauses_only_what_it_can_resume() {
+        let quit: Result<bool> = Ok(true);
+        assert_eq!(interactive_end(&quit, true), Status::Paused, "a resumable exit suspends");
+        assert_eq!(interactive_end(&quit, false), Status::Done, "nothing to resume: it is over");
+        let never_started: Result<bool> = Ok(false);
+        assert_eq!(interactive_end(&never_started, true), Status::Error);
+        let crashed: Result<bool> = Err(anyhow!("boom"));
+        assert_eq!(interactive_end(&crashed, false), Status::Error);
     }
 
     #[test]
