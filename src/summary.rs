@@ -13,7 +13,7 @@
 
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Duration as ChronoDuration, SecondsFormat, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, DurationRound, SecondsFormat, Utc};
 use tokio::task::JoinHandle;
 
 use super::backend::{Route, Routing};
@@ -64,19 +64,27 @@ impl Ended<'_> {
 
 /// The cloud's count for the session window, asked only when the backend reported
 /// nothing and the run was routed.
+///
+/// The meter reads a half-open window `[start, end)` in whole seconds and refuses
+/// one whose end does not follow its start (`400 custom range end must be after
+/// start`). So the window is the session rounded OUTWARD to whole seconds: the
+/// start down and the end up. A session that began and ended inside one second is
+/// that one second, not `start == end`, and the usage of the session's last
+/// partial second falls inside the window rather than at its excluded end.
 pub fn window(e: &Ended) -> Vec<String> {
+    let second = ChronoDuration::seconds(1);
+    let start = e.from.duration_trunc(second).unwrap_or(e.from);
+    let mut end = e.to.duration_trunc(second).unwrap_or(e.to);
+    if end < e.to {
+        end += second;
+    }
+    // A session whose clock read the same instant twice, or went backwards, is
+    // still a one-second window from its start.
+    if end <= start {
+        end = start + second;
+    }
     let at = |t: DateTime<Utc>| t.to_rfc3339_opts(SecondsFormat::Secs, true);
-    let start = at(e.from);
-    let end = at(e.to);
-    // Ensure end is after start to satisfy the API's "custom range end must be after start"
-    // If they're equal or inverted, bump end by 1 second to make a valid window.
-    let window = if e.from >= e.to {
-        let adjusted_end = at(e.from + ChronoDuration::seconds(1));
-        vec!["range=custom".into(), format!("start={}", start), format!("end={}", adjusted_end)]
-    } else {
-        vec!["range=custom".into(), format!("start={}", start), format!("end={}", end)]
-    };
-    window
+    vec!["range=custom".into(), format!("start={}", at(start)), format!("end={}", at(end))]
 }
 
 /// Whether the cloud should be asked at all: a routed run that reported no tokens.
@@ -121,7 +129,6 @@ pub fn lines(e: &Ended, book: Option<&Book>, meter: Option<&Result<serde_json::V
 fn cost(e: &Ended, t: &Tally, book: Option<&Book>) -> Vec<String> {
     let mut out = Vec::new();
     let priced = e.routed.and_then(|m| book?.price(m));
-    let routed_model = e.routed;
     match (&priced, e.usage.total_cost_usd) {
         (Some((id, p)), _) => {
             let note = if p.free { "listed as free" } else { "estimate: tokens at the list" };
@@ -130,15 +137,16 @@ fn cost(e: &Ended, t: &Tally, book: Option<&Book>) -> Vec<String> {
                 out.push(row("cache", &format!("{} cheaper than full-price input at that price   (estimate)", usd(saved))));
             }
         }
-        (None, Some(cost)) => {
-            let backend = e.backend;
-            out.push(row("cost", &format!("{} as {backend} reports it   (its own figure, not priced here)", usd(cost))));
+        (None, Some(reported)) => {
+            out.push(row("cost", &format!("{} as {} reports it   (its own figure, not priced here)", usd(reported), e.backend)));
         }
-        _ if routed_model.is_some() => {
-            // Book was provided but doesn't have the model, or no book at all
-            out.push(row("cost", &format!("not priced: {} is not on the price list", routed_model.unwrap())));
+        (None, None) => {
+            let why = match e.routed {
+                Some(m) => format!("{m} is not on the price list"),
+                None => format!("{} ran on its own account; Hanzo lists no price for it", e.backend),
+            };
+            out.push(row("cost", &format!("not priced: {why}")));
         }
-        _ => out.push(row("cost", "not priced: model not on the price list")),
     }
     out
 }
@@ -419,64 +427,69 @@ mod tests {
         }
     }
 
+    /// A moment `ms` milliseconds into 09:12:`sec` on the test day.
+    fn ms(sec: u32, ms: u32) -> DateTime<Utc> {
+        at(9, 12) + ChronoDuration::seconds(sec.into()) + ChronoDuration::milliseconds(ms.into())
+    }
+
+    fn bounds(w: &[String]) -> (DateTime<Utc>, DateTime<Utc>) {
+        let read = |k: &str, v: &str| DateTime::parse_from_rfc3339(v.strip_prefix(k).unwrap()).unwrap().with_timezone(&Utc);
+        (read("start=", &w[1]), read("end=", &w[2]))
+    }
+
+    /// #781: a session that starts and ends inside one wall-clock second used to send
+    /// `start == end` (both cut to the second), and the meter answered `400 custom
+    /// range end must be after start`.
     #[test]
-    fn window_end_is_after_start_when_session_is_instant() {
-        // When from == to (session ran in <1 second), the window should be adjusted
-        let u = Usage::default();
-        let e = Ended {
-            backend: "dev",
-            took: Duration::from_millis(500),
-            from: at(9, 12),
-            to: at(9, 12),
-            usage: &u,
-            apart: false,
-            routed: Some("enso-auto"),
-            session: Some("sess_1"),
-            tools: Err("not attached"),
-        };
-        let w = window(&e);
-        assert_eq!(w[0], "range=custom");
-        assert_eq!(w[1], "start=2026-10-11T09:12:00Z");
-        assert_eq!(w[2], "end=2026-10-11T09:12:01Z"); // bumped by 1 second
+    fn a_session_inside_one_second_is_metered_as_that_second() {
+        let none = Usage::default();
+        let mut e = ended(&none, Some("enso-auto"));
+        (e.from, e.to) = (ms(0, 300), ms(0, 800));
+        assert_eq!(window(&e), ["range=custom", "start=2026-10-11T09:12:00Z", "end=2026-10-11T09:12:01Z"]);
     }
 
     #[test]
-    fn window_end_is_after_start_when_inverted() {
-        // When from > to (shouldn't happen but guard anyway)
-        let u = Usage::default();
-        let e = Ended {
-            backend: "dev",
-            took: Duration::from_secs(10),
-            from: at(9, 13),
-            to: at(9, 12),
-            usage: &u,
-            apart: false,
-            routed: Some("enso-auto"),
-            session: Some("sess_2"),
-            tools: Err("not attached"),
-        };
-        let w = window(&e);
-        assert_eq!(w[0], "range=custom");
-        assert_eq!(w[1], "start=2026-10-11T09:13:00Z");
-        assert_eq!(w[2], "end=2026-10-11T09:13:01Z"); // bumped by 1 second from from
+    fn the_window_rounds_out_so_the_last_partial_second_is_in_it() {
+        let none = Usage::default();
+        let mut e = ended(&none, Some("enso-auto"));
+        (e.from, e.to) = (ms(0, 300), ms(5, 200));
+        assert_eq!(window(&e), ["range=custom", "start=2026-10-11T09:12:00Z", "end=2026-10-11T09:12:06Z"]);
     }
 
     #[test]
-    fn window_normal_case_unchanged() {
-        // Normal case: end > start should work as before
-        let u = Usage::default();
-        let e = Ended {
-            backend: "dev",
-            took: Duration::from_secs(842),
-            from: at(9, 12),
-            to: at(9, 26),
-            usage: &u,
-            apart: false,
-            routed: Some("enso-auto"),
-            session: Some("sess_3"),
-            tools: Err("not attached"),
-        };
-        let w = window(&e);
-        assert_eq!(w, ["range=custom", "start=2026-10-11T09:12:00Z", "end=2026-10-11T09:26:00Z"]);
+    fn an_instant_or_inverted_clock_is_still_a_one_second_window() {
+        let none = Usage::default();
+        let mut e = ended(&none, Some("enso-auto"));
+        (e.from, e.to) = (at(9, 12), at(9, 12));
+        assert_eq!(window(&e), ["range=custom", "start=2026-10-11T09:12:00Z", "end=2026-10-11T09:12:01Z"]);
+        (e.from, e.to) = (ms(1, 500), ms(0, 900));
+        assert_eq!(window(&e), ["range=custom", "start=2026-10-11T09:12:01Z", "end=2026-10-11T09:12:02Z"]);
+    }
+
+    /// The meter's own rule, for every way a session's clock can fall: the end
+    /// follows the start, and the window covers the whole session.
+    #[test]
+    fn every_window_is_one_the_meter_accepts_and_covers_the_session() {
+        let none = Usage::default();
+        let mut e = ended(&none, Some("enso-auto"));
+        for start_ms in [0, 1, 300, 999] {
+            for took_ms in [0, 1, 199, 700, 999, 1000, 1001, 1500, 61_999] {
+                e.from = ms(0, start_ms);
+                e.to = e.from + ChronoDuration::milliseconds(took_ms);
+                let (start, end) = bounds(&window(&e));
+                assert!(end > start, "{start_ms}+{took_ms}ms: {start} .. {end}");
+                assert!(start <= e.from && end >= e.to, "{start_ms}+{took_ms}ms: {start} .. {end} misses {} .. {}", e.from, e.to);
+                assert!(end - start <= ChronoDuration::milliseconds(took_ms) + ChronoDuration::seconds(2), "rounded out by at most a second each side");
+            }
+        }
+    }
+
+    #[test]
+    fn a_report_on_its_own_account_without_a_figure_says_it_is_unpriced_and_why() {
+        let u = reported();
+        let mut e = ended(&u, None);
+        e.backend = "cursor";
+        let out = text(&lines(&e, None, None));
+        assert!(out.contains("not priced: cursor ran on its own account; Hanzo lists no price for it"), "{out}");
     }
 }
