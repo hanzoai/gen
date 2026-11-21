@@ -29,12 +29,14 @@ pub mod backend;
 mod claude;
 pub mod context;
 mod control;
+pub mod contract;
 mod dev;
 // The status vocabulary IS part of the session client's signature (`set_status`),
 // so anything that can hold a session — `hanzo link` as much as `hanzo dev` —
 // must be able to name the value it is setting.
 pub mod event;
 pub mod exe;
+pub mod harbor;
 pub mod harness;
 mod home;
 pub mod host;
@@ -824,7 +826,8 @@ pub(crate) async fn run_routed_agent(
     model: Option<&str>,
     effort: Option<&str>,
     instructions: Option<&str>,
-) -> Result<()> {
+) -> Result<Option<contract::AgentRun>> {
+    let started = std::time::Instant::now();
     let kind = match configured_agent(root) {
         Some(agent) => BackendKind::parse(&agent).unwrap_or(backend::DEFAULT),
         None => backend::DEFAULT,
@@ -853,11 +856,18 @@ pub(crate) async fn run_routed_agent(
         model_opt,
     )?;
 
+    let model_id = match routing.via() {
+        Some(Routing::Gateway { model, .. }) => model.clone(),
+        _ => model_opt.unwrap_or("default").to_string(),
+    };
+    let model_locked = model_opt.is_some();
+
     if kind == BackendKind::Claude {
         home::prepare(root, &routing);
     }
 
-    let snapshot = Snapshot::capture(root, cwd, backend.label(), backend.version(root));
+    let agent_version = backend.version(root);
+    let snapshot = Snapshot::capture(root, cwd, backend.label(), agent_version.clone());
     let client = match bearer.as_deref() {
         Some(token) => Some(SessionClient::new(&api, token)?.with_org(profile.org.as_deref())),
         None => None,
@@ -931,7 +941,35 @@ pub(crate) async fn run_routed_agent(
     if status == Status::Error {
         bail!("{} did not finish the routed run: it exited with an error", backend.label());
     }
-    Ok(())
+
+    let elapsed_ms = outcome
+        .usage
+        .duration_ms
+        .unwrap_or_else(|| started.elapsed().as_millis().min(u64::MAX as u128) as u64);
+    let mut telemetry = contract::AgentRun::new(
+        session_id,
+        session_id,
+        agent_version.unwrap_or_else(|| backend.label().to_string()),
+        model_id,
+        model_locked,
+        summary::url(session_id),
+    );
+    telemetry.execution = contract::ExecutionTelemetry {
+        mode: "managed".to_string(),
+        steps: outcome.usage.num_turns.unwrap_or(0),
+        tool_calls: outcome.tool_calls,
+        elapsed_ms,
+        exit_reason: status.as_str().to_string(),
+    };
+    telemetry.usage = contract::UsageTelemetry::from_event_usage(&outcome.usage);
+    telemetry.verification = contract::VerificationTelemetry {
+        checks_executed: Vec::new(),
+        checks_passed: !outcome.saw_error && status != Status::Error,
+        critic_verdict: None,
+        grader_result: None,
+    };
+
+    Ok(Some(telemetry))
 }
 
 /// How an interactive session ends, from how its TUI exited and whether there is
@@ -1015,6 +1053,7 @@ pub(crate) async fn resolve_cloud_session(
 pub(crate) struct Outcome {
     pub backend_session: Option<String>,
     pub usage: Usage,
+    pub tool_calls: u64,
     pub saw_error: bool,
     pub final_summary: Option<String>,
 }
@@ -1033,6 +1072,9 @@ impl Sink {
     async fn handle(&mut self, m: Mapped) {
         match m {
             Mapped::Event { kind, payload } => {
+                if kind == Kind::ToolCall {
+                    self.out.tool_calls = self.out.tool_calls.saturating_add(1);
+                }
                 if self.render {
                     render_event(kind, &payload);
                 }
@@ -1300,6 +1342,7 @@ async fn supervise(
         // the newest summary wins.
         acc.backend_session = acc.backend_session.or(out.backend_session);
         acc.usage.merge(out.usage);
+        acc.tool_calls = acc.tool_calls.saturating_add(out.tool_calls);
         acc.saw_error = out.saw_error;
         if out.final_summary.is_some() {
             acc.final_summary = out.final_summary;
@@ -1887,6 +1930,7 @@ mod tests {
         let outcome = Outcome {
             backend_session: Some("sid-x".into()),
             usage: Usage { input_tokens: Some(9), ..Default::default() },
+            tool_calls: 0,
             saw_error: false,
             final_summary: None,
         };

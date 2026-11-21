@@ -20,6 +20,7 @@ use tokio::process::Command;
 use tokio::sync::Semaphore;
 
 use crate::context::TargetRecord;
+use crate::contract::AgentRun;
 use crate::host::Host;
 use crate::root::Root;
 use crate::sample::Sampler;
@@ -66,7 +67,7 @@ pub struct RoutedRun {
     pub instructions: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct RunReport {
     pub ok: bool,
@@ -75,6 +76,8 @@ pub struct RunReport {
     pub commit_sha: String,
     pub diffstat: String,
     pub error: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telemetry: Option<AgentRun>,
 }
 
 #[derive(Deserialize)]
@@ -90,7 +93,7 @@ enum ClaimPoll {
     Run(Box<RoutedRun>),
 }
 
-pub type BoxExecFuture = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
+pub type BoxExecFuture = Pin<Box<dyn Future<Output = Result<Option<AgentRun>>> + Send>>;
 pub type Executor = Arc<dyn Fn(RoutedRun, PathBuf) -> BoxExecFuture + Send + Sync>;
 
 /// Guard holding the background claim-and-execute loop open until dropped.
@@ -512,8 +515,9 @@ pub async fn execute_workspace_run(work_dir: &Path, run: &RoutedRun, executor: E
 
     let mut ok = true;
     let mut err_msg = String::new();
+    let mut telemetry = None;
     match tokio::time::timeout(timeout, executor(run.clone(), work_dir.to_path_buf())).await {
-        Ok(Ok(())) => {}
+        Ok(Ok(t)) => { telemetry = t; }
         Ok(Err(e)) => {
             ok = false;
             err_msg = e.to_string();
@@ -554,6 +558,7 @@ pub async fn execute_workspace_run(work_dir: &Path, run: &RoutedRun, executor: E
         commit_sha,
         diffstat,
         error: clamp_bytes(&err_msg, MAX_TEXT_BYTES),
+        telemetry,
     }
 }
 
@@ -565,6 +570,7 @@ fn failure_report(branch: &str, err: String) -> RunReport {
         commit_sha: String::new(),
         diffstat: String::new(),
         error: clamp_bytes(&err, MAX_TEXT_BYTES),
+        telemetry: None,
     }
 }
 
@@ -764,7 +770,7 @@ mod tests {
             Box::pin(async move {
                 assert_eq!(run.session_id, "sess_routed_1");
                 std::fs::write(cwd.join("README.md"), "hello from live runner\n")?;
-                Ok(())
+                Ok(None)
             })
         });
 
@@ -794,5 +800,55 @@ mod tests {
 
         let pushed_sha = run_git(Some(&origin), &["rev-parse", "refs/heads/hanzo/fix-landing"]).await.unwrap();
         assert_eq!(pushed_sha, body["commitSha"].as_str().unwrap());
+    }
+
+    #[tokio::test]
+    async fn execute_workspace_run_propagates_valid_agent_run_telemetry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_dir = tmp.path().join("workspace");
+        let run = RoutedRun {
+            session_id: "sess_telemetry_1".into(),
+            repo: String::new(),
+            project: String::new(),
+            base: String::new(),
+            branch: String::new(),
+            prompt: "Verify telemetry".into(),
+            clone_url: String::new(),
+            timeout_seconds: 30,
+            model: "enso-auto".into(),
+            effort: "medium".into(),
+            instructions: String::new(),
+        };
+        let exec: Executor = Arc::new(|r, _cwd| {
+            Box::pin(async move {
+                let mut telemetry = AgentRun::new(
+                    &r.session_id,
+                    &r.session_id,
+                    "0.1.0",
+                    &r.model,
+                    true,
+                    crate::summary::url(&r.session_id),
+                );
+                telemetry.execution.steps = 2;
+                telemetry.execution.tool_calls = 3;
+                telemetry.execution.elapsed_ms = 250;
+                telemetry.usage.input_tokens = 100;
+                telemetry.usage.output_tokens = 40;
+                telemetry.usage.cost_usd = 0.001;
+                telemetry.verification.checks_passed = true;
+                Ok(Some(telemetry))
+            })
+        });
+
+        let report = execute_workspace_run(&work_dir, &run, exec).await;
+        assert!(report.ok);
+        let telemetry = report.telemetry.as_ref().expect("telemetry should be populated");
+        assert!(telemetry.validate().passed);
+
+        let serialized = serde_json::to_value(&report).unwrap();
+        let check = crate::contract::validate_agent_run_json(&serialized["telemetry"]);
+        assert!(check.passed, "violations: {:?}", check.violations);
+        assert_eq!(serialized["telemetry"]["runId"], "sess_telemetry_1");
+        assert_eq!(serialized["telemetry"]["execution"]["toolCalls"], 3);
     }
 }
