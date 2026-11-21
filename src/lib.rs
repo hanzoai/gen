@@ -800,7 +800,7 @@ pub async fn run(host: Arc<dyn Host>, opts: Options) -> Result<()> {
                     .map(|p| p.display().to_string());
                 let status = interactive_end(&run, outcome.backend_session.is_some());
                 let reason = match (&run, status) {
-                    (Err(e), Status::Error) => Some(cut(&format!("{e:#}"), 600)),
+                    (Err(e), Status::Error) => Some(cut(&format!("{e:#}"), REASON_MAX)),
                     (_, Status::Error) => Some(format!("{} ended without starting", backend.label())),
                     _ => None,
                 };
@@ -1062,14 +1062,12 @@ pub(crate) struct Outcome {
     pub tool_calls: u64,
     pub saw_error: bool,
     pub final_summary: Option<String>,
-    /// How the backend's process ended when it did not end cleanly: "exited with
-    /// status 101", "was killed by signal 9". The newest turn's; None for a
-    /// process that exited zero. It is the reason a run that failed reports.
+    /// How the newest turn's process ended when not cleanly ("exited with status
+    /// 101"); the reason a failed run reports.
     pub exit: Option<String>,
 }
 
-/// How a finished process ended, when it did not end cleanly. A person's
-/// interrupt is told apart by [`interrupted`], never by this text.
+/// How a finished process ended, when not cleanly.
 fn how(status: &std::process::ExitStatus) -> Option<String> {
     if status.success() {
         return None;
@@ -1093,10 +1091,8 @@ fn how(status: &std::process::ExitStatus) -> Option<String> {
     })
 }
 
-/// Whether a process ended because a person ended it: Ctrl-C or a hangup at the
-/// terminal, or the shell's 130/143 for them. That is not a failure, and an
-/// interactive session that ends this way is a session that was ended, not one
-/// that broke.
+/// Whether a person ended the process (Ctrl-C, a hangup, or the shell's 130/143):
+/// that is not a failure.
 fn interrupted(status: &std::process::ExitStatus) -> bool {
     #[cfg(unix)]
     {
@@ -1108,41 +1104,41 @@ fn interrupted(status: &std::process::ExitStatus) -> bool {
     matches!(status.code(), Some(130 | 143))
 }
 
-/// Why a headless run ended in error, for the session that says so: the launch
-/// that failed, or how the process ended with the error it reported last. Never
-/// empty: a session in error with no reason is what this is for.
+/// The longest reason a session in error carries.
+const REASON_MAX: usize = 600;
+
+/// Why a run ended in error: the launch that failed, or how the process ended and
+/// the error it reported last. Never empty.
 fn reason_of(run: &Result<(Outcome, Status)>, label: &str) -> String {
-    const MOST: usize = 600;
     match run {
-        Err(e) => cut(&format!("{e:#}"), MOST),
+        Err(e) => cut(&format!("{e:#}"), REASON_MAX),
         Ok((o, _)) => {
             let how = o.exit.as_deref().unwrap_or("ended with an error");
             match o.final_summary.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-                Some(said) => cut(&format!("{label} {how}: {said}"), MOST),
+                Some(said) => cut(&format!("{label} {how}: {said}"), REASON_MAX),
                 None => format!("{label} {how}"),
             }
         }
     }
 }
 
-/// What a harness's own loop guard says when its model made the same tool call
-/// twice in a row with the same result ("unsupported operation: repeated identical
-/// tool-use cycle detected; refusing to continue after duplicate tool calls: {...}").
-/// The guard ends the turn with an error; the run is not over, the model is.
+/// What a harness's loop guard says when its model repeats a tool call. It ends the
+/// turn with an error; the run is not over, the model is.
 const LOOP_MARK: &str = "repeated identical tool-use cycle detected";
 
-/// How many times a run is told to change course before the guard's end stands. The
-/// same bound the cloud's coding runs use for the same guard.
+/// The longest call a change-of-course message repeats.
+const CALL_MAX: usize = 300;
+
+/// How many times a run is told to change course before the guard's end stands.
 const MAX_COURSE_CHANGES: u8 = 2;
 
-/// What a model stopped by the loop guard is told, in the same conversation: the call
-/// it repeated (its own words, bounded) and what to do instead.
+/// What a model stopped by the loop guard is told: the call it repeated and to change it.
 fn change_course(said: &str) -> String {
     let call = said.split_once("duplicate tool calls:").map(|(_, c)| c.trim()).unwrap_or("");
     let mut told = String::from("You made the same tool call twice in a row and got the same result, so your turn was stopped.");
     if !call.is_empty() {
         told.push_str(" The call was: ");
-        told.push_str(&cut(call, 300));
+        told.push_str(&cut(call, CALL_MAX));
     }
     told.push_str("\n\nDo not make it again. Use a different command or different arguments, and carry on with the task.");
     told
@@ -1479,11 +1475,8 @@ async fn supervise(
             }
             // Uncommanded end: the backend finished (or failed) on its own.
             //
-            // A turn its harness stopped for repeating one tool call is not a run that
-            // failed: its model looped. It is told what it repeated and to change
-            // course, in the same conversation, up to MAX_COURSE_CHANGES times (the
-            // cloud's coding runs do the same for the same guard); only then does the
-            // guard's end stand, with its reason.
+            // A turn the loop guard stopped is told to change course, up to
+            // MAX_COURSE_CHANGES times; only then does the guard's end stand.
             None | Some(Act::Ignore) => {
                 let looped = !ok && said.as_deref().is_some_and(|m| m.contains(LOOP_MARK));
                 if looped && changed_course < MAX_COURSE_CHANGES && acc.backend_session.is_some() {
@@ -2097,9 +2090,7 @@ mod tests {
         let client2 = SessionClient::new(&mock2.base_url(), "T").unwrap();
         finalize(&client2, "sess_e", &outcome, Status::Error, &snapshot, "https://api.hanzo.ai", "hanzo/z", None, &crate::root::scratch(), Some("dev exited with status 101")).await;
         assert!(mock2.requests().iter().any(|r| r.method == "PATCH" && r.json()["status"] == "error"));
-        // THE REASON RIDES THE SAME REQUEST AS THE STATUS: a session in error says
-        // why. A week of terminal sessions held 86 errors that said "error" and
-        // nothing else (hanzo-inc/cloud). A status that is not an error takes none.
+        // The reason rides the status request; a status that is not an error takes none.
         assert!(
             mock2.requests().iter().any(|r| r.method == "PATCH" && r.json()["error"] == "dev exited with status 101"),
             "the reason did not reach the PATCH: {:?}",
@@ -2161,7 +2152,7 @@ mod tests {
         assert_eq!(reason_of(&nothing, "dev"), "dev ended with an error");
 
         let long: Result<(Outcome, Status)> = Ok((Outcome { final_summary: Some("é".repeat(2000)), ..Default::default() }, Status::Error));
-        assert!(reason_of(&long, "dev").len() <= 600, "a reason is bounded, at a character boundary");
+        assert!(reason_of(&long, "dev").len() <= REASON_MAX, "a reason is bounded, at a character boundary");
     }
 
     /// hanzo-inc/cloud#768: a clean exit suspends a session only when there is a
@@ -2802,10 +2793,8 @@ mod control_tests {
         assert_eq!(built.lock().unwrap().len(), 1, "pause must not relaunch");
     }
 
-    /// A turn the harness stopped for repeating one tool call is told what it repeated
-    /// and to change course, in the same conversation, and the run goes on: the
-    /// terminal's runs ended in error on this guard where the cloud's coding runs are
-    /// nudged twice. After the bound the guard's end stands, with its reason.
+    /// A turn the loop guard stopped is told to change course and the run goes on;
+    /// after the bound the guard's end stands, with its reason.
     ///
     /// MUTATION: drop the `looped` branch in `supervise` and the first run ends in error
     /// after one turn.
