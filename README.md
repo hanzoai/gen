@@ -4,7 +4,7 @@
 
 The agentic harness. `gen` launches a coding agent in your terminal with the
 Hanzo MCP toolset attached, routes its model calls through api.hanzo.ai, and
-streams the session live to mission control. Hanzo Dev is the default agent;
+streams the session live to mission control. Hanzo's own agent is the default;
 Claude Code, Codex, Cursor, Antigravity, Gemini, Qwen, OpenCode and the rest are
 one flag away.
 
@@ -17,8 +17,8 @@ take the same flags and run the same session.
 curl -fsSL hanzo.sh | sh
 ```
 
-Gen signs in with your Hanzo account, the same one Hanzo Dev and the Hanzo CLI
-use. Sign in once:
+Gen signs in with your Hanzo account, the same one the Hanzo CLI
+uses. Sign in once:
 
 ```sh
 hanzo auth login
@@ -27,7 +27,7 @@ hanzo auth login
 ## Use
 
 ```sh
-gen                          # an interactive Hanzo Dev session
+gen                          # an interactive Hanzo session
 gen "fix the failing test"   # a task, run headless
 gen --claude                 # Claude Code
 gen --codex "add a test"     # Codex, headless
@@ -41,7 +41,7 @@ gen --help                   # every flag
 ## Routing
 
 Every agent's model calls go to api.hanzo.ai, which serves Enso, Zen and Kai,
-so one account and one bill cover every agent. Hanzo Dev routes there whenever
+so one account and one bill cover every agent. Hanzo's own agent routes there whenever
 you are signed in. A third-party agent keeps its own login unless you pass
 `--cloud`; with it, its calls route through api.hanzo.ai like Dev's. A few agents
 have no way to name another endpoint (Cursor, Antigravity, Gemini, Copilot, Amp

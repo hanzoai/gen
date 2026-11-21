@@ -772,7 +772,7 @@ async fn prepare_git_workspace(work_dir: &Path, clone_url: &str, base: &str, bra
         let _ = run_git(Some(work_dir), &["config", "user.email", "dev@hanzo.ai"]).await;
     }
     if git_stdout(work_dir, &["config", "user.name"]).await.unwrap_or_default().is_empty() {
-        let _ = run_git(Some(work_dir), &["config", "user.name", "Hanzo Dev"]).await;
+        let _ = run_git(Some(work_dir), &["config", "user.name", "Hanzo"]).await;
     }
 
     let branch = branch.trim();
@@ -801,7 +801,7 @@ async fn finalize_git_changes(work_dir: &Path, base_sha: &str, branch: &str) -> 
     let status = git_stdout(work_dir, &["status", "--porcelain"]).await?;
     if !status.is_empty() {
         run_git(Some(work_dir), &["add", "-A"]).await?;
-        run_git(Some(work_dir), &["commit", "-m", "chore: apply changes from Hanzo Dev run"]).await?;
+        run_git(Some(work_dir), &["commit", "-m", "chore: apply changes from Hanzo run"]).await?;
     }
 
     let head_sha = git_stdout(work_dir, &["rev-parse", "HEAD"]).await?;
@@ -991,6 +991,11 @@ mod tests {
 
         let pushed_sha = run_git(Some(&origin), &["rev-parse", "refs/heads/hanzo/fix-landing"]).await.unwrap();
         assert_eq!(pushed_sha, body["commitSha"].as_str().unwrap());
+
+        let commit = run_git(Some(&origin), &["log", "-1", "--format=%an|%s", "refs/heads/hanzo/fix-landing"]).await.unwrap();
+        let (author, subject) = commit.split_once('|').unwrap();
+        assert_ne!(author, "Hanzo Dev");
+        assert_eq!(subject, "chore: apply changes from Hanzo run");
     }
 
     // A run with its own deploy key clones and pushes through it, and the key is gone
@@ -1053,7 +1058,7 @@ mod tests {
         assert!(!format!("{run:?}").contains("PRIVATE-KEY"));
     }
 
-    // A run with no repository still works in a directory the agent accepts: Hanzo Dev
+    // A run with no repository still works in a directory the agent accepts: `dev`
     // (codex exec) refuses one that is not inside a git work tree and exits at once, which is
     // how every bare run on a linked machine ended in an error nobody read.
     #[tokio::test]

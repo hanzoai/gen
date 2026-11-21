@@ -180,7 +180,7 @@ impl std::fmt::Display for Asked {
 
 /// The host `gen` runs under: the `hanzo` command on PATH, which holds the Hanzo
 /// IAM account, refreshes its token, reads the user's settings and reads the cloud
-/// for it. Gen asks it the way Hanzo Dev does (`hanzo auth token`), so signing in
+/// for it. Gen asks it the way `dev` does (`hanzo auth token`), so signing in
 /// to one signs in to both.
 pub struct Command {
     program: Option<PathBuf>,
@@ -396,7 +396,7 @@ mod tests {
         assert!(!format!("{a:?}").contains("SECRET"));
     }
 
-    /// `gen` signs in as Hanzo Dev does: the CLI's `auth token`, for the session's brand.
+    /// `gen` signs in as `dev` does: the CLI's `auth token`, for the session's brand.
     #[cfg(unix)]
     #[tokio::test]
     async fn the_account_is_the_clis_token_for_the_sessions_brand() {

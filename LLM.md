@@ -2,7 +2,7 @@
 
 The agentic harness: `gen` launches a coding agent, attaches the Hanzo MCP
 toolset, routes the agent's model calls through api.hanzo.ai, and streams the
-session to mission control. Hanzo Dev (`hanzoai/dev`) is the default agent; Gen
+session to mission control. Hanzo's own agent (`dev`, hanzoai/dev) is the default; Gen
 is what launches and routes it and every other one. Crate `hanzo-gen` (lib
 `hanzo_gen`, binary `gen`), MIT, public.
 

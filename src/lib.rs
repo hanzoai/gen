@@ -1,4 +1,4 @@
-//! Hanzo Gen — the agentic harness. It launches a coding agent (Hanzo Dev, the
+//! Hanzo Gen — the agentic harness. It launches a coding agent (`dev`, the
 //! default, or Claude Code, Codex, Cursor and the rest in [`agents`]) so a
 //! developer's terminal session is (opt-in) linked, live-streamed and tracked in
 //! Hanzo cloud, with the Hanzo MCP toolset attached and model usage metered
@@ -974,7 +974,7 @@ pub(crate) async fn run_routed_agent(
 /// A clean exit SUSPENDS a session only when it can be reopened: its transcript
 /// and resume handle outlive the TUI, and `--resume` finds them in the local
 /// record `finalize` writes. With no handle there is no record, so nothing can
-/// ever reopen it — a fresh Hanzo Dev TUI that quits, or exits to run its own
+/// ever reopen it — a fresh `dev` TUI that quits, or exits to run its own
 /// update — and the session is DONE. Calling it paused told the cloud something
 /// was coming back, and the cloud billed it as alive (hanzo-inc/cloud#768).
 ///
@@ -2204,7 +2204,7 @@ mod tests {
 
     /// hanzo-inc/cloud#768: a clean exit suspends a session only when there is a
     /// handle to resume it by. `--resume` needs the local record, and `finalize`
-    /// writes one only for a backend session, so a fresh Hanzo Dev TUI that quits
+    /// writes one only for a backend session, so a fresh `dev` TUI that quits
     /// (or exits to run its own update) has nothing anyone can reopen: it is done,
     /// not paused — a paused row says something is coming back, and the cloud kept
     /// billing it as alive.

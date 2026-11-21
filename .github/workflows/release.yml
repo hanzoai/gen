@@ -27,7 +27,7 @@
 # from rustup into $HOME and nothing here installs a package. One amd64 machine
 # builds all five targets: `cargo-zigbuild` links the musl and darwin targets
 # (darwin against a vendored, checksum-pinned MacOSX SDK), and `cargo-xwin`
-# builds windows-msvc with LLVM's clang-cl. This is Hanzo Dev's release, cut down
+# builds windows-msvc with LLVM's clang-cl. This is hanzoai/dev's release, cut down
 # to one small binary.
 #
 # THE BUILDS RUN COLD, and hold no credential. A build job compiles every
