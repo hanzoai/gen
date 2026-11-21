@@ -112,9 +112,22 @@ impl SessionClient {
     /// calls is a caller that will one day make only the first. There is
     /// deliberately no way to spell "close it but keep the URL".
     pub async fn set_status(&self, id: &str, status: Status) -> Result<()> {
+        self.set_ended(id, status, None).await
+    }
+
+    /// [`Self::set_status`] with the reason a session ended in error: how the
+    /// backend's process ended, or why it could not start. The reason rides the
+    /// same request as the status, so the row never reads "error" and nothing
+    /// else; cloud keeps it only on a session in error, and bounds it.
+    pub async fn set_ended(&self, id: &str, status: Status, reason: Option<&str>) -> Result<()> {
         let mut body = json!({ "status": status.as_str() });
         if status.is_terminal() {
             body["terminal"] = json!("");
+        }
+        if let (Status::Error, Some(why)) = (status, reason) {
+            if !why.trim().is_empty() {
+                body["error"] = json!(why);
+            }
         }
         self.send(Method::PATCH, &format!("/v1/agents/sessions/{id}"), Some(&body))
             .await?;
