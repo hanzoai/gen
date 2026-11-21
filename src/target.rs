@@ -16,10 +16,11 @@
 
 use anyhow::{Context, Result};
 use hanzo_client::{Http, Method, Request, Transport};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::watch;
 
 use super::context::{hostname, machine_id, Machine, Metrics, Spec, TargetRecord};
 use super::sample::Sampler;
@@ -70,6 +71,25 @@ impl Register {
     }
 }
 
+/// What cloud answers a register or heartbeat with: the target's id and the folders
+/// its owner granted the web (`folders`), so a revoke reaches the machine on its
+/// next beat.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Answer {
+    pub id: String,
+    #[serde(default)]
+    pub folders: Vec<String>,
+}
+
+/// The folders this machine's owner granted, as cloud last answered a beat; `None`
+/// until an answer lands. The beat writes it, the runner reads and watches it.
+pub type Grants = Arc<watch::Sender<Option<Vec<String>>>>;
+
+/// Grants nobody has heard yet.
+pub fn grants() -> Grants {
+    Arc::new(watch::Sender::new(None))
+}
+
 impl TargetClient {
     pub fn new(api: &str, token: &str) -> Result<Self> {
         let wire = reqwest::Client::builder()
@@ -91,19 +111,19 @@ impl TargetClient {
     }
 
     /// Register-or-upsert this machine's target (`POST /v1/agent/targets`).
-    /// Returns the target id cloud minted (201) or refreshed by host (200).
-    pub async fn register(&self, body: &Register) -> Result<String> {
+    /// Answers the target cloud minted (201) or refreshed by host (200).
+    pub async fn register(&self, body: &Register) -> Result<Answer> {
         let v = self.send(Method::POST, "/v1/agent/targets", Some(body)).await?;
-        id_of(&v)
+        answer(v)
     }
 
     /// Refresh an existing target by id (`PATCH /v1/agent/targets/:id`). Sending
     /// the full body updates the capability and IS a metrics heartbeat (the server
     /// stamps its time). Errors on a non-2xx — e.g. a 404 for a target that was
     /// deleted or belongs to another org — so the caller can fall back to register.
-    pub async fn refresh(&self, id: &str, body: &Register) -> Result<String> {
+    pub async fn refresh(&self, id: &str, body: &Register) -> Result<Answer> {
         let v = self.send(Method::PATCH, &format!("/v1/agent/targets/{id}"), Some(body)).await?;
-        id_of(&v)
+        answer(v)
     }
 
     async fn send(&self, method: Method, path: &str, body: Option<&Register>) -> Result<Value> {
@@ -119,12 +139,9 @@ impl TargetClient {
     }
 }
 
-/// Extract the target id from a `targetView` response.
-fn id_of(v: &Value) -> Result<String> {
-    v.get("id")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .context("target response missing id")
+/// Read a `targetView` response.
+fn answer(v: Value) -> Result<Answer> {
+    serde_json::from_value(v).context("target response missing id")
 }
 
 /// Register or refresh THIS machine's run-target, reusing the stored id when we have
@@ -132,13 +149,13 @@ fn id_of(v: &Value) -> Result<String> {
 /// none or the stored target is gone (deleted / different org). BEST-EFFORT: every
 /// failure is logged at debug and swallowed — the coding session never depends on
 /// this. The caller runs it detached so neither the capture nor the cloud write is
-/// on the session's critical path.
-pub async fn sync(root: &Root, api: &str, token: &str, org: Option<&str>, machine_id: &str, host: &str, machine: &Machine) {
+/// on the session's critical path. Answers the granted folders when cloud answered.
+pub async fn sync(root: &Root, api: &str, token: &str, org: Option<&str>, machine_id: &str, host: &str, machine: &Machine) -> Option<Vec<String>> {
     let client = match TargetClient::new(api, token) {
         Ok(c) => c.with_org(org),
         Err(e) => {
             tracing::debug!("run-target client unavailable ({e}); skipping target register");
-            return;
+            return None;
         }
     };
     let body = Register::from_machine(host, machine);
@@ -150,9 +167,9 @@ pub async fn sync(root: &Root, api: &str, token: &str, org: Option<&str>, machin
         .flatten()
         .filter(|r| r.host == host && r.api == api);
 
-    let id = match &stored {
+    let answer = match &stored {
         Some(rec) => match client.refresh(&rec.id, &body).await {
-            Ok(id) => Some(id),
+            Ok(a) => Some(a),
             Err(e) => {
                 tracing::debug!("target heartbeat failed ({e}); re-registering");
                 client.register(&body).await.ok()
@@ -161,8 +178,8 @@ pub async fn sync(root: &Root, api: &str, token: &str, org: Option<&str>, machin
         None => client.register(&body).await.ok(),
     };
 
-    match id {
-        Some(id) => {
+    match answer {
+        Some(Answer { id, folders }) => {
             let rec = TargetRecord {
                 id,
                 host: host.to_string(),
@@ -173,8 +190,12 @@ pub async fn sync(root: &Root, api: &str, token: &str, org: Option<&str>, machin
             if let Err(e) = rec.save(root) {
                 tracing::debug!("could not persist target id ({e})");
             }
+            Some(folders)
         }
-        None => tracing::debug!("run-target register failed; session proceeds without a target"),
+        None => {
+            tracing::debug!("run-target register failed; session proceeds without a target");
+            None
+        }
     }
 }
 
@@ -223,8 +244,13 @@ impl Drop for Beat {
 /// refreshes: the credential is the host's shared state, not a value held here.
 /// It is asked for `brand`'s account, the one the session it beats for runs as.
 pub fn beat(host: Arc<dyn Host>, root: &Root, brand: &str, api: &str, machine_id: &str, name: &str) -> Beat {
+    beat_with(host, root, brand, api, machine_id, name, grants())
+}
+
+/// [`beat`], writing each answer's granted folders to `grants`.
+fn beat_with(host: Arc<dyn Host>, root: &Root, brand: &str, api: &str, machine_id: &str, name: &str, grants: Grants) -> Beat {
     let creds = Creds::Refreshing { host, brand: brand.to_string() };
-    beat_every(BEAT, creds, root, api, machine_id, name)
+    beat_every(BEAT, creds, root, api, machine_id, name, grants)
 }
 
 /// Where a beat gets its bearer.
@@ -278,8 +304,9 @@ pub fn beat_and_serve(
     name: &str,
 ) -> (Beat, crate::runner::Runner) {
     let api = api.trim_end_matches('/');
-    let b = beat(host.clone(), root, brand, api, machine_id, name);
-    let r = crate::runner::serve(host, root, brand, api, machine_id, name);
+    let grants = grants();
+    let b = beat_with(host.clone(), root, brand, api, machine_id, name, grants.clone());
+    let r = crate::runner::serve(host, root, brand, api, machine_id, name, grants);
     (b, r)
 }
 
@@ -298,7 +325,7 @@ pub async fn present(host: Arc<dyn Host>, root: &Root, brand: &str) -> Result<()
 /// [`beat`] with the period as a parameter, so a test can watch the loop repeat
 /// without waiting minutes for it. `BEAT` is the ONE period production uses — this
 /// is the mechanism, not a setting.
-fn beat_every(period: Duration, mut creds: Creds, root: &Root, api: &str, machine_id: &str, host: &str) -> Beat {
+fn beat_every(period: Duration, mut creds: Creds, root: &Root, api: &str, machine_id: &str, host: &str, grants: Grants) -> Beat {
     let root = root.clone();
     let api = api.to_string();
     let (machine_id, host) = (machine_id.to_string(), host.to_string());
@@ -313,7 +340,9 @@ fn beat_every(period: Duration, mut creds: Creds, root: &Root, api: &str, machin
             match creds.bearer().await {
                 Some(token) => {
                     let machine = sampler.machine().await;
-                    sync(&root, &api, &token, org.as_deref(), &machine_id, &host, &machine).await;
+                    if let Some(folders) = sync(&root, &api, &token, org.as_deref(), &machine_id, &host, &machine).await {
+                        grants.send_replace(Some(folders));
+                    }
                 }
                 None => tracing::debug!("no credential for this beat; the machine will read offline"),
             }
@@ -377,7 +406,7 @@ mod tests {
     async fn register_posts_the_body_with_bearer_and_no_org() {
         let mock = MockCloud::start().await;
         let client = TargetClient::new(&mock.base_url(), "TOK").unwrap();
-        let id = client.register(&Register::from_machine("evo", &gpu_machine())).await.unwrap();
+        let id = client.register(&Register::from_machine("evo", &gpu_machine())).await.unwrap().id;
         assert_eq!(id, "tgt_mock");
 
         let reqs = mock.requests();
@@ -395,7 +424,7 @@ mod tests {
         let mock = MockCloud::start().await;
         let client = TargetClient::new(&mock.base_url(), "T").unwrap().with_org(Some("acme"));
         let body = Register::from_machine("evo", &gpu_machine());
-        let id = client.register(&body).await.unwrap();
+        let id = client.register(&body).await.unwrap().id;
         let _ = client.refresh(&id, &body).await;
         let reqs = mock.requests();
         let calls: Vec<_> = reqs.iter().filter(|r| r.path.starts_with("/v1/agent/targets")).collect();
@@ -409,7 +438,7 @@ mod tests {
     async fn refresh_patches_by_id() {
         let mock = MockCloud::start().await;
         let client = TargetClient::new(&mock.base_url(), "T").unwrap();
-        let id = client.refresh("tgt_1", &Register::from_machine("evo", &gpu_machine())).await.unwrap();
+        let id = client.refresh("tgt_1", &Register::from_machine("evo", &gpu_machine())).await.unwrap().id;
         assert_eq!(id, "tgt_1");
         let reqs = mock.requests();
         assert!(reqs.iter().any(|r| r.method == "PATCH" && r.path == "/v1/agent/targets/tgt_1"));
@@ -496,7 +525,7 @@ mod tests {
         let machine = format!("beat_{}", std::process::id());
         let _ = std::fs::remove_file(crate::context::target_path_for_test(&root, &machine));
 
-        let held = beat_every(Duration::from_millis(10), Creds::Fixed("T".into()), &root, &mock.base_url(), &machine, "evo");
+        let held = beat_every(Duration::from_millis(10), Creds::Fixed("T".into()), &root, &mock.base_url(), &machine, "evo", grants());
         until("a machine to keep beating", || mock.requests().len() >= 3).await;
         drop(held);
 
@@ -522,6 +551,7 @@ mod tests {
             &mock.base_url(),
             &machine,
             "evo",
+            grants(),
         );
         until("several beats", || mock.requests().len() >= 3).await;
         drop(held);
@@ -570,6 +600,22 @@ mod tests {
         let _ = std::fs::remove_file(crate::context::target_path_for_test(&root, &machine));
     }
 
+    /// Each beat keeps the folders cloud answers as granted, so a revoke lands on the next.
+    #[tokio::test]
+    async fn a_beat_keeps_the_granted_folders() {
+        let mock = MockCloud::start().await;
+        mock.grant(&["/home/me/site", "/home/me/notes"]);
+        let root = crate::root::scratch();
+        let machine = format!("beatgrants_{}", std::process::id());
+        let g = grants();
+        let held = beat_every(Duration::from_millis(10), Creds::Fixed("T".into()), &root, &mock.base_url(), &machine, "evo", g.clone());
+        until("the grants", || g.borrow().as_ref().is_some_and(|f| f.len() == 2)).await;
+        mock.grant(&["/home/me/notes"]);
+        until("the revoke", || g.borrow().as_deref() == Some(&["/home/me/notes".to_string()][..])).await;
+        drop(held);
+        let _ = std::fs::remove_file(crate::context::target_path_for_test(&root, &machine));
+    }
+
     /// Letting go stops the beat, and stopping is the whole ending: cloud's window
     /// expires on its own. Nothing sends a goodbye, so nothing can fail to.
     #[tokio::test]
@@ -579,7 +625,7 @@ mod tests {
         let machine = format!("beatdrop_{}", std::process::id());
         let _ = std::fs::remove_file(crate::context::target_path_for_test(&root, &machine));
 
-        let held = beat_every(Duration::from_millis(10), Creds::Fixed("T".into()), &root, &mock.base_url(), &machine, "evo");
+        let held = beat_every(Duration::from_millis(10), Creds::Fixed("T".into()), &root, &mock.base_url(), &machine, "evo", grants());
         until("the first beat", || !mock.requests().is_empty()).await;
         drop(held);
         // A beat already in flight may still land, so settle before reading the mark.
