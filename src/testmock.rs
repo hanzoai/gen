@@ -71,6 +71,9 @@ struct Config {
     routed_runs: Arc<Mutex<std::collections::VecDeque<crate::runner::RoutedRun>>>,
     key_mints: Arc<std::sync::atomic::AtomicUsize>,
     reject_first_key: bool,
+    /// Answer 503 to the first this-many requests, then serve normally.
+    refuse_first: usize,
+    refused: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// The ordinary control plane: everything succeeds. Each constructor below
@@ -90,6 +93,8 @@ impl Default for Config {
             routed_runs: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             key_mints: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             reject_first_key: false,
+            refuse_first: 0,
+            refused: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 }
@@ -118,6 +123,12 @@ impl MockCloud {
     /// run-target sync heartbeat→register fallback.
     pub async fn start_target_missing() -> MockCloud {
         Self::with(Config { targets_missing: true, ..Config::default() }).await
+    }
+
+    /// A mock that answers 503 to its first `n` requests and then serves normally:
+    /// a cloud that is briefly not ready.
+    pub async fn start_refusing_first(n: usize) -> MockCloud {
+        Self::with(Config { refuse_first: n, ..Config::default() }).await
     }
 
     /// A mock that fails GET on a session id with `code` while register still
@@ -283,6 +294,9 @@ async fn serve_conn(
 fn respond(cfg: &Config, method: &str, path: &str, bearer: bool, claim_key: Option<&str>) -> (String, String) {
     if let Some(code) = cfg.force_status {
         return (format!("{code} Error"), r#"{"error":"forced"}"#.to_string());
+    }
+    if cfg.refused.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < cfg.refuse_first {
+        return ("503 Service Unavailable".into(), r#"{"error":"not ready"}"#.to_string());
     }
     // The org's kit, as the caller reads it.
     if method == "GET" && path == "/v1/tool/kit" {
