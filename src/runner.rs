@@ -503,8 +503,15 @@ pub async fn execute_workspace_run(work_dir: &Path, run: &RoutedRun, executor: E
             return failure_report(&run.branch, format!("workspace setup failed: {e}"));
         }
         base_sha = git_stdout(work_dir, &["rev-parse", "HEAD"]).await.unwrap_or_default();
-    } else if let Err(e) = std::fs::create_dir_all(work_dir) {
-        return failure_report(&run.branch, format!("creating workspace dir: {e}"));
+    } else {
+        // Nothing to clone, so the workspace is an empty repository: the agent will not
+        // start in a directory that is not one.
+        if let Err(e) = std::fs::create_dir_all(work_dir) {
+            return failure_report(&run.branch, format!("creating workspace dir: {e}"));
+        }
+        if let Err(e) = run_git(Some(work_dir), &["init", "--quiet"]).await {
+            return failure_report(&run.branch, format!("workspace setup failed: {e}"));
+        }
     }
 
     let timeout = if run.timeout_seconds > 0 {
@@ -800,6 +807,38 @@ mod tests {
 
         let pushed_sha = run_git(Some(&origin), &["rev-parse", "refs/heads/hanzo/fix-landing"]).await.unwrap();
         assert_eq!(pushed_sha, body["commitSha"].as_str().unwrap());
+    }
+
+    // A run with no repository still works in a directory the agent accepts: Hanzo Dev
+    // (codex exec) refuses one that is not inside a git work tree and exits at once, which is
+    // how every bare run on a linked machine ended in an error nobody read.
+    #[tokio::test]
+    async fn a_run_without_a_repository_works_inside_a_git_work_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_dir = tmp.path().join("workspace");
+        let run = RoutedRun {
+            session_id: "sess_bare_1".into(),
+            repo: String::new(),
+            project: String::new(),
+            base: String::new(),
+            branch: String::new(),
+            prompt: "Say ok".into(),
+            clone_url: String::new(),
+            timeout_seconds: 30,
+            model: "enso-auto".into(),
+            effort: "medium".into(),
+            instructions: String::new(),
+        };
+        let exec: Executor = Arc::new(|_run, cwd| {
+            Box::pin(async move {
+                let inside = git_stdout(&cwd, &["rev-parse", "--is-inside-work-tree"]).await?;
+                anyhow::ensure!(inside == "true", "the workspace is not a git work tree: {inside:?}");
+                Ok(None)
+            })
+        });
+        let report = execute_workspace_run(&work_dir, &run, exec).await;
+        assert!(report.ok, "a bare run failed: {}", report.error);
+        assert!(!report.changed);
     }
 
     #[tokio::test]
