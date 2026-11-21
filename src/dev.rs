@@ -198,6 +198,19 @@ impl Backend for Agent {
             Route::Inherit => {}
         }
 
+        // A task run has nobody to answer. Left to itself the agent reads a few files
+        // and ends its turn asking whether to go on ("would you like me to ..."), which
+        // a scripted run reads as done: ten read-the-repository tasks on public
+        // repositories took a median of 2 tool calls (4 on the released CLI) before
+        // the turn ended. Told that nobody is there, the same ten took a median of 5.5,
+        // so a task run says so, unless the caller named developer instructions of
+        // their own.
+        let own = spec.passthrough.iter().any(|a| a.starts_with("developer_instructions="));
+        if headless && spec.task.is_some() && !own {
+            args.push("-c".into());
+            args.push(cfg_string("developer_instructions", NO_ONE_TO_ASK));
+        }
+
         // Passthrough flags precede positionals so they can't swallow the prompt.
         args.extend(spec.passthrough.iter().cloned());
 
@@ -428,6 +441,12 @@ fn cfg_string(key: &str, val: &str) -> String {
     format!("{key}={}", toml_string(val))
 }
 
+/// What a task run's agent is told: nobody is present to answer it.
+const NO_ONE_TO_ASK: &str = "This run is non-interactive: nobody is present to answer a question or approve a step. \
+Do the whole task with your tools before you end your turn. Do not stop to ask whether to continue, \
+do not offer follow-up work, and do not announce a next step without taking it; end your turn only \
+when the task is complete, with the result.";
+
 /// A `-c key=value` override where `value` is a TOML array of strings.
 fn cfg_array(key: &str, items: &[String]) -> String {
     let parts: Vec<String> = items.iter().map(|s| toml_string(s)).collect();
@@ -487,6 +506,33 @@ mod tests {
         // dev carries the provider natively.
         let l = Agent::DEV.build(&spec(Mode::Headless, "https://api.hanzo.ai")).unwrap();
         assert!(!l.command.as_std().get_args().any(|a| a.to_string_lossy().contains("hanzocode")));
+    }
+
+    /// A task run is told nobody can answer it, once, before the prompt; a caller's own
+    /// developer instructions stand instead, an interactive session is left to the person
+    /// in it, and a resumed turn carries it too.
+    ///
+    /// MUTATION: drop the `headless && task && !own` condition and the interactive and
+    /// caller-instruction cases carry it.
+    #[test]
+    fn a_task_run_is_told_nobody_is_there_to_answer() {
+        let told = |l: &Launch| argv(l).iter().filter(|a| a.starts_with("developer_instructions=")).count();
+        let l = Agent::DEV.build(&spec(Mode::Headless, "https://api.hanzo.ai")).unwrap();
+        assert_eq!(told(&l), 1, "{:?}", argv(&l));
+        assert!(argv(&l).iter().any(|a| a.starts_with("developer_instructions=") && a.contains("nobody is present")));
+        let at = argv(&l).iter().position(|a| a.starts_with("developer_instructions=")).unwrap();
+        assert!(at < argv(&l).iter().position(|a| a == "do it").unwrap(), "before the prompt");
+
+        let mut own = spec(Mode::Headless, "https://api.hanzo.ai");
+        own.passthrough = vec!["-c".into(), "developer_instructions=\"mine\"".into()];
+        assert_eq!(told(&Agent::DEV.build(&own).unwrap()), 1, "the caller's, and only theirs");
+        assert!(argv(&Agent::DEV.build(&own).unwrap()).iter().all(|a| !a.contains("nobody is present")));
+
+        assert_eq!(told(&Agent::DEV.build(&spec(Mode::Interactive, "https://api.hanzo.ai")).unwrap()), 0, "a person is there");
+
+        let mut resumed = spec(Mode::Headless, "https://api.hanzo.ai");
+        resumed.resume = Some("th-1".into());
+        assert_eq!(told(&Agent::DEV.build(&resumed).unwrap()), 1, "a resumed turn is just as unattended");
     }
 
     #[test]

@@ -1125,6 +1125,29 @@ fn reason_of(run: &Result<(Outcome, Status)>, label: &str) -> String {
     }
 }
 
+/// What a harness's own loop guard says when its model made the same tool call
+/// twice in a row with the same result ("unsupported operation: repeated identical
+/// tool-use cycle detected; refusing to continue after duplicate tool calls: {...}").
+/// The guard ends the turn with an error; the run is not over, the model is.
+const LOOP_MARK: &str = "repeated identical tool-use cycle detected";
+
+/// How many times a run is told to change course before the guard's end stands. The
+/// same bound the cloud's coding runs use for the same guard.
+const MAX_COURSE_CHANGES: u8 = 2;
+
+/// What a model stopped by the loop guard is told, in the same conversation: the call
+/// it repeated (its own words, bounded) and what to do instead.
+fn change_course(said: &str) -> String {
+    let call = said.split_once("duplicate tool calls:").map(|(_, c)| c.trim()).unwrap_or("");
+    let mut told = String::from("You made the same tool call twice in a row and got the same result, so your turn was stopped.");
+    if !call.is_empty() {
+        told.push_str(" The call was: ");
+        told.push_str(&cut(call, 300));
+    }
+    told.push_str("\n\nDo not make it again. Use a different command or different arguments, and carry on with the task.");
+    told
+}
+
 /// `s` cut to at most `n` bytes at a character boundary.
 fn cut(s: &str, n: usize) -> String {
     if s.len() <= n {
@@ -1415,10 +1438,12 @@ async fn supervise(
     };
 
     let mut acc = Outcome::default();
+    let mut changed_course = 0u8;
     let status = loop {
         let (out, ok, act) =
             run_turn(backend, structured, launch, client.clone(), session_id.clone(), rx.as_mut())
                 .await?;
+        let said = out.final_summary.clone();
 
         // Fold this turn into the run. The backend session id is set once — it is
         // the SAME conversation across every steer — while usage accumulates and
@@ -1453,7 +1478,28 @@ async fn supervise(
                 launch = backend.build(&spec)?;
             }
             // Uncommanded end: the backend finished (or failed) on its own.
-            None | Some(Act::Ignore) => break Status::of(ok),
+            //
+            // A turn its harness stopped for repeating one tool call is not a run that
+            // failed: its model looped. It is told what it repeated and to change
+            // course, in the same conversation, up to MAX_COURSE_CHANGES times (the
+            // cloud's coding runs do the same for the same guard); only then does the
+            // guard's end stand, with its reason.
+            None | Some(Act::Ignore) => {
+                let looped = !ok && said.as_deref().is_some_and(|m| m.contains(LOOP_MARK));
+                if looped && changed_course < MAX_COURSE_CHANGES && acc.backend_session.is_some() {
+                    changed_course += 1;
+                    crate::warn(&format!(
+                        "{} repeated a tool call; telling it to change course ({changed_course}/{MAX_COURSE_CHANGES})",
+                        backend.label()
+                    ));
+                    spec.resume = acc.backend_session.clone();
+                    spec.task = Some(change_course(said.as_deref().unwrap_or("")));
+                    spec.preset_session = None;
+                    launch = backend.build(&spec)?;
+                    continue;
+                }
+                break Status::of(ok);
+            }
         }
     };
 
@@ -2754,6 +2800,43 @@ mod control_tests {
             "the resume handle must survive an interrupt — without it the session is unreachable"
         );
         assert_eq!(built.lock().unwrap().len(), 1, "pause must not relaunch");
+    }
+
+    /// A turn the harness stopped for repeating one tool call is told what it repeated
+    /// and to change course, in the same conversation, and the run goes on: the
+    /// terminal's runs ended in error on this guard where the cloud's coding runs are
+    /// nudged twice. After the bound the guard's end stands, with its reason.
+    ///
+    /// MUTATION: drop the `looped` branch in `supervise` and the first run ends in error
+    /// after one turn.
+    #[tokio::test]
+    async fn a_run_its_loop_guard_stopped_is_told_to_change_course() {
+        const LOOPED: &str = concat!(
+            r#"echo '{"type":"system","subtype":"init","session_id":"bsid-1","model":"m"}'; "#,
+            r#"echo '{"type":"result","subtype":"error_during_execution","is_error":true,"session_id":"bsid-1","result":"unsupported operation: repeated identical tool-use cycle detected; refusing to continue after duplicate tool calls: {\"name\":\"exec_command\"}"}'; "#,
+            "exit 1",
+        );
+        const FINISHES: &str = concat!(
+            r#"echo '{"type":"system","subtype":"init","session_id":"bsid-1","model":"m"}'; "#,
+            r#"echo '{"type":"result","subtype":"success","is_error":false,"session_id":"bsid-1","result":"finished","num_turns":1}'"#,
+        );
+        let mock = MockCloud::start().await;
+        let (out, status, built, _) = supervise_with(&mock, "sess_loop", vec![LOOPED, FINISHES]).await;
+        let built = built.lock().unwrap().clone();
+        assert_eq!(built.len(), 2, "the stopped turn was not followed by another: {built:?}");
+        assert_eq!(built[1].0.as_deref(), Some("bsid-1"), "the same conversation, not a new one");
+        let told = built[1].1.as_deref().unwrap();
+        assert!(told.contains("same tool call twice") && told.contains("exec_command") && told.contains("different command"), "{told}");
+        assert_eq!(status, Status::Done, "the run it was told to carry on finished");
+        assert!(!out.saw_error, "the newest turn is the one that counts");
+
+        // A model that loops again and again is stopped after the bound, with the reason.
+        let mock2 = MockCloud::start().await;
+        let (out2, status2, built2, _) = supervise_with(&mock2, "sess_loop2", vec![LOOPED]).await;
+        assert_eq!(built2.lock().unwrap().len(), 1 + MAX_COURSE_CHANGES as usize, "told {MAX_COURSE_CHANGES} times, then stopped");
+        assert_eq!(status2, Status::Error);
+        let why = reason_of(&Ok((out2, status2)), "claude");
+        assert!(why.contains("repeated identical tool-use cycle"), "{why}");
     }
 
     /// `message` steers: the child is interrupted, then the SAME conversation
