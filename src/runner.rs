@@ -2,7 +2,9 @@
 //!
 //! Heartbeating (`target::beat`) proves a machine is `online`; long-polling
 //! `POST /v1/agent/targets/:id/claim` proves a runner is listening (`serving: true`)
-//! and executes routed `hanzo.app > Dev` runs locally in an isolated git checkout.
+//! and executes routed `hanzo.app > Dev` runs locally in an isolated git checkout,
+//! or, for a run that names a `dir`, in place in that folder when it lies inside one
+//! the machine's owner granted (hanzo-inc/app#310).
 //! Cloud's `routedFinalizer` owns closing the session after `/report` lands, so
 //! the runner streams live events to `sessionId` without setting a terminal status.
 
@@ -24,7 +26,7 @@ use crate::contract::AgentRun;
 use crate::host::Host;
 use crate::root::Root;
 use crate::sample::Sampler;
-use crate::target;
+use crate::target::{self, Grants};
 
 /// Default wall-clock cap for a single routed run when `timeoutSeconds == 0`.
 const DEFAULT_RUN_TIMEOUT: Duration = Duration::from_secs(1800);
@@ -40,6 +42,9 @@ const MAX_CONCURRENT_RUNS: usize = 2;
 /// Clamp limits matching `cloud/apps/agents/routing_http.go`.
 const MAX_SHA_CHARS: usize = 128;
 const MAX_TEXT_BYTES: usize = 60 * 1024;
+
+/// The outcome a run in a folder outside every grant ends with, as cloud names it.
+pub const FOLDER_NOT_GRANTED: &str = "folder_not_granted";
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -72,6 +77,10 @@ pub struct RoutedRun {
     pub deploy_key: Secret,
     #[serde(default)]
     pub known_hosts: String,
+    /// The folder the run works in, in place: no clone, no push, nothing removed after.
+    /// Empty is a run in its own checkout.
+    #[serde(default)]
+    pub dir: String,
 }
 
 /// A secret that a debug line leaves out.
@@ -131,6 +140,7 @@ pub fn serve(
     api: &str,
     machine_id: &str,
     name: &str,
+    grants: Grants,
 ) -> Runner {
     let exec_host = host.clone();
     let exec_root = root.clone();
@@ -154,9 +164,10 @@ pub fn serve(
             .await
         })
     });
-    serve_with(host, root, brand, api, machine_id, name, executor)
+    serve_with(host, root, brand, api, machine_id, name, grants, executor)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn serve_with(
     host: Arc<dyn Host>,
     root: &Root,
@@ -164,6 +175,7 @@ pub fn serve_with(
     api: &str,
     machine_id: &str,
     name: &str,
+    grants: Grants,
     executor: Executor,
 ) -> Runner {
     let root = root.clone();
@@ -171,7 +183,7 @@ pub fn serve_with(
     let api = api.trim_end_matches('/').to_string();
     let machine_id = machine_id.to_string();
     let name = name.to_string();
-    let handle = tokio::spawn(run_loop(host, root, brand, api, machine_id, name, executor));
+    let handle = tokio::spawn(run_loop(host, root, brand, api, machine_id, name, grants, executor));
     Runner(handle)
 }
 
@@ -293,6 +305,9 @@ fn save_claim_key(root: &Root, api: &str, org: Option<&str>, target_id: &str, ke
     let _ = crate::private::write(&p, key.as_bytes());
 }
 
+/// This machine's target id, registering when none is stored or no answer has said
+/// which folders are granted yet.
+#[allow(clippy::too_many_arguments)]
 async fn resolve_target_id(
     root: &Root,
     api: &str,
@@ -301,16 +316,16 @@ async fn resolve_target_id(
     machine_id: &str,
     host_name: &str,
     sampler: &mut Sampler,
+    grants: &Grants,
 ) -> Option<String> {
     if let Some(rec) = TargetRecord::load(root, machine_id)
         .ok()
         .flatten()
-        .filter(|r| r.host == host_name && r.api == api)
+        .filter(|r| r.host == host_name && r.api == api && grants.borrow().is_some())
     {
         return Some(rec.id);
     }
-    let machine = sampler.machine().await;
-    target::sync(root, api, token, org, machine_id, host_name, &machine).await;
+    sync(root, api, token, org, machine_id, host_name, sampler, grants).await;
     TargetRecord::load(root, machine_id)
         .ok()
         .flatten()
@@ -318,6 +333,16 @@ async fn resolve_target_id(
         .map(|r| r.id)
 }
 
+/// [`target::sync`], keeping the granted folders it answers.
+#[allow(clippy::too_many_arguments)]
+async fn sync(root: &Root, api: &str, token: &str, org: Option<&str>, machine_id: &str, host_name: &str, sampler: &mut Sampler, grants: &Grants) {
+    let machine = sampler.machine().await;
+    if let Some(folders) = target::sync(root, api, token, org, machine_id, host_name, &machine).await {
+        grants.send_replace(Some(folders));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_loop(
     host: Arc<dyn Host>,
     root: Root,
@@ -325,6 +350,7 @@ async fn run_loop(
     api: String,
     machine_id: String,
     host_name: String,
+    grants: Grants,
     executor: Executor,
 ) {
     let org = host.profile().await.org;
@@ -365,6 +391,7 @@ async fn run_loop(
             &machine_id,
             &host_name,
             &mut sampler,
+            &grants,
         )
         .await
         else {
@@ -402,8 +429,7 @@ async fn run_loop(
             }
             Ok(ClaimPoll::Forbidden) => {
                 drop(permit);
-                let machine = sampler.machine().await;
-                target::sync(&root, &api, &token, org.as_deref(), &machine_id, &host_name, &machine).await;
+                sync(&root, &api, &token, org.as_deref(), &machine_id, &host_name, &mut sampler, &grants).await;
                 let refreshed_id = TargetRecord::load(&root, &machine_id)
                     .ok()
                     .flatten()
@@ -430,6 +456,7 @@ async fn run_loop(
                 let org = org.clone();
                 let client = client.clone();
                 let executor = executor.clone();
+                let grants = grants.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
                     handle_claimed_run(
@@ -442,6 +469,7 @@ async fn run_loop(
                         &target_id,
                         &claim_key,
                         *run,
+                        &grants,
                         executor,
                     )
                     .await;
@@ -467,17 +495,22 @@ async fn handle_claimed_run(
     target_id: &str,
     initial_claim_key: &str,
     run: RoutedRun,
+    grants: &Grants,
     executor: Executor,
 ) {
-    let run_slug = sanitize_id(&run.session_id);
-    let work_dir = root.data().join("runs").join(format!(
-        "{}-{:08x}",
-        if run_slug.is_empty() { "run" } else { &run_slug },
-        rand::random::<u32>()
-    ));
-
-    let report = execute_workspace_run(&work_dir, &run, executor).await;
-    let _ = std::fs::remove_dir_all(&work_dir);
+    let report = if run.dir.is_empty() {
+        let run_slug = sanitize_id(&run.session_id);
+        let work_dir = root.data().join("runs").join(format!(
+            "{}-{:08x}",
+            if run_slug.is_empty() { "run" } else { &run_slug },
+            rand::random::<u32>()
+        ));
+        let report = execute_workspace_run(&work_dir, &run, executor).await;
+        let _ = std::fs::remove_dir_all(&work_dir);
+        report
+    } else {
+        execute_folder_run(&run, grants, executor).await
+    };
 
     let mut key = load_claim_key(root, api, org, target_id).unwrap_or_else(|| initial_claim_key.to_string());
     for attempt in 0..3 {
@@ -542,24 +575,14 @@ pub async fn execute_workspace_run(work_dir: &Path, run: &RoutedRun, executor: E
         }
     }
 
-    let timeout = if run.timeout_seconds > 0 {
-        Duration::from_secs(run.timeout_seconds)
-    } else {
-        DEFAULT_RUN_TIMEOUT
-    };
-
     let mut ok = true;
     let mut err_msg = String::new();
     let mut telemetry = None;
-    match tokio::time::timeout(timeout, executor(run.clone(), work_dir.to_path_buf())).await {
-        Ok(Ok(t)) => { telemetry = t; }
-        Ok(Err(e)) => {
+    match agent(run, work_dir, executor).await {
+        Ok(t) => telemetry = t,
+        Err(e) => {
             ok = false;
             err_msg = e.to_string();
-        }
-        Err(_) => {
-            ok = false;
-            err_msg = format!("run timed out after {}s", timeout.as_secs());
         }
     }
 
@@ -595,6 +618,73 @@ pub async fn execute_workspace_run(work_dir: &Path, run: &RoutedRun, executor: E
         error: clamp_bytes(&err_msg, MAX_TEXT_BYTES),
         telemetry,
     }
+}
+
+/// The agent on `run` in `cwd`, ended at the run's time limit.
+async fn agent(run: &RoutedRun, cwd: &Path, executor: Executor) -> Result<Option<AgentRun>> {
+    let timeout = if run.timeout_seconds > 0 {
+        Duration::from_secs(run.timeout_seconds)
+    } else {
+        DEFAULT_RUN_TIMEOUT
+    };
+    match tokio::time::timeout(timeout, executor(run.clone(), cwd.to_path_buf())).await {
+        Ok(out) => out,
+        Err(_) => bail!("run timed out after {}s", timeout.as_secs()),
+    }
+}
+
+/// Run `run` in place in its `dir`, which must lie inside a folder in `grants`; the
+/// run is stopped the moment a beat answers that its folder is no longer granted.
+pub async fn execute_folder_run(run: &RoutedRun, grants: &Grants, executor: Executor) -> RunReport {
+    let mut granted = grants.subscribe();
+    let dir = match inside(Path::new(&run.dir), granted.borrow_and_update().as_deref().unwrap_or_default()) {
+        Ok(dir) => dir,
+        Err(e) => return failure_report(&run.branch, e.to_string()),
+    };
+    let revoked = async {
+        while granted.changed().await.is_ok() {
+            if inside(&dir, granted.borrow_and_update().as_deref().unwrap_or_default()).is_err() {
+                return;
+            }
+        }
+        std::future::pending::<()>().await
+    };
+    let out = tokio::select! {
+        out = agent(run, &dir, executor) => out,
+        () = revoked => Err(anyhow!("{FOLDER_NOT_GRANTED}: the folder {} was revoked, and the run was stopped", run.dir)),
+    };
+    match out {
+        Ok(telemetry) => RunReport {
+            ok: true,
+            changed: false,
+            branch: run.branch.clone(),
+            commit_sha: String::new(),
+            diffstat: String::new(),
+            error: String::new(),
+            telemetry,
+        },
+        Err(e) => failure_report(&run.branch, e.to_string()),
+    }
+}
+
+/// The real path of `dir` when it is a directory that is, or lies under, a granted
+/// folder. Both sides are real paths (symlinks, `..` and `/proc` links resolved), so
+/// no spelling escapes a grant, and a grant missing from disk grants nothing.
+pub fn inside(dir: &Path, folders: &[String]) -> Result<PathBuf> {
+    let refused = || anyhow!("{FOLDER_NOT_GRANTED}: the folder {} is not inside one this machine's owner granted", dir.display());
+    let real = Some(dir)
+        .filter(|d| d.is_absolute())
+        .and_then(|d| std::fs::canonicalize(d).ok())
+        .filter(|d| d.is_dir())
+        .ok_or_else(refused)?;
+    folders
+        .iter()
+        .map(Path::new)
+        .filter(|f| f.is_absolute())
+        .filter_map(|f| std::fs::canonicalize(f).ok())
+        .any(|f| real.starts_with(f))
+        .then_some(real)
+        .ok_or_else(refused)
 }
 
 /// A run's deploy key and the host key it is checked against, on disk for the run:
@@ -857,6 +947,7 @@ mod tests {
             instructions: String::new(),
             deploy_key: Secret::default(),
             known_hosts: String::new(),
+            dir: String::new(),
         };
 
         let mock = MockCloud::start_with_routed_runs(vec![queued], true).await;
@@ -874,7 +965,7 @@ mod tests {
             })
         });
 
-        let held = serve_with(host, &root, "hanzo", &mock.base_url(), "mach_1", "James-MacBook-Air.local", exec);
+        let held = serve_with(host, &root, "hanzo", &mock.base_url(), "mach_1", "James-MacBook-Air.local", target::grants(), exec);
         until("routed run report to land", || {
             mock.requests().iter().any(|r| r.method == "POST" && r.path == "/v1/agent/targets/tgt_mock/runs/sess_routed_1/report")
         })
@@ -934,6 +1025,7 @@ mod tests {
             instructions: String::new(),
             deploy_key: serde_json::from_str("\"PRIVATE-KEY\"").unwrap(),
             known_hosts: "git.test ssh-ed25519 AAAA".into(),
+            dir: String::new(),
         };
         let seen = keys.clone();
         let exec: Executor = Arc::new(move |_run, cwd| {
@@ -982,6 +1074,7 @@ mod tests {
             instructions: String::new(),
             deploy_key: Secret::default(),
             known_hosts: String::new(),
+            dir: String::new(),
         };
         let exec: Executor = Arc::new(|_run, cwd| {
             Box::pin(async move {
@@ -1013,6 +1106,7 @@ mod tests {
             instructions: String::new(),
             deploy_key: Secret::default(),
             known_hosts: String::new(),
+            dir: String::new(),
         };
         let exec: Executor = Arc::new(|r, _cwd| {
             Box::pin(async move {
@@ -1045,5 +1139,212 @@ mod tests {
         assert!(check.passed, "violations: {:?}", check.violations);
         assert_eq!(serialized["telemetry"]["runId"], "sess_telemetry_1");
         assert_eq!(serialized["telemetry"]["execution"]["toolCalls"], 3);
+    }
+
+    fn folder_run(dir: &Path) -> RoutedRun {
+        RoutedRun {
+            session_id: "sess_folder_1".into(),
+            repo: String::new(),
+            project: String::new(),
+            base: String::new(),
+            branch: String::new(),
+            prompt: "Tidy the notes".into(),
+            clone_url: String::new(),
+            timeout_seconds: 30,
+            model: String::new(),
+            effort: String::new(),
+            instructions: String::new(),
+            deploy_key: Secret::default(),
+            known_hosts: String::new(),
+            dir: dir.to_string_lossy().into_owned(),
+        }
+    }
+
+    fn granted(folders: &[&Path]) -> Grants {
+        let g = target::grants();
+        g.send_replace(Some(folders.iter().map(|f| f.to_string_lossy().into_owned()).collect()));
+        g
+    }
+
+    fn refused(r: Result<PathBuf>) -> bool {
+        r.is_err_and(|e| e.to_string().starts_with(FOLDER_NOT_GRANTED))
+    }
+
+    // A grant covers itself and what lies under it, and nothing beside it.
+    #[test]
+    fn a_grant_holds_its_folder_and_what_is_under_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let site = tmp.path().join("site");
+        std::fs::create_dir_all(site.join("src")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("site2")).unwrap();
+        let grant = [site.to_string_lossy().into_owned()];
+        let real = std::fs::canonicalize(&site).unwrap();
+        assert_eq!(inside(&site, &grant).unwrap(), real);
+        assert_eq!(inside(&site.join("src"), &grant).unwrap(), real.join("src"));
+        assert!(refused(inside(&tmp.path().join("site2"), &grant)), "a sibling sharing a prefix is not inside");
+        assert!(refused(inside(tmp.path(), &grant)), "a parent is not inside");
+        assert!(refused(inside(Path::new("site/src"), &grant)), "a relative dir is not inside");
+        assert!(refused(inside(&site, &[])), "no grant, no folder");
+    }
+
+    // A symlink inside a grant that points out of it is refused; one pointing in is not.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_out_of_a_grant_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let site = tmp.path().join("site");
+        let secrets = tmp.path().join("secrets");
+        std::fs::create_dir_all(site.join("src")).unwrap();
+        std::fs::create_dir_all(&secrets).unwrap();
+        std::os::unix::fs::symlink(&secrets, site.join("out")).unwrap();
+        std::os::unix::fs::symlink(site.join("src"), tmp.path().join("in")).unwrap();
+        let grant = [site.to_string_lossy().into_owned()];
+        assert!(refused(inside(&site.join("out"), &grant)));
+        assert!(refused(inside(&site.join("out").join("."), &grant)));
+        assert_eq!(inside(&tmp.path().join("in"), &grant).unwrap(), std::fs::canonicalize(site.join("src")).unwrap());
+    }
+
+    // `..` is resolved before the check: climbing out is refused, climbing back in is not.
+    #[test]
+    fn dot_dot_cannot_climb_out_of_a_grant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let site = tmp.path().join("site");
+        std::fs::create_dir_all(site.join("src")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("other")).unwrap();
+        let grant = [site.to_string_lossy().into_owned()];
+        assert!(refused(inside(&site.join("..").join("other"), &grant)));
+        assert!(refused(inside(&site.join(".."), &grant)));
+        assert_eq!(inside(&site.join("src").join(".."), &grant).unwrap(), std::fs::canonicalize(&site).unwrap());
+    }
+
+    // A folder that is not on disk is refused, and a grant that is not on disk grants nothing.
+    #[test]
+    fn a_missing_folder_or_grant_grants_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let site = tmp.path().join("site");
+        std::fs::create_dir_all(&site).unwrap();
+        std::fs::write(site.join("notes.md"), "x").unwrap();
+        let grant = [site.to_string_lossy().into_owned()];
+        assert!(refused(inside(&site.join("gone"), &grant)));
+        assert!(refused(inside(&site.join("notes.md"), &grant)), "a file is not a folder to work in");
+        let gone = [tmp.path().join("gone").to_string_lossy().into_owned()];
+        assert!(refused(inside(&site, &gone)));
+    }
+
+    // A run in a granted folder works there in place: no clone, no repository made, and
+    // what the agent wrote stays.
+    #[tokio::test]
+    async fn a_run_in_a_granted_folder_works_in_place() {
+        let tmp = tempfile::tempdir().unwrap();
+        let site = tmp.path().join("site");
+        std::fs::create_dir_all(&site).unwrap();
+        let real = std::fs::canonicalize(&site).unwrap();
+        let exec: Executor = Arc::new(move |_run, cwd| {
+            let real = real.clone();
+            Box::pin(async move {
+                anyhow::ensure!(cwd == real, "the run worked in {}", cwd.display());
+                std::fs::write(cwd.join("notes.md"), "done\n")?;
+                Ok(None)
+            })
+        });
+        let report = execute_folder_run(&folder_run(&site), &granted(&[&site]), exec).await;
+        assert!(report.ok, "{}", report.error);
+        assert!(!report.changed);
+        assert_eq!(std::fs::read_to_string(site.join("notes.md")).unwrap(), "done\n");
+        assert!(!site.join(".git").exists(), "the folder was made a repository");
+    }
+
+    // A run outside every grant runs nothing and reports folder_not_granted.
+    #[tokio::test]
+    async fn a_run_outside_every_grant_runs_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let site = tmp.path().join("site");
+        let other = tmp.path().join("other");
+        std::fs::create_dir_all(&site).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = ran.clone();
+        let exec: Executor = Arc::new(move |_run, _cwd| {
+            seen.store(true, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async { Ok(None) })
+        });
+        for grants in [granted(&[&site]), target::grants()] {
+            let report = execute_folder_run(&folder_run(&other), &grants, exec.clone()).await;
+            assert!(!report.ok);
+            assert!(report.error.starts_with(FOLDER_NOT_GRANTED), "{}", report.error);
+        }
+        assert!(!ran.load(std::sync::atomic::Ordering::SeqCst), "a refused run executed");
+    }
+
+    // A beat that no longer carries the run's folder stops the run at once.
+    #[tokio::test]
+    async fn revoking_the_folder_stops_the_run() {
+        struct Dropped(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let site = tmp.path().join("site");
+        let keep = tmp.path().join("keep");
+        std::fs::create_dir_all(&site).unwrap();
+        std::fs::create_dir_all(&keep).unwrap();
+        let grants = granted(&[&site, &keep]);
+        let started = Arc::new(tokio::sync::Notify::new());
+        let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (go, flag) = (started.clone(), stopped.clone());
+        let exec: Executor = Arc::new(move |_run, _cwd| {
+            let (go, guard) = (go.clone(), Dropped(flag.clone()));
+            Box::pin(async move {
+                let _guard = guard;
+                go.notify_one();
+                std::future::pending::<()>().await;
+                Ok(None)
+            })
+        });
+        let run = folder_run(&site);
+        let revoke = async {
+            started.notified().await;
+            grants.send_replace(Some(vec![keep.to_string_lossy().into_owned()]));
+        };
+        let (report, ()) = tokio::join!(execute_folder_run(&run, &grants, exec), revoke);
+        assert!(!report.ok);
+        assert!(report.error.starts_with(FOLDER_NOT_GRANTED) && report.error.contains("revoked"), "{}", report.error);
+        assert!(stopped.load(std::sync::atomic::Ordering::SeqCst), "the agent outlived the revoke");
+    }
+
+    // The runner learns the granted folders from cloud's answer and checks a claimed run's
+    // dir against them: one inside runs, one outside is reported folder_not_granted.
+    #[tokio::test]
+    async fn the_runner_checks_a_claimed_runs_folder_against_the_beat() {
+        let tmp = tempfile::tempdir().unwrap();
+        let site = tmp.path().join("site");
+        let other = tmp.path().join("other");
+        std::fs::create_dir_all(&site).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let mut outside = folder_run(&other);
+        outside.session_id = "sess_folder_2".into();
+        let mock = MockCloud::start_with_routed_runs(vec![folder_run(&site), outside], false).await;
+        mock.grant(&[&site.to_string_lossy()]);
+        let root = crate::root::Root::at(tmp.path().join("hanzo-root"));
+        let host = Arc::new(StubHost { api: mock.base_url(), org: None });
+        let exec: Executor = Arc::new(|run, _cwd| {
+            Box::pin(async move {
+                anyhow::ensure!(run.session_id == "sess_folder_1", "{} ran", run.session_id);
+                Ok(None)
+            })
+        });
+        let held = serve_with(host, &root, "hanzo", &mock.base_url(), "mach_1", "evo", target::grants(), exec);
+        let report = |id: &str| {
+            let path = format!("/v1/agent/targets/tgt_mock/runs/{id}/report");
+            mock.requests().into_iter().find(|r| r.path == path).map(|r| r.json())
+        };
+        until("both reports", || report("sess_folder_1").is_some() && report("sess_folder_2").is_some()).await;
+        drop(held);
+        assert_eq!(report("sess_folder_1").unwrap()["ok"], true);
+        let denied = report("sess_folder_2").unwrap();
+        assert_eq!(denied["ok"], false);
+        assert!(denied["error"].as_str().unwrap().starts_with(FOLDER_NOT_GRANTED), "{denied}");
     }
 }

@@ -27,6 +27,7 @@ sandbox run`, so every launcher takes the same flags and runs `hanzo_gen::run`.
 | `src/kit.rs` | the org's kit: skills written where the backend reads them, cloud tools as one MCP server. |
 | `src/session.rs`, `event.rs`, `control.rs` | `/v1/agents/sessions` client, event vocabulary, remote steer/stop. |
 | `src/target.rs`, `context.rs`, `sample.rs` | run-target registry + heartbeat (`beat`, `present`), machine snapshot, live metrics. `hanzo up` and `hanzo link` use them too. |
+| `src/runner.rs` | routed runs: claim, run, report (`serve`, `beat_and_serve`). A run in its own checkout, or in place in a granted folder (below). |
 | `src/harness.rs`, `settings.rs`, `native.rs` | connected accounts + usage line, `~/.hanzo/settings.json`, native agent sign-in table (`hanzo auth login` reads it). |
 | `src/summary.rs`, `savings.rs`, `ledger.rs` | end-of-session block; prices/tallies/meter rows/number formatting (the console uses them too); MCP tool-call ledger. |
 | `src/private.rs` | THE owner-only atomic file write (`write`, `create`). The CLI writes its credential store and config through it. |
@@ -68,6 +69,22 @@ pub trait Host: Send + Sync {
 The brand rides everything a token is asked for: the session's account, the
 refresh command codex-grammar agents re-run (`auth.command`/`auth.args`), and the
 run-target beat. It must name the token's owner (the CLI), never `gen` itself.
+
+## Runs in a granted folder (hanzo-inc/app#310)
+
+A claimed run with `dir` works IN PLACE in that folder: no clone, no `git init`, no
+commit or push, nothing removed after; the agent's cwd (codex's workspace-write
+root) is the folder. Every target answer (register, heartbeat) carries `folders`,
+the owner's active grants; `beat_and_serve` shares them with the runner as
+`target::Grants`, kept from the last answer. Before anything runs, `runner::inside`
+real-paths `dir` and each grant (`canonicalize`: symlinks, `..`, `/proc` links) and
+requires the dir to be a directory equal to or under a grant that exists on disk;
+otherwise the run reports `ok:false`, `error: "folder_not_granted: …"` and nothing
+executes. A beat whose answer no longer covers a running run's folder stops it: the
+run's future is dropped, and `run_turn`'s `kill_on_drop` kills the agent (SIGKILL,
+the same end a time limit gives), reported `folder_not_granted: … was revoked`. A
+bind mount under a grant is inside it, as the path says. A run without `dir` is
+unchanged.
 
 ## Where state lives
 

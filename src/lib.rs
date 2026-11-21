@@ -1393,7 +1393,8 @@ async fn run_turn(
     control: Option<&mut tokio::sync::mpsc::Receiver<Command>>,
 ) -> Result<(Outcome, bool, Option<Act>)> {
     let Launch { mut command, cleanup } = launch;
-    command.stdin(Stdio::inherit()).stderr(Stdio::inherit());
+    // A run given up on (its time limit, its folder revoked) takes its agent with it.
+    command.stdin(Stdio::inherit()).stderr(Stdio::inherit()).kill_on_drop(true);
     if structured {
         command.stdout(Stdio::piped());
     } else {

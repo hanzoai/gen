@@ -74,6 +74,9 @@ struct Config {
     /// Answer 503 to the first this-many requests, then serve normally.
     refuse_first: usize,
     refused: Arc<std::sync::atomic::AtomicUsize>,
+    /// The folders every target answer carries as granted; a test changes them
+    /// with [`MockCloud::grant`].
+    folders: Arc<Mutex<Vec<String>>>,
 }
 
 /// The ordinary control plane: everything succeeds. Each constructor below
@@ -95,6 +98,7 @@ impl Default for Config {
             reject_first_key: false,
             refuse_first: 0,
             refused: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            folders: Arc::new(Mutex::new(Vec::new())),
         }
     }
 }
@@ -102,6 +106,7 @@ impl Default for Config {
 pub struct MockCloud {
     port: u16,
     requests: Arc<Mutex<Vec<Recorded>>>,
+    folders: Arc<Mutex<Vec<String>>>,
 }
 
 impl MockCloud {
@@ -173,6 +178,7 @@ impl MockCloud {
         let port = listener.local_addr().unwrap().port();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let reqs = requests.clone();
+        let folders = cfg.folders.clone();
         tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else { break };
@@ -181,7 +187,7 @@ impl MockCloud {
                 tokio::spawn(async move { serve_conn(stream, reqs, cfg).await });
             }
         });
-        MockCloud { port, requests }
+        MockCloud { port, requests, folders }
     }
 
 
@@ -204,6 +210,11 @@ impl MockCloud {
 
     pub fn requests(&self) -> Vec<Recorded> {
         self.requests.lock().unwrap().clone()
+    }
+
+    /// Set the folders the machine's owner has granted, as the next target answer says.
+    pub fn grant(&self, folders: &[&str]) {
+        *self.folders.lock().unwrap() = folders.iter().map(|f| f.to_string()).collect();
     }
 }
 
@@ -325,10 +336,11 @@ fn respond(cfg: &Config, method: &str, path: &str, bearer: bool, claim_key: Opti
         );
     }
     // run-target register (upsert-by-host) -> a targetView with an id.
+    let folders = serde_json::to_string(&*cfg.folders.lock().unwrap()).unwrap();
     if method == "POST" && path == "/v1/agent/targets" {
         return (
             "201 Created".into(),
-            r#"{"id":"tgt_mock","label":"evo","kind":"gpu","status":"online","sessions":0,"running":0}"#.to_string(),
+            format!(r#"{{"id":"tgt_mock","label":"evo","kind":"gpu","status":"online","sessions":0,"running":0,"folders":{folders}}}"#),
         );
     }
     // target claim-key mint -> 200 {"targetId", "claimKey"}
@@ -366,7 +378,7 @@ fn respond(cfg: &Config, method: &str, path: &str, bearer: bool, claim_key: Opti
         let id = path.trim_start_matches("/v1/agent/targets/");
         return (
             "200 OK".into(),
-            format!(r#"{{"id":"{id}","label":"evo","kind":"gpu","status":"online","sessions":0,"running":0}}"#),
+            format!(r#"{{"id":"{id}","label":"evo","kind":"gpu","status":"online","sessions":0,"running":0,"folders":{folders}}}"#),
         );
     }
     // Control drain -> the commands newer than ?after=, oldest first, plus the
