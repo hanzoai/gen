@@ -1,5 +1,7 @@
 # Hanzo Gen
 
+[![Open in Hanzo](https://hanzo.app/badges/open-in-hanzo.svg)](https://hanzo.app/dev/open?repo=github.com/hanzoai/gen&ref=main&action=open) [![Edit with Hanzo](https://hanzo.app/badges/edit-with-hanzo.svg)](https://hanzo.app/dev/open?repo=github.com/hanzoai/gen&ref=main&action=edit) [![Deploy with Hanzo](https://hanzo.app/badges/deploy-with-hanzo.svg)](https://hanzo.app/dev/open?repo=github.com/hanzoai/gen&ref=main&action=deploy)
+
 The agentic harness. `gen` launches a coding agent in your terminal with the
 Hanzo MCP toolset attached, routes its model calls through api.hanzo.ai, and
 streams the session live to mission control. Hanzo Dev is the default agent;
