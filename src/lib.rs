@@ -187,8 +187,11 @@ enum Cred {
 /// COMPILED IN, so every already-installed binary keeps asking for `enso` and no
 /// deploy of ours can reach them. The catalog's transitional entry may not be
 /// removed until those have aged out.
-/// The longest a run waits for the cloud to register its session before it starts unlinked.
-const LINK_WAIT: Duration = Duration::from_secs(2);
+/// The longest a linked run keeps trying to register its session before it fails.
+const REGISTER_WITHIN: Duration = Duration::from_secs(30);
+
+/// The first wait between registration attempts; each next one doubles it.
+const REGISTER_WAIT: Duration = Duration::from_millis(500);
 
 pub(crate) const DEFAULT_MODEL: &str = "enso-auto";
 pub(crate) const DEFAULT_SMALL_FAST_MODEL: &str = "enso-flash";
@@ -636,8 +639,9 @@ pub async fn run(host: Arc<dyn Host>, opts: Options) -> Result<()> {
 
     // The org's kit and the cloud session are two reads of the cloud that nothing
     // between them depends on, and the backend does not start until both are in:
-    // they are asked together, and the session only for as long as LINK_WAIT. A
-    // cloud that answers slowly costs a run its link and never its first model call.
+    // they are asked together. A linked run never starts without its session: the
+    // registration is retried with backoff and fails the run, saying why, if the cloud
+    // does not answer.
     //
     // The kit is the skills an admin activated (and the person left on) written
     // where THIS backend reads them — which for Claude is the home the route just
@@ -665,30 +669,16 @@ pub async fn run(host: Arc<dyn Host>, opts: Options) -> Result<()> {
     // Cloud session (linked only). Resolve reuses a non-terminal resumed session
     // (same id) or forks a new one off a terminal / fresh session.
     let link = async {
-        let c = client.as_ref()?;
+        let Some(c) = client.as_ref() else { return Ok(None) };
         let title = session_title(&opts);
-        let registered = tokio::time::timeout(LINK_WAIT, async {
-            let (id, forked_from) = resolve_cloud_session(c, &snapshot, &title, resume_from.as_deref()).await?;
-            // The "where it runs" context snapshot (no secrets).
-            let _ = c.event(&id, Kind::Status, snapshot.context_payload(forked_from.as_deref())).await;
-            Ok::<_, anyhow::Error>(id)
-        })
-        .await;
-        match registered {
-            Ok(Ok(id)) => Some(id),
-            // Fail-open for availability: never block the dev's work on a
-            // cloud hiccup — degrade to a local (unlinked) run.
-            Ok(Err(e)) => {
-                crate::warn(&format!("could not register session ({e}); continuing locally."));
-                None
-            }
-            Err(_) => {
-                crate::warn(&format!("the cloud did not register the session in {}s; continuing locally.", LINK_WAIT.as_secs()));
-                None
-            }
-        }
+        let (id, forked_from) =
+            register_session(c, &snapshot, &title, resume_from.as_deref(), REGISTER_WITHIN, REGISTER_WAIT).await?;
+        // The "where it runs" context snapshot (no secrets).
+        let _ = c.event(&id, Kind::Status, snapshot.context_payload(forked_from.as_deref())).await;
+        Ok::<_, anyhow::Error>(Some(id))
     };
     let (equipped, session_id) = tokio::join!(equip, link);
+    let session_id = session_id?;
 
     // Register/refresh this machine as a cloud run-target so mission-control knows
     // WHICH computer the session runs on and whether it can take more work. DETACHED
@@ -1003,6 +993,38 @@ fn preset_session_of(spec: &Spec) -> Option<String> {
 
 // ---- cloud session resolution ----
 
+/// `resolve_cloud_session`, retried with doubling waits until `within` has passed: a
+/// linked run starts only with its session, so a cloud that is briefly not ready delays
+/// the run and one that stays away fails it, saying why and how to run without a link.
+pub(crate) async fn register_session(
+    client: &SessionClient,
+    snapshot: &Snapshot,
+    title: &str,
+    resume_from: Option<&str>,
+    within: Duration,
+    first_wait: Duration,
+) -> Result<(String, Option<String>)> {
+    let mut last = String::new();
+    let tried = tokio::time::timeout(within, async {
+        let mut wait = first_wait;
+        loop {
+            match resolve_cloud_session(client, snapshot, title, resume_from).await {
+                Ok(registered) => return registered,
+                Err(e) => last = format!("{e:#}"),
+            }
+            tokio::time::sleep(wait).await;
+            wait *= 2;
+        }
+    })
+    .await;
+    tried.map_err(|_| {
+        anyhow!(
+            "the cloud did not register the session in {}s ({last}); try again, or pass --no-link to work without a session",
+            within.as_secs()
+        )
+    })
+}
+
 /// Resolve the cloud session id for this run. Fresh runs register a new session.
 /// A resume reuses the SAME id when the prior session is still live (running/
 /// paused) — cloud forbids reopening a terminal one — otherwise it forks a new
@@ -1129,8 +1151,30 @@ const LOOP_MARK: &str = "repeated identical tool-use cycle detected";
 /// The longest call a change-of-course message repeats.
 const CALL_MAX: usize = 300;
 
-/// How many times a run is told to change course before the guard's end stands.
-const MAX_COURSE_CHANGES: u8 = 2;
+/// How many times a run is nudged on before its end stands, whatever stopped it.
+const MAX_NUDGES: u8 = 2;
+
+/// What a task run is told when its turn ended announcing a next step, or asking a
+/// question nobody is there to answer.
+const KEEP_GOING: &str = "Your turn ended without finishing the task, and nobody is here to answer. \
+Carry on with your tools now, and end your turn only with the finished result.";
+
+/// Whether `said` ends a turn on an announcement or an offer instead of a result: a last
+/// line that ends in a colon, or starts "let me", "now I'll", "would you like" and the like.
+fn narrating(said: &str) -> bool {
+    let s = said.trim();
+    if s.ends_with(':') {
+        return true;
+    }
+    let last = s.lines().last().unwrap_or("").trim_start_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
+    [
+        "let me ", "let's ", "now let me", "now let's", "now i'll ", "now i will ", "next i'll ", "next i will ",
+        "next, i'll ", "next, i will ", "i'll now ", "i will now ", "would you like", "do you want me to", "shall i ",
+        "should i ",
+    ]
+    .iter()
+    .any(|p| last.starts_with(p))
+}
 
 /// What a model stopped by the loop guard is told: the call it repeated and to change it.
 fn change_course(said: &str) -> String {
@@ -1434,7 +1478,7 @@ async fn supervise(
     };
 
     let mut acc = Outcome::default();
-    let mut changed_course = 0u8;
+    let mut nudged = 0u8;
     let status = loop {
         let (out, ok, act) =
             run_turn(backend, structured, launch, client.clone(), session_id.clone(), rx.as_mut())
@@ -1475,18 +1519,20 @@ async fn supervise(
             }
             // Uncommanded end: the backend finished (or failed) on its own.
             //
-            // A turn the loop guard stopped is told to change course, up to
-            // MAX_COURSE_CHANGES times; only then does the guard's end stand.
+            // A turn the loop guard stopped, or one that ended announcing a next step,
+            // is nudged in the same conversation, up to MAX_NUDGES times; only then
+            // does its end stand.
             None | Some(Act::Ignore) => {
-                let looped = !ok && said.as_deref().is_some_and(|m| m.contains(LOOP_MARK));
-                if looped && changed_course < MAX_COURSE_CHANGES && acc.backend_session.is_some() {
-                    changed_course += 1;
-                    crate::warn(&format!(
-                        "{} repeated a tool call; telling it to change course ({changed_course}/{MAX_COURSE_CHANGES})",
-                        backend.label()
-                    ));
+                let nudge = match said.as_deref() {
+                    Some(m) if !ok && m.contains(LOOP_MARK) => Some(change_course(m)),
+                    Some(m) if ok && narrating(m) => Some(KEEP_GOING.to_string()),
+                    _ => None,
+                };
+                if let Some(told) = nudge.filter(|_| nudged < MAX_NUDGES && acc.backend_session.is_some()) {
+                    nudged += 1;
+                    crate::warn(&format!("{} stopped short; nudging it on ({nudged}/{MAX_NUDGES})", backend.label()));
                     spec.resume = acc.backend_session.clone();
-                    spec.task = Some(change_course(said.as_deref().unwrap_or("")));
+                    spec.task = Some(told);
                     spec.preset_session = None;
                     launch = backend.build(&spec)?;
                     continue;
@@ -1783,7 +1829,7 @@ mod tests {
 
     /// The "where it runs" value every linked session carries. One fixture, so a
     /// test cannot accidentally assert against a snapshot with no machine in it.
-    fn snapshot(backend: &str) -> Snapshot {
+    pub(crate) fn snapshot(backend: &str) -> Snapshot {
         Snapshot {
             machine_id: "m".into(),
             host: "evo".into(),
@@ -2822,10 +2868,76 @@ mod control_tests {
         // A model that loops again and again is stopped after the bound, with the reason.
         let mock2 = MockCloud::start().await;
         let (out2, status2, built2, _) = supervise_with(&mock2, "sess_loop2", vec![LOOPED]).await;
-        assert_eq!(built2.lock().unwrap().len(), 1 + MAX_COURSE_CHANGES as usize, "told {MAX_COURSE_CHANGES} times, then stopped");
+        assert_eq!(built2.lock().unwrap().len(), 1 + MAX_NUDGES as usize, "told {MAX_NUDGES} times, then stopped");
         assert_eq!(status2, Status::Error);
         let why = reason_of(&Ok((out2, status2)), "claude");
         assert!(why.contains("repeated identical tool-use cycle"), "{why}");
+    }
+
+    /// A linked run starts only with its session: a cloud that is briefly not ready is
+    /// retried with backoff, and one that stays away fails the run saying how to work
+    /// without a link, never an unregistered continue.
+    ///
+    /// MUTATION: return None on a failed registration, as the old code did, and the
+    /// second case reads Ok.
+    #[tokio::test]
+    async fn a_linked_run_registers_its_session_or_fails() {
+        let slow = Duration::from_millis(10);
+        let mock = MockCloud::start_refusing_first(2).await;
+        let client = SessionClient::new(&mock.base_url(), "T").unwrap();
+        let (id, forked) = register_session(&client, &crate::tests::snapshot("claude"), "t", None, Duration::from_secs(5), slow).await.unwrap();
+        assert!(!id.is_empty() && forked.is_none());
+        assert!(mock.requests().len() >= 3, "the refused attempts were retried: {}", mock.requests().len());
+
+        let down = MockCloud::start_status(503).await;
+        let client = SessionClient::new(&down.base_url(), "T").unwrap();
+        let err = register_session(&client, &crate::tests::snapshot("claude"), "t", None, Duration::from_millis(300), slow).await.unwrap_err();
+        let said = format!("{err:#}");
+        assert!(said.contains("did not register") && said.contains("--no-link"), "{said}");
+    }
+
+    /// A task run whose turn ends announcing a next step is told to carry on, in the same
+    /// conversation, and finishes; one that announces every time is let go after the bound.
+    ///
+    /// MUTATION: drop the `narrating` arm in `supervise` and the first run ends after one turn.
+    #[tokio::test]
+    async fn a_task_run_that_ends_announcing_is_told_to_carry_on() {
+        const ANNOUNCES: &str = concat!(
+            r#"echo '{"type":"system","subtype":"init","session_id":"bsid-1","model":"m"}'; "#,
+            r#"echo '{"type":"result","subtype":"success","is_error":false,"session_id":"bsid-1","result":"I read the build file. Now let me read the workflow:","num_turns":1}'"#,
+        );
+        const FINISHES: &str = concat!(
+            r#"echo '{"type":"system","subtype":"init","session_id":"bsid-1","model":"m"}'; "#,
+            r#"echo '{"type":"result","subtype":"success","is_error":false,"session_id":"bsid-1","result":"The inputs are a and b.","num_turns":1}'"#,
+        );
+        let mock = MockCloud::start().await;
+        let (out, status, built, _) = supervise_with(&mock, "sess_n", vec![ANNOUNCES, FINISHES]).await;
+        let built = built.lock().unwrap().clone();
+        assert_eq!(built.len(), 2, "the announcing turn was not followed by another: {built:?}");
+        assert_eq!(built[1].0.as_deref(), Some("bsid-1"), "the same conversation");
+        assert!(built[1].1.as_deref().unwrap().contains("nobody is here"), "{:?}", built[1].1);
+        assert_eq!(status, Status::Done);
+        assert_eq!(out.final_summary.as_deref(), Some("The inputs are a and b."));
+
+        let mock2 = MockCloud::start().await;
+        let (_, status2, built2, _) = supervise_with(&mock2, "sess_n2", vec![ANNOUNCES]).await;
+        assert_eq!(built2.lock().unwrap().len(), 1 + MAX_NUDGES as usize, "told {MAX_NUDGES} times, then let go");
+        assert_eq!(status2, Status::Done);
+
+        // A finished answer is not nudged.
+        let mock3 = MockCloud::start().await;
+        let (_, _, built3, _) = supervise_with(&mock3, "sess_n3", vec![FINISHES]).await;
+        assert_eq!(built3.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn narrating_is_an_announcement_or_an_offer() {
+        for yes in ["Now let me read the workflow:", "Done reading.\nLet me know if you want more.", "- Now I'll run it", "Would you like me to go on?"] {
+            assert!(narrating(yes), "{yes}");
+        }
+        for no in ["The inputs are a and b.", "No change needed.", ""] {
+            assert!(!narrating(no), "{no}");
+        }
     }
 
     /// `message` steers: the child is interrupted, then the SAME conversation
