@@ -198,13 +198,8 @@ impl Backend for Agent {
             Route::Inherit => {}
         }
 
-        // A task run has nobody to answer. Left to itself the agent reads a few files
-        // and ends its turn asking whether to go on ("would you like me to ..."), which
-        // a scripted run reads as done: ten read-the-repository tasks on public
-        // repositories took a median of 2 tool calls (4 on the released CLI) before
-        // the turn ended. Told that nobody is there, the same ten took a median of 5.5,
-        // so a task run says so, unless the caller named developer instructions of
-        // their own.
+        // A task run has nobody to answer, so it is told so, unless the caller named
+        // developer instructions of their own.
         let own = spec.passthrough.iter().any(|a| a.starts_with("developer_instructions="));
         if headless && spec.task.is_some() && !own {
             args.push("-c".into());
