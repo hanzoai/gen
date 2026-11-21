@@ -65,6 +65,24 @@ pub struct RoutedRun {
     pub effort: String,
     #[serde(default)]
     pub instructions: String,
+    /// The run's own key to its repository, when the repository is one this machine
+    /// holds no credential for, and the forge's host key to check it against. Held for
+    /// the run and not after it.
+    #[serde(default)]
+    pub deploy_key: Secret,
+    #[serde(default)]
+    pub known_hosts: String,
+}
+
+/// A secret that a debug line leaves out.
+#[derive(Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct Secret(String);
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret(..)")
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -498,8 +516,18 @@ pub async fn execute_workspace_run(work_dir: &Path, run: &RoutedRun, executor: E
     let has_repo = !run.clone_url.trim().is_empty();
     let mut base_sha = String::new();
 
+    let access = if has_repo && !run.deploy_key.0.is_empty() {
+        match Access::make(work_dir, &run.deploy_key.0, &run.known_hosts) {
+            Ok(a) => Some(a),
+            Err(e) => return failure_report(&run.branch, format!("workspace setup failed: {e}")),
+        }
+    } else {
+        None
+    };
+
     if has_repo {
-        if let Err(e) = prepare_git_workspace(work_dir, &run.clone_url, &run.base, &run.branch).await {
+        let ssh = access.as_ref().map(|a| a.ssh.as_str());
+        if let Err(e) = prepare_git_workspace(work_dir, &run.clone_url, &run.base, &run.branch, ssh).await {
             return failure_report(&run.branch, format!("workspace setup failed: {e}"));
         }
         base_sha = git_stdout(work_dir, &["rev-parse", "HEAD"]).await.unwrap_or_default();
@@ -569,6 +597,53 @@ pub async fn execute_workspace_run(work_dir: &Path, run: &RoutedRun, executor: E
     }
 }
 
+/// A run's deploy key and the host key it is checked against, on disk for the run:
+/// the directory goes when the value does.
+struct Access {
+    dir: PathBuf,
+    ssh: String,
+}
+
+impl Access {
+    fn make(work_dir: &Path, key: &str, known_hosts: &str) -> Result<Access> {
+        let dir = PathBuf::from(format!("{}.ssh", work_dir.display()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).context("creating the key directory")?;
+        let mut access = Access { dir, ssh: String::new() };
+        let key_file = access.dir.join("key");
+        let hosts_file = access.dir.join("known_hosts");
+        write_private(&key_file, &format!("{}\n", key.trim_end()))?;
+        write_private(&hosts_file, &format!("{}\n", known_hosts.trim_end()))?;
+        access.ssh = format!(
+            "ssh -i {} -o IdentitiesOnly=yes -o UserKnownHostsFile={} -o StrictHostKeyChecking=yes -o BatchMode=yes",
+            quoted(&key_file),
+            quoted(&hosts_file),
+        );
+        Ok(access)
+    }
+}
+
+impl Drop for Access {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+fn quoted(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\\', "/").replace('\'', "'\\''"))
+}
+
+fn write_private(path: &Path, text: &str) -> Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options.open(path).with_context(|| format!("writing {}", path.display()))?;
+    file.write_all(text.as_bytes())?;
+    Ok(())
+}
+
 fn failure_report(branch: &str, err: String) -> RunReport {
     RunReport {
         ok: false,
@@ -581,23 +656,26 @@ fn failure_report(branch: &str, err: String) -> RunReport {
     }
 }
 
-async fn prepare_git_workspace(work_dir: &Path, clone_url: &str, base: &str, branch: &str) -> Result<()> {
+async fn prepare_git_workspace(work_dir: &Path, clone_url: &str, base: &str, branch: &str, ssh: Option<&str>) -> Result<()> {
     let base = base.trim();
+    let dest = work_dir.to_string_lossy();
     let cloned = if !base.is_empty() {
-        run_git(None, &["clone", "--branch", base, clone_url, &work_dir.to_string_lossy()]).await
+        clone(ssh, &["--branch", base], clone_url, &dest).await
     } else {
         Err(anyhow!("no explicit base branch"))
     };
     if cloned.is_err() {
         let _ = std::fs::remove_dir_all(work_dir);
-        run_git(None, &["clone", clone_url, &work_dir.to_string_lossy()])
-            .await
-            .context("git clone failed")?;
+        clone(ssh, &[], clone_url, &dest).await.context("git clone failed")?;
         if !base.is_empty() {
             run_git(Some(work_dir), &["checkout", base])
                 .await
                 .with_context(|| format!("git checkout {base} failed"))?;
         }
+    }
+    // The key serves the pushes after the clone too, the agent's own among them.
+    if let Some(s) = ssh {
+        run_git(Some(work_dir), &["config", "core.sshCommand", s]).await?;
     }
 
     if git_stdout(work_dir, &["config", "user.email"]).await.unwrap_or_default().is_empty() {
@@ -614,6 +692,19 @@ async fn prepare_git_workspace(work_dir: &Path, clone_url: &str, base: &str, bra
             .with_context(|| format!("git checkout -B {branch} failed"))?;
     }
     Ok(())
+}
+
+/// `git clone`, through the run's own key when it has one.
+async fn clone(ssh: Option<&str>, options: &[&str], url: &str, dest: &str) -> Result<String> {
+    let through = ssh.map(|s| format!("core.sshCommand={s}"));
+    let mut args: Vec<&str> = Vec::new();
+    if let Some(t) = &through {
+        args.extend(["-c", t]);
+    }
+    args.push("clone");
+    args.extend(options);
+    args.extend([url, dest]);
+    run_git(None, &args).await
 }
 
 async fn finalize_git_changes(work_dir: &Path, base_sha: &str, branch: &str) -> Result<Option<(String, String)>> {
@@ -764,6 +855,8 @@ mod tests {
             model: "enso-auto".into(),
             effort: "medium".into(),
             instructions: String::new(),
+            deploy_key: Secret::default(),
+            known_hosts: String::new(),
         };
 
         let mock = MockCloud::start_with_routed_runs(vec![queued], true).await;
@@ -809,6 +902,65 @@ mod tests {
         assert_eq!(pushed_sha, body["commitSha"].as_str().unwrap());
     }
 
+    // A run with its own deploy key clones and pushes through it, and the key is gone
+    // with the run. A local path stands in for the forge: git never asks it for ssh.
+    #[tokio::test]
+    async fn a_runs_deploy_key_is_held_for_the_run_and_removed_after() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origin.git");
+        run_git(None, &["init", "--bare", "--initial-branch=main", &origin.to_string_lossy()]).await.unwrap();
+        let seed = tmp.path().join("seed");
+        run_git(None, &["clone", &origin.to_string_lossy(), &seed.to_string_lossy()]).await.unwrap();
+        run_git(Some(&seed), &["config", "user.email", "t@hanzo.ai"]).await.unwrap();
+        run_git(Some(&seed), &["config", "user.name", "T"]).await.unwrap();
+        std::fs::write(seed.join("a"), "a\n").unwrap();
+        run_git(Some(&seed), &["add", "."]).await.unwrap();
+        run_git(Some(&seed), &["commit", "-m", "init"]).await.unwrap();
+        run_git(Some(&seed), &["push", "origin", "HEAD:refs/heads/main"]).await.unwrap();
+
+        let work_dir = tmp.path().join("workspace");
+        let keys = tmp.path().join("workspace.ssh");
+        let run = RoutedRun {
+            session_id: "sess_key_1".into(),
+            repo: "api".into(),
+            project: String::new(),
+            base: "main".into(),
+            branch: "agent/key".into(),
+            prompt: "x".into(),
+            clone_url: origin.to_string_lossy().to_string(),
+            timeout_seconds: 30,
+            model: String::new(),
+            effort: String::new(),
+            instructions: String::new(),
+            deploy_key: serde_json::from_str("\"PRIVATE-KEY\"").unwrap(),
+            known_hosts: "git.test ssh-ed25519 AAAA".into(),
+        };
+        let seen = keys.clone();
+        let exec: Executor = Arc::new(move |_run, cwd| {
+            let keys = seen.clone();
+            Box::pin(async move {
+                let key = std::fs::read_to_string(keys.join("key"))?;
+                anyhow::ensure!(key.trim() == "PRIVATE-KEY", "the key was not written");
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mode = std::fs::metadata(keys.join("key"))?.permissions().mode() & 0o777;
+                    anyhow::ensure!(mode == 0o600, "the key is mode {mode:o}");
+                }
+                let through = git_stdout(&cwd, &["config", "core.sshCommand"]).await?;
+                anyhow::ensure!(through.contains("IdentitiesOnly=yes") && through.contains("StrictHostKeyChecking=yes"), "{through}");
+                std::fs::write(cwd.join("b"), "b\n")?;
+                Ok(None)
+            })
+        });
+        let report = execute_workspace_run(&work_dir, &run, exec).await;
+        assert!(report.ok, "{}", report.error);
+        assert!(report.changed);
+        assert!(!keys.exists(), "the key outlived its run");
+        assert_eq!(format!("{:?}", run.deploy_key), "Secret(..)");
+        assert!(!format!("{run:?}").contains("PRIVATE-KEY"));
+    }
+
     // A run with no repository still works in a directory the agent accepts: Hanzo Dev
     // (codex exec) refuses one that is not inside a git work tree and exits at once, which is
     // how every bare run on a linked machine ended in an error nobody read.
@@ -828,6 +980,8 @@ mod tests {
             model: "enso-auto".into(),
             effort: "medium".into(),
             instructions: String::new(),
+            deploy_key: Secret::default(),
+            known_hosts: String::new(),
         };
         let exec: Executor = Arc::new(|_run, cwd| {
             Box::pin(async move {
@@ -857,6 +1011,8 @@ mod tests {
             model: "enso-auto".into(),
             effort: "medium".into(),
             instructions: String::new(),
+            deploy_key: Secret::default(),
+            known_hosts: String::new(),
         };
         let exec: Executor = Arc::new(|r, _cwd| {
             Box::pin(async move {
