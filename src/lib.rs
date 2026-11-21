@@ -772,7 +772,8 @@ pub async fn run(host: Arc<dyn Host>, opts: Options) -> Result<()> {
                     .as_ref()
                     .and_then(|bs| backend.transcript_path(&root, &route, &cwd, bs))
                     .map(|p| p.display().to_string());
-                finalize(c, id, &outcome, status, &snapshot, &api, &who, transcript, &root).await;
+                let reason = (status == Status::Error).then(|| reason_of(&run, backend.label()));
+                finalize(c, id, &outcome, status, &snapshot, &api, &who, transcript, &root, reason.as_deref()).await;
             }
             spent.end(&*host, &opts.brand, backend.label(), kind == BackendKind::Claude, &outcome.usage, session_id.as_deref(), tools.as_deref().map_err(String::as_str)).await;
             if let Some(id) = &session_id {
@@ -798,7 +799,12 @@ pub async fn run(host: Arc<dyn Host>, opts: Options) -> Result<()> {
                     .and_then(|s| backend.transcript_path(&root, &route, &cwd, s))
                     .map(|p| p.display().to_string());
                 let status = interactive_end(&run, outcome.backend_session.is_some());
-                finalize(c, id, &outcome, status, &snapshot, &api, &who, transcript, &root).await;
+                let reason = match (&run, status) {
+                    (Err(e), Status::Error) => Some(cut(&format!("{e:#}"), 600)),
+                    (_, Status::Error) => Some(format!("{} ended without starting", backend.label())),
+                    _ => None,
+                };
+                finalize(c, id, &outcome, status, &snapshot, &api, &who, transcript, &root, reason.as_deref()).await;
             }
             // The tool's own screen was the stream, so nothing was reported here.
             spent.end(&*host, &opts.brand, backend.label(), kind == BackendKind::Claude, &Usage::default(), session_id.as_deref(), tools.as_deref().map_err(String::as_str)).await;
@@ -1056,6 +1062,79 @@ pub(crate) struct Outcome {
     pub tool_calls: u64,
     pub saw_error: bool,
     pub final_summary: Option<String>,
+    /// How the backend's process ended when it did not end cleanly: "exited with
+    /// status 101", "was killed by signal 9". The newest turn's; None for a
+    /// process that exited zero. It is the reason a run that failed reports.
+    pub exit: Option<String>,
+}
+
+/// How a finished process ended, when it did not end cleanly. A person's
+/// interrupt is told apart by [`interrupted`], never by this text.
+fn how(status: &std::process::ExitStatus) -> Option<String> {
+    if status.success() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(sig) = status.signal() {
+            return Some(match sig {
+                1 => "was hung up on (SIGHUP)".to_string(),
+                2 => "was interrupted (SIGINT)".to_string(),
+                15 => "was terminated (SIGTERM)".to_string(),
+                9 => "was killed (SIGKILL), which is usually the system running out of memory".to_string(),
+                n => format!("was killed by signal {n}"),
+            });
+        }
+    }
+    Some(match status.code() {
+        Some(c) => format!("exited with status {c}"),
+        None => "ended without an exit status".to_string(),
+    })
+}
+
+/// Whether a process ended because a person ended it: Ctrl-C or a hangup at the
+/// terminal, or the shell's 130/143 for them. That is not a failure, and an
+/// interactive session that ends this way is a session that was ended, not one
+/// that broke.
+fn interrupted(status: &std::process::ExitStatus) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(sig) = status.signal() {
+            return matches!(sig, 1 | 2 | 15);
+        }
+    }
+    matches!(status.code(), Some(130 | 143))
+}
+
+/// Why a headless run ended in error, for the session that says so: the launch
+/// that failed, or how the process ended with the error it reported last. Never
+/// empty: a session in error with no reason is what this is for.
+fn reason_of(run: &Result<(Outcome, Status)>, label: &str) -> String {
+    const MOST: usize = 600;
+    match run {
+        Err(e) => cut(&format!("{e:#}"), MOST),
+        Ok((o, _)) => {
+            let how = o.exit.as_deref().unwrap_or("ended with an error");
+            match o.final_summary.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                Some(said) => cut(&format!("{label} {how}: {said}"), MOST),
+                None => format!("{label} {how}"),
+            }
+        }
+    }
+}
+
+/// `s` cut to at most `n` bytes at a character boundary.
+fn cut(s: &str, n: usize) -> String {
+    if s.len() <= n {
+        return s.to_string();
+    }
+    let mut end = n;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
 }
 
 /// The forward+render sink for a structured event stream. Forwarding fires ONLY
@@ -1199,6 +1278,9 @@ pub(crate) async fn finalize(
     identity: &str,
     transcript_path: Option<String>,
     root: &Root,
+    // Why the run ended in error: sent with the status, so a session in error
+    // always says why. Ignored for any other status.
+    reason: Option<&str>,
 ) {
     if !outcome.usage.is_empty() {
         let mut p = serde_json::to_value(&outcome.usage).unwrap_or_else(|_| json!({}));
@@ -1223,7 +1305,7 @@ pub(crate) async fn finalize(
         let _ = client.event(session_id, Kind::Status, rec.resume_payload()).await;
     }
 
-    let _ = client.set_status(session_id, status).await;
+    let _ = client.set_ended(session_id, status, reason).await;
 }
 
 // ---- process execution ----
@@ -1263,7 +1345,7 @@ async fn run_turn(
     relay.to(pid);
     let mut acted: Option<Act> = None;
 
-    let outcome = match (structured, control) {
+    let mut outcome = match (structured, control) {
         (false, _) => Outcome::default(),
         (true, control) => {
             let stdout = child.stdout.take().expect("piped stdout");
@@ -1304,6 +1386,7 @@ async fn run_turn(
     let status = child.wait().await.context("waiting for backend")?;
     drop(relay);
     drop(cleanup);
+    outcome.exit = how(&status);
     Ok((outcome, status.success(), acted))
 }
 
@@ -1344,6 +1427,7 @@ async fn supervise(
         acc.usage.merge(out.usage);
         acc.tool_calls = acc.tool_calls.saturating_add(out.tool_calls);
         acc.saw_error = out.saw_error;
+        acc.exit = out.exit;
         if out.final_summary.is_some() {
             acc.final_summary = out.final_summary;
         }
@@ -1412,7 +1496,10 @@ async fn run_interactive(
         let _ = h.await;
     }
     drop(cleanup);
-    Ok(status.success())
+    if status.success() || interrupted(&status) {
+        return Ok(true);
+    }
+    Err(anyhow!("{} {}", backend.label(), how(&status).unwrap_or_default()))
 }
 
 /// Follow a Claude transcript JSONL, forwarding newly-appended events to the
@@ -1933,9 +2020,10 @@ mod tests {
             tool_calls: 0,
             saw_error: false,
             final_summary: None,
+            exit: None,
         };
         let root = crate::root::scratch();
-        finalize(&client, "sess_9", &outcome, Status::Done, &snapshot, "https://api.hanzo.ai", "hanzo/z", None, &root).await;
+        finalize(&client, "sess_9", &outcome, Status::Done, &snapshot, "https://api.hanzo.ai", "hanzo/z", None, &root, None).await;
 
         let reqs = mock.requests();
         // usage log event
@@ -1956,13 +2044,78 @@ mod tests {
         let client = SessionClient::new(&mock.base_url(), "T").unwrap();
         let snapshot = snapshot("dev");
         let outcome = Outcome::default();
-        finalize(&client, "sess_i", &outcome, Status::Paused, &snapshot, "https://api.hanzo.ai", "hanzo/z", None, &crate::root::scratch()).await;
+        finalize(&client, "sess_i", &outcome, Status::Paused, &snapshot, "https://api.hanzo.ai", "hanzo/z", None, &crate::root::scratch(), None).await;
         assert!(mock.requests().iter().any(|r| r.method == "PATCH" && r.json()["status"] == "paused"));
 
         let mock2 = MockCloud::start().await;
         let client2 = SessionClient::new(&mock2.base_url(), "T").unwrap();
-        finalize(&client2, "sess_e", &outcome, Status::Error, &snapshot, "https://api.hanzo.ai", "hanzo/z", None, &crate::root::scratch()).await;
+        finalize(&client2, "sess_e", &outcome, Status::Error, &snapshot, "https://api.hanzo.ai", "hanzo/z", None, &crate::root::scratch(), Some("dev exited with status 101")).await;
         assert!(mock2.requests().iter().any(|r| r.method == "PATCH" && r.json()["status"] == "error"));
+        // THE REASON RIDES THE SAME REQUEST AS THE STATUS: a session in error says
+        // why. A week of terminal sessions held 86 errors that said "error" and
+        // nothing else (hanzo-inc/cloud). A status that is not an error takes none.
+        assert!(
+            mock2.requests().iter().any(|r| r.method == "PATCH" && r.json()["error"] == "dev exited with status 101"),
+            "the reason did not reach the PATCH: {:?}",
+            mock2.requests().iter().map(|r| r.json().to_string()).collect::<Vec<_>>()
+        );
+        let mock3 = MockCloud::start().await;
+        let client3 = SessionClient::new(&mock3.base_url(), "T").unwrap();
+        finalize(&client3, "sess_d", &outcome, Status::Done, &snapshot, "https://api.hanzo.ai", "hanzo/z", None, &crate::root::scratch(), Some("not an error")).await;
+        assert!(mock3.requests().iter().all(|r| r.method != "PATCH" || r.json().get("error").is_none()));
+    }
+
+    /// How a process ended is said in words, and a person's interrupt is told
+    /// apart from a failure: Ctrl-C at an interactive session ends it, it does not
+    /// break it.
+    #[cfg(unix)]
+    #[test]
+    fn how_a_process_ended_is_said_and_an_interrupt_is_not_a_failure() {
+        use std::os::unix::process::ExitStatusExt;
+        // A wait status: the exit code in the second byte, or the signal in the low bits.
+        let code = |c: i32| std::process::ExitStatus::from_raw(c << 8);
+        let signal = |n: i32| std::process::ExitStatus::from_raw(n);
+
+        assert_eq!(how(&code(0)), None);
+        assert!(!interrupted(&code(0)));
+
+        let failed = code(101);
+        assert_eq!(how(&failed).as_deref(), Some("exited with status 101"));
+        assert!(!interrupted(&failed), "a crash is not an interrupt");
+
+        let ctrl_c = signal(2);
+        assert_eq!(how(&ctrl_c).as_deref(), Some("was interrupted (SIGINT)"));
+        assert!(interrupted(&ctrl_c));
+        assert!(interrupted(&signal(15)) && interrupted(&signal(1)), "a terminate and a hangup are a person's too");
+        assert!(interrupted(&code(130)) && interrupted(&code(143)), "the shell's spelling of them");
+
+        let killed = signal(9);
+        assert!(how(&killed).unwrap().contains("SIGKILL"), "{:?}", how(&killed));
+        assert!(!interrupted(&killed), "a kill is not a person's interrupt");
+        assert_eq!(how(&signal(11)).as_deref(), Some("was killed by signal 11"));
+    }
+
+    /// A headless run that ended in error reports why: the launch that failed, or
+    /// how the process ended and the last error it reported. Never empty.
+    #[test]
+    fn a_failed_headless_run_reports_a_reason() {
+        let launch_failed: Result<(Outcome, Status)> = Err(anyhow!("the `dev` coding agent is not installed (not on PATH)"));
+        assert!(reason_of(&launch_failed, "dev").contains("not installed"));
+
+        let crashed: Result<(Outcome, Status)> = Ok((Outcome { exit: Some("exited with status 101".into()), ..Default::default() }, Status::Error));
+        assert_eq!(reason_of(&crashed, "dev"), "dev exited with status 101");
+
+        let said: Result<(Outcome, Status)> = Ok((
+            Outcome { exit: Some("exited with status 1".into()), final_summary: Some("stream disconnected before completion".into()), ..Default::default() },
+            Status::Error,
+        ));
+        assert_eq!(reason_of(&said, "dev"), "dev exited with status 1: stream disconnected before completion");
+
+        let nothing: Result<(Outcome, Status)> = Ok((Outcome::default(), Status::Error));
+        assert_eq!(reason_of(&nothing, "dev"), "dev ended with an error");
+
+        let long: Result<(Outcome, Status)> = Ok((Outcome { final_summary: Some("é".repeat(2000)), ..Default::default() }, Status::Error));
+        assert!(reason_of(&long, "dev").len() <= 600, "a reason is bounded, at a character boundary");
     }
 
     /// hanzo-inc/cloud#768: a clean exit suspends a session only when there is a
