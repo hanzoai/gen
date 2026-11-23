@@ -193,6 +193,9 @@ pub enum Routing {
         api: String,
         /// The bearer/key authenticating gateway model calls.
         token: String,
+        /// The active Hanzo organization (`X-Org-Id` / account owner), if known,
+        /// forwarded as `HANZO_ORG` so `hanzo-mcp` scopes cloud calls to the same org.
+        org: Option<String>,
         /// The gateway catalog id for the main model, already resolved by precedence
         /// (`--model`, then exported env, then `~/.hanzo/settings.json`, then the
         /// built-in default). The gateway is the authority on validity — a bad id
@@ -437,18 +440,199 @@ pub fn resolve(kind: BackendKind) -> Box<dyn Backend> {
 }
 
 /// Resolve how to launch hanzo-mcp as a stdio server scoped to `cwd`: the native
-/// binary hanzo.sh installed beside this one, else the first on PATH. Returns
-/// `None` when there is none — MCP is an enhancement, so a missing server never
-/// blocks the session (the caller warns and continues without it). `ledger` is
-/// where the proxy records each tool call for the session summary.
+/// binary hanzo.sh installed beside this one, else `~/.local/bin/hanzo-mcp` under
+/// `root`, else the first on the search path. Returns `None` when there is none.
+pub fn resolve_mcp_in(root: &Root, cwd: &Path, ledger: Option<&Path>) -> Option<McpAttach> {
+    let exe = std::env::current_exe().ok();
+    let program = beside(exe.as_deref(), MCP_BIN)
+        .or_else(|| local_mcp(root))
+        .or_else(|| crate::exe::find(MCP_BIN))?;
+    Some(attach_mcp(program, exe, cwd, ledger))
+}
+
+/// Resolve how to launch hanzo-mcp as a stdio server scoped to `cwd`: the native
+/// binary hanzo.sh installed beside this one, else the first on the search path.
+/// Returns `None` when there is none — MCP is an enhancement, so a missing server
+/// never blocks the session (the caller warns and continues without it). `ledger`
+/// is where the proxy records each tool call for the session summary.
 pub fn resolve_mcp(cwd: &Path, ledger: Option<&Path>) -> Option<McpAttach> {
     let exe = std::env::current_exe().ok();
     let program = beside(exe.as_deref(), MCP_BIN).or_else(|| crate::exe::find(MCP_BIN))?;
+    Some(attach_mcp(program, exe, cwd, ledger))
+}
+
+/// Resolve `hanzo-mcp` if already present, or auto-bootstrap the verified native
+/// release binary into `<root>/.local/bin/hanzo-mcp` on first run so `hanzo`
+/// always has the full native toolset out of the box.
+pub async fn resolve_or_install_mcp(root: &Root, cwd: &Path, ledger: Option<&Path>) -> Option<McpAttach> {
+    if let Some(found) = resolve_mcp_in(root, cwd, ledger) {
+        return Some(found);
+    }
+    let installed = ensure_mcp_installed(root).await?;
+    let exe = std::env::current_exe().ok();
+    Some(attach_mcp(installed, exe, cwd, ledger))
+}
+
+fn attach_mcp(program: PathBuf, exe: Option<PathBuf>, cwd: &Path, ledger: Option<&Path>) -> McpAttach {
     let direct = McpAttach {
         program: program.display().to_string(),
         args: vec!["--project-dir".into(), cwd.display().to_string()],
     };
-    Some(lazy(direct, exe, ledger))
+    lazy(direct, exe, ledger)
+}
+
+fn local_mcp(root: &Root) -> Option<PathBuf> {
+    let p = root.home().join(".local").join("bin").join(MCP_BIN);
+    p.is_file().then_some(p)
+}
+
+/// Default release download base for `hanzo-mcp`.
+#[cfg(not(test))]
+const MCP_RELEASE_BASE: &str = "https://github.com/hanzoai/mcp/releases/latest/download";
+
+/// Map `(std::env::consts::OS, std::env::consts::ARCH)` to the published
+/// `hanzoai/mcp` release target name (matching `hanzo.sh` and `cli/npm/install.js`).
+pub fn mcp_release_target(os: &str, arch: &str) -> Option<&'static str> {
+    match (os, arch) {
+        ("linux", "x86_64") => Some("linux-amd64"),
+        ("linux", "aarch64") => Some("linux-arm64"),
+        ("macos", "x86_64") => Some("darwin-amd64"),
+        ("macos", "aarch64") => Some("darwin-arm64"),
+        ("windows", "x86_64") => Some("windows-amd64"),
+        _ => None,
+    }
+}
+
+/// Ensure `hanzo-mcp` is installed under `<root>/.local/bin/hanzo-mcp` during a
+/// real user session when `HANZO_NO_AUTO_MCP != "1"` and `root` is writable.
+#[cfg(not(test))]
+pub async fn ensure_mcp_installed(root: &Root) -> Option<PathBuf> {
+    if matches!(
+        std::env::var("HANZO_NO_AUTO_MCP").ok().as_deref(),
+        Some("1" | "true")
+    ) {
+        return None;
+    }
+    if !root.home().is_dir() || super::kit::private_dir(&root.hanzo()).is_err() {
+        return None;
+    }
+    let target = mcp_release_target(std::env::consts::OS, std::env::consts::ARCH)?;
+    let base = std::env::var("HANZO_MCP_RELEASE_URL")
+        .ok()
+        .filter(|u| !u.trim().is_empty())
+        .unwrap_or_else(|| MCP_RELEASE_BASE.to_string());
+    match ensure_mcp_installed_from(root, &base, target).await {
+        Ok(path) => Some(path),
+        Err(e) => {
+            crate::warn(&format!("could not auto-install hanzo-mcp ({e})"));
+            None
+        }
+    }
+}
+
+/// Unit tests never make unmocked downloads; tests exercise [`ensure_mcp_installed_from`]
+/// directly against a local loopback server.
+#[cfg(test)]
+pub async fn ensure_mcp_installed(_root: &Root) -> Option<PathBuf> {
+    None
+}
+
+/// Download `hanzo-mcp-<target>.tar.gz` + `.sha256` from `base_url`, verify its
+/// SHA-256 digest BEFORE unpacking, and install atomically to
+/// `<root>/.local/bin/hanzo-mcp` (mode `0755`).
+pub async fn ensure_mcp_installed_from(root: &Root, base_url: &str, target: &str) -> Result<PathBuf> {
+    use anyhow::{bail, Context};
+    use sha2::{Digest, Sha256};
+
+    if !root.home().is_dir() {
+        bail!("root directory {} does not exist", root.home().display());
+    }
+    let bin_dir = root.home().join(".local").join("bin");
+    std::fs::create_dir_all(&bin_dir)
+        .with_context(|| format!("creating {}", bin_dir.display()))?;
+
+    let asset = format!("hanzo-mcp-{target}.tar.gz");
+    let url = format!("{}/{asset}", base_url.trim_end_matches('/'));
+    let sha_url = format!("{url}.sha256");
+
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(45))
+        .build()
+        .context("building HTTP client for hanzo-mcp bootstrap")?;
+
+    let sum_bytes = client
+        .get(&sha_url)
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .with_context(|| format!("downloading {sha_url}"))?
+        .bytes()
+        .await
+        .with_context(|| format!("reading {sha_url}"))?;
+    let want = String::from_utf8_lossy(&sum_bytes)
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if want.len() != 64 || !want.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!("{asset}.sha256 is not a valid SHA-256 digest");
+    }
+
+    let tarball = client
+        .get(&url)
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .with_context(|| format!("downloading {url}"))?
+        .bytes()
+        .await
+        .with_context(|| format!("reading {url}"))?;
+    let got = format!("{:x}", Sha256::digest(&tarball));
+    if got != want {
+        bail!("{asset} SHA-256 mismatch (expected {want}, got {got})");
+    }
+
+    let exe_name = if target.starts_with("windows") { "hanzo-mcp.exe" } else { "hanzo-mcp" };
+    let staged = bin_dir.join(format!(".{exe_name}.{:016x}.tmp", rand::random::<u64>()));
+    let unpack_res = (|| -> Result<()> {
+        let mut found = false;
+        let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(&tarball[..]));
+        for entry in archive.entries().context("reading hanzo-mcp archive")? {
+            let mut entry = entry.context("reading hanzo-mcp archive entry")?;
+            let matches = entry
+                .path()
+                .ok()
+                .and_then(|p| p.file_name().map(|n| n == exe_name))
+                .unwrap_or(false);
+            if matches {
+                entry.unpack(&staged).with_context(|| format!("unpacking {exe_name}"))?;
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            bail!("{asset} did not contain {exe_name}");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))
+                .with_context(|| format!("setting mode 0755 on {}", staged.display()))?;
+        }
+        Ok(())
+    })();
+    if let Err(e) = unpack_res {
+        let _ = std::fs::remove_file(&staged);
+        return Err(e);
+    }
+
+    let dest = bin_dir.join(exe_name);
+    if let Err(e) = std::fs::rename(&staged, &dest) {
+        let _ = std::fs::remove_file(&staged);
+        return Err(e).with_context(|| format!("installing {}", dest.display()));
+    }
+    Ok(dest)
 }
 
 /// The MCP server's binary name, as hanzo.sh installs it.
@@ -648,6 +832,7 @@ mod tests {
         let g = Routing::Gateway {
             api: "https://api.hanzo.ai".into(),
             token: "sk-SECRET-TOKEN".into(),
+            org: Some("hanzo".into()),
             model: "enso".into(),
             small_fast_model: "enso-flash".into(),
             context_window: 1_000_000,
@@ -679,6 +864,7 @@ mod tests {
         let r = Route::Via(Routing::Gateway {
             api: "x".into(),
             token: "sk-INNER".into(),
+            org: None,
             model: "enso".into(),
             small_fast_model: "enso-flash".into(),
             context_window: 1_000_000,
@@ -698,5 +884,94 @@ mod tests {
             .is_some());
         assert!(Route::Inherit.via().is_none());
         assert!(Route::FailClosed.via().is_none());
+    }
+
+    #[test]
+    fn mcp_release_target_matches_published_archive_names() {
+        assert_eq!(mcp_release_target("linux", "x86_64"), Some("linux-amd64"));
+        assert_eq!(mcp_release_target("linux", "aarch64"), Some("linux-arm64"));
+        assert_eq!(mcp_release_target("macos", "x86_64"), Some("darwin-amd64"));
+        assert_eq!(mcp_release_target("macos", "aarch64"), Some("darwin-arm64"));
+        assert_eq!(mcp_release_target("windows", "x86_64"), Some("windows-amd64"));
+        assert_eq!(mcp_release_target("freebsd", "x86_64"), None);
+    }
+
+    fn make_mcp_tarball(exe_name: &str, contents: &[u8]) -> Vec<u8> {
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        {
+            let mut builder = tar::Builder::new(&mut gz);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(contents.len() as u64);
+            header.set_mode(0o755);
+            header.set_cksum();
+            builder.append_data(&mut header, exe_name, contents).unwrap();
+            builder.finish().unwrap();
+        }
+        gz.finish().unwrap()
+    }
+
+    async fn serve_mcp_release(tarball: Vec<u8>, sha_line: String) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else { break };
+                let tarball = tarball.clone();
+                let sha_line = sha_line.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let path = req.lines().next().and_then(|l| l.split_whitespace().nth(1)).unwrap_or("");
+                    let (status, body): (&str, Vec<u8>) = if path.ends_with(".sha256") {
+                        ("200 OK", sha_line.into_bytes())
+                    } else if path.ends_with(".tar.gz") {
+                        ("200 OK", tarball)
+                    } else {
+                        ("404 Not Found", b"not found".to_vec())
+                    };
+                    let head = format!(
+                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    let _ = stream.write_all(&body).await;
+                });
+            }
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    #[tokio::test]
+    async fn ensure_mcp_installed_verifies_sha256_and_installs_atomically() {
+        use sha2::{Digest, Sha256};
+
+        let bin_bytes = b"#!/bin/sh\necho hanzo-mcp-stub\n";
+        let tarball = make_mcp_tarball("hanzo-mcp", bin_bytes);
+        let sum = format!("{:x}  hanzo-mcp-linux-amd64.tar.gz\n", Sha256::digest(&tarball));
+        let base = serve_mcp_release(tarball.clone(), sum).await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = Root::at(dir.path());
+        let installed = ensure_mcp_installed_from(&root, &base, "linux-amd64").await.unwrap();
+        assert_eq!(installed, dir.path().join(".local/bin/hanzo-mcp"));
+        assert_eq!(std::fs::read(&installed).unwrap(), bin_bytes);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&installed).unwrap().permissions().mode() & 0o777, 0o755);
+        }
+
+        // And a tampered checksum is refused without leaving any binary behind.
+        let bad_base = serve_mcp_release(tarball, format!("{}\n", "0".repeat(64))).await;
+        let dir2 = tempfile::tempdir().unwrap();
+        let root2 = Root::at(dir2.path());
+        let err = ensure_mcp_installed_from(&root2, &bad_base, "linux-amd64").await.unwrap_err().to_string();
+        assert!(err.contains("SHA-256 mismatch"), "got: {err}");
+        assert!(!dir2.path().join(".local/bin/hanzo-mcp").exists());
     }
 }

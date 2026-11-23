@@ -68,6 +68,12 @@ struct Config {
     /// The body `GET /v1/tool/kit` answers. `None` is a cloud that serves no kit
     /// yet: a 404, as any unregistered `/v1` route is.
     kit: Option<String>,
+    /// Optional `GET /api/skills?search=...` JSON payload (`None` => 404).
+    hanzoskills_api: Option<String>,
+    /// Optional `GET /search.json` JSON payload (`None` => 404).
+    hanzoskills_index: Option<String>,
+    /// Optional `GET /skills/<slug>/SKILL.md` documents.
+    hanzoskills_docs: Vec<(String, String)>,
     routed_runs: Arc<Mutex<std::collections::VecDeque<crate::runner::RoutedRun>>>,
     key_mints: Arc<std::sync::atomic::AtomicUsize>,
     reject_first_key: bool,
@@ -93,6 +99,9 @@ impl Default for Config {
             control_delay_polls: 0,
             polls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             kit: None,
+            hanzoskills_api: None,
+            hanzoskills_index: None,
+            hanzoskills_docs: Vec::new(),
             routed_runs: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             key_mints: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             reject_first_key: false,
@@ -171,6 +180,32 @@ impl MockCloud {
     /// `POST /v1/mcp` that answers only a caller with a bearer.
     pub async fn start_kit(kit: &str) -> MockCloud {
         Self::with(Config { kit: Some(kit.to_string()), ..Config::default() }).await
+    }
+
+    /// A mock `hanzoskills` REST server answering `GET /api/skills?search=...`.
+    pub async fn start_hanzoskills_api(api_body: &str, docs: &[(&str, &str)]) -> MockCloud {
+        Self::with(Config {
+            hanzoskills_api: Some(api_body.to_string()),
+            hanzoskills_docs: docs.iter().map(|(k, v)| ((*k).to_string(), (*v).to_string())).collect(),
+            ..Config::default()
+        })
+        .await
+    }
+
+    /// A mock `hanzoskills.com` static site (`GET /search.json` + `/skills/<slug>/SKILL.md`),
+    /// optionally paired with an org kit (`GET /v1/tool/kit`).
+    pub async fn start_hanzoskills_site(
+        kit: Option<&str>,
+        search_json: &str,
+        docs: &[(&str, &str)],
+    ) -> MockCloud {
+        Self::with(Config {
+            kit: kit.map(String::from),
+            hanzoskills_index: Some(search_json.to_string()),
+            hanzoskills_docs: docs.iter().map(|(k, v)| ((*k).to_string(), (*v).to_string())).collect(),
+            ..Config::default()
+        })
+        .await
     }
 
     async fn with(cfg: Config) -> MockCloud {
@@ -313,6 +348,28 @@ fn respond(cfg: &Config, method: &str, path: &str, bearer: bool, claim_key: Opti
     if method == "GET" && path == "/v1/tool/kit" {
         return match &cfg.kit {
             Some(body) => ("200 OK".into(), body.clone()),
+            None => ("404 Not Found".into(), r#"{"error":"not found"}"#.to_string()),
+        };
+    }
+    // hanzoskills REST search endpoint (`GET /api/skills?search=...`).
+    if method == "GET" && (path == "/api/skills" || path.starts_with("/api/skills?")) {
+        return match &cfg.hanzoskills_api {
+            Some(body) => ("200 OK".into(), body.clone()),
+            None => ("404 Not Found".into(), r#"{"error":"not found"}"#.to_string()),
+        };
+    }
+    // hanzoskills.com Tier-1 static search index (`GET /search.json`).
+    if method == "GET" && path == "/search.json" {
+        return match &cfg.hanzoskills_index {
+            Some(body) => ("200 OK".into(), body.clone()),
+            None => ("404 Not Found".into(), r#"{"error":"not found"}"#.to_string()),
+        };
+    }
+    // hanzoskills.com Tier-2 skill markdown (`GET /skills/<slug>/SKILL.md`).
+    if method == "GET" && path.starts_with("/skills/") && path.ends_with("/SKILL.md") {
+        let slug = path.trim_start_matches("/skills/").trim_end_matches("/SKILL.md");
+        return match cfg.hanzoskills_docs.iter().find(|(k, _)| k == slug) {
+            Some((_, md)) => ("200 OK".into(), md.clone()),
             None => ("404 Not Found".into(), r#"{"error":"not found"}"#.to_string()),
         };
     }

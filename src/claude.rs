@@ -144,9 +144,16 @@ impl Backend for Claude {
             // > exported `ANTHROPIC_MODEL` > `~/.hanzo/settings.json` > built-in
             // default `enso`). Setting it back to the user's own exported value is a
             // deliberate no-op; a `--model` overrides it, exactly the intended precedence.
-            Route::Via(Routing::Gateway { api, token, model, small_fast_model, context_window }) => {
+            Route::Via(Routing::Gateway { api, token, org, model, small_fast_model, context_window }) => {
                 cmd.env("ANTHROPIC_BASE_URL", api.trim_end_matches('/'));
                 cmd.env("ANTHROPIC_AUTH_TOKEN", token);
+                super::dev::apply_gateway_mcp_env(
+                    &mut cmd,
+                    api,
+                    token,
+                    org.as_deref(),
+                    super::dev::inherited_hanzo_api_key().as_deref(),
+                );
                 // The model, every tiering slot Claude resolves subagents/`/compact`
                 // through, and the picker's labels — one pure map from `tier`, so
                 // carrier mapping and slot precedence have exactly one home.
@@ -202,6 +209,11 @@ impl Backend for Claude {
                 cmd.env_remove("ANTHROPIC_API_KEY");
                 cmd.env_remove("ANTHROPIC_AUTH_TOKEN");
                 cmd.env_remove("ANTHROPIC_BASE_URL");
+                cmd.env_remove("HANZO_USER_KEY");
+                cmd.env_remove("HANZO_API_KEY");
+                cmd.env_remove("HANZO_API_URL");
+                cmd.env_remove("HANZO_API_BASE");
+                cmd.env_remove("HANZO_ORG");
             }
             // `--no-route` (or an unconfigured, signed-out run): Claude uses its
             // OWN account. Leave the child's inherited model-auth exactly as the
@@ -388,7 +400,7 @@ mod tests {
             mode,
             task: Some("do it".into()),
             cwd: PathBuf::from("/tmp/proj"),
-            routing: Route::Via(Routing::Gateway { api: "https://api.hanzo.ai".into(), token: "JWT".into(), model: crate::DEFAULT_MODEL.into(), small_fast_model: crate::DEFAULT_SMALL_FAST_MODEL.into(), context_window: 1_000_000 }),
+            routing: Route::Via(Routing::Gateway { api: "https://api.hanzo.ai".into(), token: "JWT".into(), org: Some("hanzo".into()), model: crate::DEFAULT_MODEL.into(), small_fast_model: crate::DEFAULT_SMALL_FAST_MODEL.into(), context_window: 1_000_000 }),
             // The default is auto-approve ON (the confirmed default).
             approval: Approval::Auto,
             mcp: Some(McpAttach { program: "hanzo-mcp".into(), args: vec!["--project-dir".into(), "/tmp/proj".into()] }),
@@ -412,7 +424,7 @@ mod tests {
     fn the_toolset_is_searched_for_on_the_anthropic_wire_only() {
         let env = |model: &str, mcp: bool| {
             let mut s = spec(Mode::Headless);
-            s.routing = Route::Via(Routing::Gateway { api: "https://api.hanzo.ai".into(), token: "JWT".into(), model: model.into(), small_fast_model: "enso-flash".into(), context_window: 1_000_000 });
+            s.routing = Route::Via(Routing::Gateway { api: "https://api.hanzo.ai".into(), token: "JWT".into(), org: None, model: model.into(), small_fast_model: "enso-flash".into(), context_window: 1_000_000 });
             if !mcp {
                 s.mcp = None;
             }
@@ -524,6 +536,7 @@ mod tests {
         s.routing = Route::Via(Routing::Gateway {
             api: "https://api.hanzo.ai".into(),
             token: "JWT".into(),
+            org: Some("hanzo".into()),
             model: "enso-auto".into(),
             small_fast_model: "enso-flash".into(),
             context_window: 1_000_000,
@@ -536,6 +549,11 @@ mod tests {
             .filter_map(|(k, v)| Some((k.to_string_lossy().to_string(), v?.to_string_lossy().to_string())))
             .collect();
         assert_eq!(env.get("ANTHROPIC_MODEL").map(String::as_str), Some("enso-auto[1m]"));
+        assert_eq!(env.get("HANZO_USER_KEY").map(String::as_str), Some("JWT"));
+        assert_eq!(env.get("HANZO_API_KEY").map(String::as_str), Some("JWT"));
+        assert_eq!(env.get("HANZO_API_URL").map(String::as_str), Some("https://api.hanzo.ai"));
+        assert_eq!(env.get("HANZO_API_BASE").map(String::as_str), Some("https://api.hanzo.ai"));
+        assert_eq!(env.get("HANZO_ORG").map(String::as_str), Some("hanzo"));
     }
 
     /// The `[1m]` extended-context suffix rides ONLY a large-context model at a
@@ -550,6 +568,7 @@ mod tests {
             s.routing = Route::Via(Routing::Gateway {
                 api: "https://api.hanzo.ai".into(),
                 token: "JWT".into(),
+                org: None,
                 model: model.into(),
                 small_fast_model: "enso-flash".into(),
                 context_window: cw,
@@ -704,7 +723,7 @@ mod tests {
 
         let mut s = spec(Mode::Headless);
         s.cwd = dir.path().to_path_buf();
-        s.routing = Route::Via(Routing::Gateway { api: "https://api.hanzo.ai".into(), token: "SECRET-BEARER".into(), model: "enso".into(), small_fast_model: "enso-flash".into(), context_window: 1_000_000 });
+        s.routing = Route::Via(Routing::Gateway { api: "https://api.hanzo.ai".into(), token: "SECRET-BEARER".into(), org: None, model: "enso".into(), small_fast_model: "enso-flash".into(), context_window: 1_000_000 });
         // Default: project_mcp = false (repo is untrusted).
         let l = Claude.build(&s).unwrap();
         let args = argv(&l);
@@ -914,7 +933,7 @@ mod tests {
 
         let mut s = spec(Mode::Headless); // approval = Auto (default)
         s.cwd = dir.path().to_path_buf();
-        s.routing = Route::Via(Routing::Gateway { api: "https://api.hanzo.ai".into(), token: "SECRET-BEARER".into(), model: "enso".into(), small_fast_model: "enso-flash".into(), context_window: 1_000_000 });
+        s.routing = Route::Via(Routing::Gateway { api: "https://api.hanzo.ai".into(), token: "SECRET-BEARER".into(), org: None, model: "enso".into(), small_fast_model: "enso-flash".into(), context_window: 1_000_000 });
         let l = Claude.build(&s).unwrap();
         let args = argv(&l);
 
@@ -947,6 +966,7 @@ mod tests {
         s.routing = Route::Via(Routing::Gateway {
             api: "https://api.hanzo.ai".into(),
             token: "JWT".into(),
+            org: None,
             model: model.into(),
             small_fast_model: small_fast.into(),
             context_window: cw,
@@ -1056,6 +1076,7 @@ mod tests {
         let routed = at(&Route::Via(Routing::Gateway {
             api: "https://api.hanzo.ai".into(),
             token: "JWT".into(),
+            org: None,
             model: "enso".into(),
             small_fast_model: "enso-flash".into(),
             context_window: 1_000_000,

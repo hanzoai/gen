@@ -100,11 +100,17 @@ impl Backend for Agent {
         }
 
         // MCP: additive `-c` overrides (never touches the user's config/login).
+        // `codex-rs` (`rmcp-client`) strips MCP stdio child environments down to
+        // `DEFAULT_ENV_VARS` unless variable names are explicitly listed in
+        // `mcp_servers.hanzo.env_vars`, so list the Hanzo auth/endpoint vars here
+        // (names only — no secret ever enters argv).
         if let Some(mcp) = &spec.mcp {
             args.push("-c".into());
             args.push(cfg_string("mcp_servers.hanzo.command", &mcp.program));
             args.push("-c".into());
             args.push(cfg_array("mcp_servers.hanzo.args", &mcp.args));
+            args.push("-c".into());
+            args.push(cfg_array("mcp_servers.hanzo.env_vars", &mcp_env_vars()));
         }
         // The caller's cloud tools: a streamable-HTTP server whose bearer the agent
         // reads from the variable it is NAMED — the value never reaches argv.
@@ -126,8 +132,14 @@ impl Backend for Agent {
             // resolved a valid catalog id (`--model` > `~/.hanzo/settings.json` >
             // built-in default `enso`; `dev` reads no `ANTHROPIC_*` env). `dev` has
             // no small/fast model.
-            Route::Via(Routing::Gateway { api, token, model, context_window, .. }) => {
-                cmd.env("HANZO_USER_KEY", token);
+            Route::Via(Routing::Gateway { api, token, org, model, context_window, .. }) => {
+                apply_gateway_mcp_env(
+                    &mut cmd,
+                    api,
+                    token,
+                    org.as_deref(),
+                    inherited_hanzo_api_key().as_deref(),
+                );
                 args.push("-c".into());
                 args.push(cfg_string("model", model));
                 // Name the model's REAL window so the agent doesn't clamp a custom
@@ -191,6 +203,10 @@ impl Backend for Agent {
                 cmd.env_remove("OPENAI_API_KEY");
                 cmd.env_remove("OPENAI_BASE_URL");
                 cmd.env_remove("HANZO_USER_KEY");
+                cmd.env_remove("HANZO_API_KEY");
+                cmd.env_remove("HANZO_API_URL");
+                cmd.env_remove("HANZO_API_BASE");
+                cmd.env_remove("HANZO_ORG");
             }
             // `--no-route` (or an unconfigured, signed-out run): dev uses its OWN
             // account (`dev login` / native provider). Leave inherited model-auth
@@ -432,6 +448,50 @@ fn user_config(_root: &Root, _program: &str) -> Option<toml::Table> {
     None
 }
 
+/// Parent environment variables forwarded past `codex-rs` `rmcp-client`'s
+/// `DEFAULT_ENV_VARS` filter into the `hanzo-mcp` stdio server.
+const MCP_ENV_VARS: [&str; 6] = [
+    "HANZO_USER_KEY",
+    "HANZO_API_KEY",
+    "HANZO_API_URL",
+    "HANZO_API_BASE",
+    "HANZO_ORG",
+    "LOCAL_KAI_URL",
+];
+
+fn mcp_env_vars() -> Vec<String> {
+    MCP_ENV_VARS.into_iter().map(String::from).collect()
+}
+
+pub(crate) fn apply_gateway_mcp_env(
+    cmd: &mut tokio::process::Command,
+    api: &str,
+    token: &str,
+    org: Option<&str>,
+    existing_api_key: Option<&str>,
+) {
+    let clean_api = api.trim_end_matches('/');
+    cmd.env("HANZO_USER_KEY", token);
+    if existing_api_key.map(str::trim).filter(|s| !s.is_empty()).is_none() {
+        cmd.env("HANZO_API_KEY", token);
+    }
+    cmd.env("HANZO_API_URL", clean_api);
+    cmd.env("HANZO_API_BASE", clean_api);
+    if let Some(o) = org.map(str::trim).filter(|s| !s.is_empty()) {
+        cmd.env("HANZO_ORG", o);
+    }
+}
+
+#[cfg(not(test))]
+pub(crate) fn inherited_hanzo_api_key() -> Option<String> {
+    std::env::var("HANZO_API_KEY").ok().filter(|s| !s.trim().is_empty())
+}
+
+#[cfg(test)]
+pub(crate) fn inherited_hanzo_api_key() -> Option<String> {
+    None
+}
+
 fn cfg_string(key: &str, val: &str) -> String {
     format!("{key}={}", toml_string(val))
 }
@@ -463,7 +523,7 @@ mod tests {
             mode,
             task: Some("do it".into()),
             cwd: PathBuf::from("/tmp/proj"),
-            routing: Route::Via(Routing::Gateway { api: api.into(), token: "JWT".into(), model: "enso".into(), small_fast_model: "enso-flash".into(), context_window: 1_000_000 }),
+            routing: Route::Via(Routing::Gateway { api: api.into(), token: "JWT".into(), org: Some("hanzo".into()), model: "enso".into(), small_fast_model: "enso-flash".into(), context_window: 1_000_000 }),
             // The default is auto-approve ON (the confirmed default).
             approval: Approval::Auto,
             mcp: Some(McpAttach { program: "hanzo-mcp".into(), args: vec!["--project-dir".into(), "/tmp/proj".into()] }),
@@ -561,7 +621,7 @@ mod tests {
     #[test]
     fn the_cloud_tools_are_one_http_server_whose_bearer_is_named_not_spelled() {
         let mut s = spec(Mode::Headless, "https://api.hanzo.ai");
-        s.routing = Route::Via(Routing::Gateway { api: "https://api.hanzo.ai".into(), token: "JWT".into(), model: "enso".into(), small_fast_model: "enso-flash".into(), context_window: 1_000_000 });
+        s.routing = Route::Via(Routing::Gateway { api: "https://api.hanzo.ai".into(), token: "JWT".into(), org: Some("hanzo".into()), model: "enso".into(), small_fast_model: "enso-flash".into(), context_window: 1_000_000 });
         s.remote = Some(Remote { url: "https://api.hanzo.ai/v1/mcp".into(), token: "IAM-BEARER".into() });
         let l = Agent::DEV.build(&s).unwrap();
         let args = argv(&l);
@@ -647,6 +707,7 @@ mod tests {
         s.routing = Route::Via(Routing::Gateway {
             api: "https://api.hanzo.ai".into(),
             token: "JWT".into(),
+            org: Some("hanzo".into()),
             model: "enso".into(),
             small_fast_model: "enso-flash".into(),
             context_window: 1_000_000,
@@ -814,6 +875,7 @@ mod tests {
         s.routing = Route::Via(Routing::Gateway {
             api: "https://gw.example.com".into(),
             token: "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ6In0.c2ln".into(),
+            org: Some("acme".into()),
             model: "enso".into(),
             small_fast_model: "enso-flash".into(),
             context_window: 1_000_000,
@@ -878,7 +940,7 @@ mod tests {
 
         // A standard window (<= codex's fallback) writes NO catalog.
         let mut s = spec(Mode::Headless, "https://api.hanzo.ai");
-        s.routing = Route::Via(Routing::Gateway { api: "https://api.hanzo.ai".into(), token: "JWT".into(), model: "enso".into(), small_fast_model: "enso-flash".into(), context_window: 200_000 });
+        s.routing = Route::Via(Routing::Gateway { api: "https://api.hanzo.ai".into(), token: "JWT".into(), org: None, model: "enso".into(), small_fast_model: "enso-flash".into(), context_window: 200_000 });
         let l = Agent::CODEX.build(&s).unwrap();
         assert!(!argv(&l).iter().any(|a| a.starts_with("model_catalog_json=")), "no catalog below codex's fallback");
         assert!(l.cleanup.files.is_empty());
@@ -889,5 +951,44 @@ mod tests {
         assert!(argv(&l).iter().any(|a| a == "model_context_window=1000000"), "{:?}", argv(&l));
         assert!(!argv(&l).iter().any(|a| a.starts_with("model_catalog_json=")));
         assert!(l.cleanup.files.is_empty());
+    }
+
+    #[test]
+    fn gateway_route_passes_unified_cloud_iam_auth_and_env_vars_to_hanzo_mcp() {
+        let mut s = spec(Mode::Headless, "https://api.hanzo.ai/");
+        s.routing = Route::Via(Routing::Gateway {
+            api: "https://api.hanzo.ai/".into(),
+            token: "IAM-JWT".into(),
+            org: Some("acme".into()),
+            model: "enso-auto".into(),
+            small_fast_model: "enso-flash".into(),
+            context_window: 1_000_000,
+        });
+        let l = Agent::DEV.build(&s).unwrap();
+        let env = envmap(&l);
+        assert_eq!(env.get("HANZO_USER_KEY").map(String::as_str), Some("IAM-JWT"));
+        assert_eq!(env.get("HANZO_API_KEY").map(String::as_str), Some("IAM-JWT"));
+        assert_eq!(env.get("HANZO_API_URL").map(String::as_str), Some("https://api.hanzo.ai"));
+        assert_eq!(env.get("HANZO_API_BASE").map(String::as_str), Some("https://api.hanzo.ai"));
+        assert_eq!(env.get("HANZO_ORG").map(String::as_str), Some("acme"));
+
+        let args = argv(&l);
+        assert!(
+            args.iter().any(|a| a == r#"mcp_servers.hanzo.env_vars=["HANZO_USER_KEY","HANZO_API_KEY","HANZO_API_URL","HANZO_API_BASE","HANZO_ORG","LOCAL_KAI_URL"]"#),
+            "dev must whitelist Hanzo auth env vars for hanzo-mcp stdio server: {args:?}"
+        );
+        assert!(!args.iter().any(|a| a.contains("IAM-JWT")), "token must never appear in argv");
+
+        // An existing explicit HANZO_API_KEY in the parent shell is not overwritten.
+        let mut cmd = tokio::process::Command::from(crate::exe::bare("/bin/true"));
+        apply_gateway_mcp_env(&mut cmd, "https://api.hanzo.ai", "IAM-JWT", None, Some("sk-explicit"));
+        let envs: std::collections::HashMap<String, String> = cmd
+            .as_std()
+            .get_envs()
+            .filter_map(|(k, v)| Some((k.to_string_lossy().to_string(), v?.to_string_lossy().to_string())))
+            .collect();
+        assert_eq!(envs.get("HANZO_USER_KEY").map(String::as_str), Some("IAM-JWT"));
+        assert!(!envs.contains_key("HANZO_API_KEY"), "existing HANZO_API_KEY must be preserved");
+        assert!(!envs.contains_key("HANZO_ORG"));
     }
 }

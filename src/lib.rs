@@ -72,7 +72,7 @@ pub use args::Args;
 pub use host::{Account, Host, Profile, Provider};
 pub use root::Root;
 
-use backend::{resolve, resolve_mcp, Approval, BackendKind, Backend, Launch, Mode, Route, Routing, Spec};
+use backend::{resolve, resolve_or_install_mcp, Approval, BackendKind, Backend, Launch, Mode, Route, Routing, Spec};
 use context::{ResumeRecord, Snapshot};
 use control::{Act, Command};
 use event::{Kind, Mapped, Status, Usage};
@@ -327,6 +327,7 @@ fn resolve_routing(
     backend: BackendKind,
     api: &str,
     bearer: Option<&str>,
+    org: Option<&str>,
     model_flag: Option<&str>,
 ) -> Result<Route> {
     // The default: a third-party tool talks straight to the account it is signed
@@ -342,9 +343,11 @@ fn resolve_routing(
     // The model rides ONLY the gateway route (resolved once here). Both gateway
     // credentials build the SAME variant, so one closure keeps the mapping DRY.
     let models = gateway_models(backend, model_flag, settings);
+    let org_opt = org.map(str::trim).filter(|s| !s.is_empty()).map(String::from);
     let gateway = |token: String| Routing::Gateway {
         api: api.to_string(),
         token,
+        org: org_opt.clone(),
         model: models.model.clone(),
         small_fast_model: models.small_fast_model.clone(),
         context_window: models.context_window,
@@ -553,7 +556,7 @@ pub async fn run(host: Arc<dyn Host>, opts: Options) -> Result<()> {
     // session exists.
     let ledger = ledger::path(&root, &format!("{}-{:08x}", chrono::Utc::now().format("%Y%m%dT%H%M%S"), rand::random::<u32>()));
     let mcp = if mcp_on {
-        let m = resolve_mcp(&cwd, Some(&ledger));
+        let m = resolve_or_install_mcp(&root, &cwd, Some(&ledger)).await;
         if m.is_none() {
             crate::warn("hanzo-mcp not found — install it with `hanzo upgrade mcp` (or `curl -fsSL hanzo.sh/mcp | sh`); continuing without the Hanzo toolset.");
         }
@@ -575,7 +578,21 @@ pub async fn run(host: Arc<dyn Host>, opts: Options) -> Result<()> {
     // Routing: which model endpoint this run's calls go to, and with what
     // credential — the Hanzo gateway (metered) for a Hanzo login, or a provider's
     // OWN API for a stored OpenAI/Anthropic key. A third-party tool is direct unless `--cloud`.
-    let routing = resolve_routing(&*host, profile.provider.as_deref(), &settings, opts.cloud, kind, &api, bearer.as_deref(), opts.model.as_deref())?;
+    let active_org = profile
+        .org
+        .as_deref()
+        .or_else(|| identity.as_ref().map(|a| a.owner.as_str()));
+    let routing = resolve_routing(
+        &*host,
+        profile.provider.as_deref(),
+        &settings,
+        opts.cloud,
+        kind,
+        &api,
+        bearer.as_deref(),
+        active_org,
+        opts.model.as_deref(),
+    )?;
     // Local usage, one line per session, for whichever connected account this
     // run actually used. A missing home does not stop the session.
     let used = harness::used_account(
@@ -652,6 +669,14 @@ pub async fn run(host: Arc<dyn Host>, opts: Options) -> Result<()> {
         match kit::root(&root, kind, &routing) {
             Some(skills) => {
                 let cache = kit::cache(&root);
+                let hs_cache = kit::hanzoskills_cache(&root);
+                let hs_api = kit::hanzoskills_api();
+                let auto = hs_api.as_deref().map(|skills_api| kit::AutoSkills {
+                    cache: &hs_cache,
+                    api: skills_api,
+                    cwd: &cwd,
+                    task: opts.task.as_deref(),
+                });
                 let caller = identity.as_ref().zip(bearer.as_deref()).map(|(_, token)| kit::Caller {
                     api: &api,
                     who: &who,
@@ -660,7 +685,16 @@ pub async fn run(host: Arc<dyn Host>, opts: Options) -> Result<()> {
                 });
                 // The cloud's tools ride only a Hanzo-routed run (Spec::cloud), so the
                 // banner never claims a server the backend will not be handed.
-                Some(kit::equip(&cache, &skills, caller.as_ref(), mcp_on && routing.hanzo()).await)
+                Some(
+                    kit::equip_with(
+                        &cache,
+                        &skills,
+                        caller.as_ref(),
+                        mcp_on && routing.hanzo(),
+                        auto.as_ref(),
+                    )
+                    .await,
+                )
             }
             None => None,
         }
@@ -839,8 +873,12 @@ pub(crate) async fn run_routed_agent(
     let settings = Settings::load(root);
 
     let mcp_on = settings.mcp.unwrap_or(true);
-    let mcp = if mcp_on { resolve_mcp(cwd, None) } else { None };
+    let mcp = if mcp_on { resolve_or_install_mcp(root, cwd, None).await } else { None };
     let model_opt = model.map(str::trim).filter(|s| !s.is_empty());
+    let active_org = profile
+        .org
+        .as_deref()
+        .or_else(|| identity.as_ref().map(|a| a.owner.as_str()));
     let routing = resolve_routing(
         &*host,
         profile.provider.as_deref(),
@@ -849,6 +887,7 @@ pub(crate) async fn run_routed_agent(
         kind,
         &api,
         bearer.as_deref(),
+        active_org,
         model_opt,
     )?;
 
@@ -875,13 +914,30 @@ pub(crate) async fn run_routed_agent(
     let equipped = match kit::root(root, kind, &routing) {
         Some(skills) => {
             let cache = kit::cache(root);
+            let hs_cache = kit::hanzoskills_cache(root);
+            let hs_api = kit::hanzoskills_api();
+            let auto = hs_api.as_deref().map(|skills_api| kit::AutoSkills {
+                cache: &hs_cache,
+                api: skills_api,
+                cwd,
+                task: Some(prompt),
+            });
             let caller = identity.as_ref().zip(bearer.as_deref()).map(|(_, token)| kit::Caller {
                 api: &api,
                 who: &who,
                 token,
                 local,
             });
-            Some(kit::equip(&cache, &skills, caller.as_ref(), mcp_on && routing.hanzo()).await)
+            Some(
+                kit::equip_with(
+                    &cache,
+                    &skills,
+                    caller.as_ref(),
+                    mcp_on && routing.hanzo(),
+                    auto.as_ref(),
+                )
+                .await,
+            )
         }
         None => None,
     };
@@ -2326,7 +2382,7 @@ mod tests {
         };
         // Routing ON (gateway), stream OFF — the case that regressed:
         // --no-link but model calls still ship code to the gateway.
-        let gw = Routing::Gateway { api: "https://api.hanzo.ai".into(), token: "T".into(), model: "enso".into(), small_fast_model: "enso-flash".into(), context_window: 1_000_000 };
+        let gw = Routing::Gateway { api: "https://api.hanzo.ai".into(), token: "T".into(), org: None, model: "enso".into(), small_fast_model: "enso-flash".into(), context_window: 1_000_000 };
         let (route, stream) = status_lines(&opts, Some(&gw), true, None);
         assert!(route.contains("model routing: Hanzo cloud"), "got: {route}");
         assert!(route.contains("api.hanzo.ai"));
