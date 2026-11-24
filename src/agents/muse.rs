@@ -15,7 +15,7 @@ pub const AGENT: Agent = Agent {
     programs: &["muse"],
     upgrade: Upgrade::Own(&["--version"]),
     routable: false,
-    toolset: Toolset::Never,
+    toolset: Toolset::Always,
     build,
     read,
 };
@@ -23,16 +23,23 @@ pub const AGENT: Agent = Agent {
 fn build(r: &mut Run) -> Result<()> {
     if r.headless() {
         r.arg("exec");
-        if r.auto() {
-            r.arg("--yolo");
-        }
+    }
+    if let Some(m) = r.mcp() {
+        let cfg = serde_json::json!({
+            "command": m.program,
+            "args": m.args,
+        });
+        r.arg("-c").arg(format!("mcpServers.hanzo={cfg}"));
+    }
+    if r.auto() {
+        r.arg("--yolo");
+    }
+    if r.headless() {
         if r.structured() {
             r.arg("--json");
         }
         let task = r.task();
         r.arg(task);
-    } else if r.auto() {
-        r.arg("--yolo");
     }
     Ok(())
 }
@@ -47,16 +54,6 @@ fn read(r: &mut Reader, line: &str) -> Vec<Mapped> {
     let ptype = v["payload_type"].as_str().unwrap_or_default();
     let payload = &v["payload"];
     match ptype {
-        "run.lifecycle.started" => {
-            vec![Mapped::note("session-start", "muse run started")]
-        }
-        "task.lifecycle.started" => {
-            let kind = payload["event"]["task_kind"]
-                .as_str()
-                .or_else(|| payload["task_id"].as_str())
-                .unwrap_or("task");
-            vec![Mapped::note("task", kind)]
-        }
         "run.usage" => {
             let mut input = 0u64;
             let mut output = 0u64;
@@ -98,16 +95,24 @@ mod tests {
     #[test]
     fn muse_builds_headless_and_interactive_argvs() {
         let h = build("muse", &spec(Mode::Headless, gateway()));
-        assert_eq!(argv(&h), ["exec", "--yolo", "fix the test"]);
+        let a = argv(&h);
+        assert_eq!(a[0], "exec");
+        assert_eq!(a[1], "-c");
+        assert!(a[2].starts_with("mcpServers.hanzo={"), "got {}", a[2]);
+        assert_eq!(&a[3..], ["--yolo", "fix the test"]);
         assert!(env(&h, "OPENAI_API_KEY").is_none());
 
         let i = build("muse", &spec(Mode::Interactive, Route::Inherit));
-        assert_eq!(argv(&i), ["--yolo"]);
+        let ia = argv(&i);
+        assert_eq!(ia[0], "-c");
+        assert!(ia[1].starts_with("mcpServers.hanzo={"), "got {}", ia[1]);
+        assert_eq!(&ia[2..], ["--yolo"]);
     }
 
     #[test]
     fn muse_reads_jsonl_usage_and_terminal_events() {
         let stream = r#"{"payload_type":"run.lifecycle.started","payload":{"kind":"run_started"}}
+{"payload_type":"task.lifecycle.started","payload":{"kind":"task_lifecycle","task_id":"01a20b8b-43f9-7733-bf61-f44f0e685ad0"}}
 {"payload_type":"run.usage","payload":{"kind":"run_usage","models":[{"input_tokens":120,"cached_tokens":40,"output_tokens":35}]}}
 {"payload_type":"run.terminal.completed","payload":{"kind":"run_terminal","terminal":"completed","text":"echo: ping","reason":null}}"#;
         let out = read("muse", stream);
