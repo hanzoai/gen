@@ -9,11 +9,14 @@
 //! auto-run against our env; model calls route through the Hanzo gateway via
 //! `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN` (Bearer).
 //!
-//! Auto-approve is ON by default (`--dangerously-skip-permissions`), the confirmed
+//! Auto-approve is OFF by default (`--dangerously-skip-permissions`), the confirmed
 //! default; `--ask`/`--safe` (or `autoApprove: false`) opt out and hand back the
 //! user's own permission mode. The trust gate is INDEPENDENT of and unweakened by
-//! this: `--strict-mcp-config` + `--setting-sources user` still keep the repo's own
+//! this: `--strict-mcp-config` + `--setting-sources user` still keep the repo\047s own
 //! `.mcp.json` and settings/hooks out of the process env, so auto-approve never
+//! reopens the routing-bearer exfil vector.
+//! `--auto` / `--yes` / `--auto-approve` opt in for one run; `--ask`/`--safe` opt out;
+//! `--no-sandbox` escalates past it.
 //! reopens the routing-bearer exfil vector.
 //!
 //! On the gateway route the model reaches Claude Code as a CARRIER — a `claude-*`

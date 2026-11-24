@@ -28,7 +28,8 @@ pub struct Settings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub small_fast_model: Option<String>,
     /// Auto-approve the coding agent's actions without a per-action prompt. Unset
-    /// ⇒ ON (the built-in default — the confirmed always-on default). `--ask` /
+    /// ⇒ OFF (the built-in default). `--auto` / `--yes` opt in for one run; 
+    /// `autoApprove: true` in settings persists the opt-in. `--ask` /
     /// `--safe` force it OFF regardless; `--no-sandbox` escalates past it. This is a
     /// PERSISTED default only: dropping the sandbox entirely is never persisted, it
     /// is always a per-invocation `--no-sandbox` (fail-secure — see [`super::Approval`]).
@@ -80,7 +81,15 @@ impl Settings {
     pub fn load(root: &Root) -> Settings {
         let path = Self::path(root);
         match std::fs::read_to_string(&path) {
-            Ok(body) => serde_json::from_str(&body).unwrap_or_default(),
+            Ok(body) => {
+                let settings: Settings = serde_json::from_str(&body).unwrap_or_default();
+                // One-time migration: if the file matches the OLD fully-populated defaults
+                // exactly (autoApprove: true + all other keys at old built-in defaults),
+                // flip it to false and warn. We CANNOT distinguish a user choice from
+                // the old first-run default, so we migrate only the exact match.
+                maybe_migrate_old_auto_approve(&path, &settings);
+                settings
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 write_defaults(&path);
                 Settings::default()
@@ -153,7 +162,7 @@ fn defaults_document() -> Settings {
     Settings {
         model: Some(crate::DEFAULT_MODEL.to_string()),
         small_fast_model: Some(crate::DEFAULT_SMALL_FAST_MODEL.to_string()),
-        auto_approve: Some(true),
+        auto_approve: Some(false),
         mcp: Some(true),
         context_window: Some(super::DEFAULT_CONTEXT_WINDOW),
         agent: Some(super::backend::DEFAULT.as_str().to_string()),
@@ -170,6 +179,50 @@ fn write_defaults(path: &Path) {
     }
     if let Ok(body) = serde_json::to_string_pretty(&defaults_document()) {
         let _ = crate::private::write(path, format!("{body}\n").as_bytes());
+    }
+}
+
+/// One-time migration: if the settings file matches the OLD fully-populated
+/// defaults document exactly (autoApprove: true + all other keys at the old
+/// built-in defaults), flip it to false and warn. We CANNOT distinguish a user
+/// choice from the old first-run default, so we migrate only the exact match.
+/// If the file has any other value (explicit user edit or partial defaults), we
+/// leave it alone — the user's intent is either explicit or ambiguous.
+fn maybe_migrate_old_auto_approve(path: &Path, parsed: &Settings) {
+    // The OLD fully-populated defaults document (before the security fix).
+    let old_defaults = Settings {
+        model: Some(crate::DEFAULT_MODEL.to_string()),
+        small_fast_model: Some(crate::DEFAULT_SMALL_FAST_MODEL.to_string()),
+        auto_approve: Some(true),
+        mcp: Some(true),
+        context_window: Some(super::DEFAULT_CONTEXT_WINDOW),
+        agent: Some(super::backend::DEFAULT.as_str().to_string()),
+        harness: None,
+    };
+
+    // Check if the parsed settings match the old defaults exactly
+    if parsed.model == old_defaults.model
+        && parsed.small_fast_model == old_defaults.small_fast_model
+        && parsed.auto_approve == old_defaults.auto_approve
+        && parsed.mcp == old_defaults.mcp
+        && parsed.context_window == old_defaults.context_window
+        && parsed.agent == old_defaults.agent
+        && parsed.harness == old_defaults.harness
+    {
+        // Read the raw file to check if it matches exactly (including unknown keys)
+        if let Ok(body) = std::fs::read_to_string(path) {
+            if let Ok(doc) = serde_json::from_str::<serde_json::Value>(&body) {
+                let old_doc = serde_json::to_value(&old_defaults).unwrap();
+                if doc == old_doc {
+                    let mut new_doc = doc;
+                    new_doc["autoApprove"] = serde_json::Value::Bool(false);
+                    if let Ok(new_body) = serde_json::to_string_pretty(&new_doc) {
+                        let _ = crate::private::write(path, format!("{new_body}\n").as_bytes());
+                        eprintln!("warning: migrated ~/.hanzo/settings.json autoApprove from legacy default ON to OFF — pass --auto to opt in per-invocation or set autoApprove: true in settings to persist");
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -224,7 +277,7 @@ mod tests {
             )),
             "got {doc}"
         );
-        assert!(doc.contains("\"autoApprove\":true"), "got {doc}");
+        assert!(doc.contains("\"autoApprove\":false"), "got {doc}");
         assert!(doc.contains("\"mcp\":true"), "got {doc}");
         assert!(doc.contains("\"contextWindow\":1000000"), "got {doc}");
     }
@@ -235,5 +288,64 @@ mod tests {
     fn path_is_dot_hanzo_settings_json() {
         let p = Settings::path(&Root::at("/h"));
         assert_eq!(p, std::path::Path::new("/h/.hanzo/settings.json"));
+    }
+    
+    /// The one-time migration flips the OLD exact default document from
+    /// autoApprove: true to false and warns.
+    #[test]
+    fn migration_flips_exact_old_defaults() {
+        use tempfile::NamedTempFile;
+        use std::io::Write;
+        
+        // Create a temp file with the OLD exact defaults
+        let mut file = NamedTempFile::new().unwrap();
+        let old_doc = r#"{
+  "model": "enso-auto",
+  "smallFastModel": "enso-flash",
+  "autoApprove": true,
+  "mcp": true,
+  "contextWindow": 1000000,
+  "agent": "dev"
+}"#;
+        file.write_all(old_doc.as_bytes()).unwrap();
+        file.flush().unwrap();
+        
+        // Parse it through load (which calls migration)
+        let root = Root::at(file.path().parent().unwrap());
+        let _ = Settings::load(&root);
+        
+        // Read back the file - it should now have autoApprove: false
+        let content = std::fs::read_to_string(file.path()).unwrap();
+        assert!(content.contains("\"autoApprove\":false"));
+        // The warning was printed to stderr - we can't easily capture it in this test
+    }
+    
+    /// The migration does NOT flip a file that has been edited by the user
+    /// (even if only one key differs from old defaults).
+    #[test]
+    fn migration_skips_user_edited_file() {
+        use tempfile::NamedTempFile;
+        use std::io::Write;
+        
+        // Create a temp file with user-edited model but old autoApprove
+        let mut file = NamedTempFile::new().unwrap();
+        let edited_doc = r#"{
+  "model": "enso-ultra",
+  "smallFastModel": "enso-flash",
+  "autoApprove": true,
+  "mcp": true,
+  "contextWindow": 1000000,
+  "agent": "dev"
+}"#;
+        file.write_all(edited_doc.as_bytes()).unwrap();
+        file.flush().unwrap();
+        
+        // Parse it through load
+        let root = Root::at(file.path().parent().unwrap());
+        let _ = Settings::load(&root);
+        
+        // Read back - should still have autoApprove: true (user's choice)
+        let content = std::fs::read_to_string(file.path()).unwrap();
+        assert!(content.contains("\"autoApprove\":true"));
     }
 }

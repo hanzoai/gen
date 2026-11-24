@@ -111,6 +111,9 @@ pub struct Options {
     /// Opt OUT of auto-approve (`--ask` / `--safe`): the backend runs in its own
     /// ask-for-permission mode. Wins over `~/.hanzo/settings.json` `autoApprove`.
     pub ask: bool,
+    /// Opt IN to auto-approve for this invocation (`--auto` / `--yes` / `--auto-approve`).
+    /// Wins over `~/.hanzo/settings.json` `autoApprove` when set.
+    pub auto: bool,
     /// Escalate PAST auto-approve to a full bypass that also drops the sandbox
     /// (`--no-sandbox`): `dev` `--dangerously-bypass-approvals-and-sandbox`. A
     /// deliberate per-invocation act, never a persisted default (fail-secure).
@@ -339,7 +342,7 @@ pub async fn run(host: Arc<dyn Host>, opts: Options) -> Result<()> {
     // gate: the repo `.mcp.json`/settings stay untrusted (`--strict-mcp-config` +
     // `--setting-sources user`) regardless, so auto-approve can't reopen the
     // bearer-exfil vector. Each backend maps the decision to its own flags.
-    let approval = resolve_approval(opts.ask, opts.no_sandbox, settings.auto_approve);
+    let approval = resolve_approval(opts.ask, opts.auto, opts.no_sandbox, settings.auto_approve);
 
     // MCP: attach hanzo-mcp by default. `--no-mcp` forces it off (flag wins);
     // otherwise `~/.hanzo/settings.json` `mcp` decides, defaulting ON. A missing

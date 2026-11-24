@@ -46,19 +46,23 @@ pub(crate) const DEFAULT_SMALL_FAST_MODEL: &str = "enso-flash";
 pub(crate) const DEFAULT_CONTEXT_WINDOW: u64 = 1_000_000;
 
 /// Resolve the auto-approve decision by precedence: an explicit CLI flag wins,
-/// then `~/.hanzo/settings.json` `autoApprove`, then the built-in default (ON).
+/// then `~/.hanzo/settings.json` `autoApprove`, then the built-in default (OFF).
 /// PURE + testable; the impure settings read lives in [`run`].
 ///
 /// `--no-sandbox` (escalate) and `--ask`/`--safe` (opt out) are mutually exclusive
 /// at the clap layer, so at most one is set. The persisted `autoApprove` can turn
-/// the default OFF but can NEVER reach `Bypass`: dropping the sandbox is always a
+/// the default ON but can NEVER reach `Bypass`: dropping the sandbox is always a
 /// deliberate per-invocation `--no-sandbox`, never a stored default (fail-secure).
-pub(crate) fn resolve_approval(ask: bool, no_sandbox: bool, settings: Option<bool>) -> Approval {
+/// `--auto` / `--yes` (explicit opt-in) wins over settings but loses to `--ask`/`--safe`
+/// and `--no-sandbox`.
+pub(crate) fn resolve_approval(ask: bool, auto: bool, no_sandbox: bool, settings: Option<bool>) -> Approval {
     if no_sandbox {
         Approval::Bypass
     } else if ask {
         Approval::Ask
-    } else if settings.unwrap_or(true) {
+    } else if auto {
+        Approval::Auto
+    } else if settings.unwrap_or(false) {
         Approval::Auto
     } else {
         Approval::Ask
@@ -267,24 +271,38 @@ mod tests {
     }
 
     /// The auto-approve precedence: an explicit CLI flag wins, then the persisted
-    /// `autoApprove`, then the built-in default (ON → `Auto`). The escalation
+    /// `autoApprove`, then the built-in default (OFF → `Ask`). The escalation
     /// (`--no-sandbox` → `Bypass`) and the opt-out (`--ask`/`--safe` → `Ask`) both
-    /// beat the persisted setting; the setting can turn the default OFF but can
+    /// beat the persisted setting; the setting can turn the default ON but can
     /// NEVER reach `Bypass` — dropping the sandbox is always a per-invocation act.
     #[test]
     fn resolve_approval_precedence() {
-        // No flags: the persisted setting decides, defaulting ON (Auto).
-        assert_eq!(resolve_approval(false, false, None), Approval::Auto);
-        assert_eq!(resolve_approval(false, false, Some(true)), Approval::Auto);
-        assert_eq!(resolve_approval(false, false, Some(false)), Approval::Ask);
+        // No flags: the persisted setting decides, defaulting OFF (Ask).
+        assert_eq!(resolve_approval(false, false, false, None), Approval::Ask);
+        assert_eq!(resolve_approval(false, false, false, Some(true)), Approval::Auto);
+        assert_eq!(resolve_approval(false, false, false, Some(false)), Approval::Ask);
         // `--ask`/`--safe` opt out, winning over a persisted `true`.
-        assert_eq!(resolve_approval(true, false, Some(true)), Approval::Ask);
-        assert_eq!(resolve_approval(true, false, None), Approval::Ask);
+        assert_eq!(resolve_approval(true, false, false, Some(true)), Approval::Ask);
+        assert_eq!(resolve_approval(true, false, false, None), Approval::Ask);
         // `--no-sandbox` escalates, winning over any setting — including `false`
         // (the flag is explicit; the setting can never itself reach Bypass).
-        assert_eq!(resolve_approval(false, true, Some(false)), Approval::Bypass);
-        assert_eq!(resolve_approval(false, true, Some(true)), Approval::Bypass);
-        assert_eq!(resolve_approval(false, true, None), Approval::Bypass);
+        assert_eq!(resolve_approval(false, false, true, Some(false)), Approval::Bypass);
+        assert_eq!(resolve_approval(false, false, true, Some(true)), Approval::Bypass);
+        assert_eq!(resolve_approval(false, false, true, None), Approval::Bypass);
+    }
+
+    /// The auto-approve precedence with the new `--auto` flag: explicit auto opt-in
+    /// wins over settings, but `--ask` and `--no-sandbox` still win over `--auto`.
+    #[test]
+    fn resolve_approval_precedence_with_auto_flag() {
+        // `--auto` / `--yes` opt in for one invocation, winning over settings
+        assert_eq!(resolve_approval(false, true, false, None), Approval::Auto);
+        assert_eq!(resolve_approval(false, true, false, Some(false)), Approval::Auto);
+        assert_eq!(resolve_approval(false, true, false, Some(true)), Approval::Auto);
+        // `--no-sandbox` wins over `--auto`
+        assert_eq!(resolve_approval(false, true, true, Some(false)), Approval::Bypass);
+        assert_eq!(resolve_approval(false, true, true, Some(true)), Approval::Bypass);
+        assert_eq!(resolve_approval(false, true, true, None), Approval::Bypass);
     }
 
     /// The context window rides the gateway route by precedence `settings > default`,

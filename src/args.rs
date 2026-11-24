@@ -69,6 +69,11 @@ pub struct Args {
     #[arg(long, visible_alias = "safe", conflicts_with = "no_sandbox")]
     pub ask: bool,
 
+    /// Opt IN to auto-approve for this invocation (overrides settings default OFF).
+    /// Mutually exclusive with `--ask`/`--safe`.
+    #[arg(long, visible_alias = "yes", visible_alias = "auto-approve", conflicts_with = "ask")]
+    pub auto: bool,
+
     /// Escalate PAST auto-approve to run unconfined on bare metal (runc / native host)
     /// with direct GPU pass-through, dropping the sandbox.
     #[arg(long, visible_alias = "runc", visible_alias = "bare")]
@@ -195,6 +200,7 @@ impl Args {
             mcp: !self.no_mcp,
             project_mcp: self.project_mcp,
             ask: self.ask,
+            auto: self.auto,
             no_sandbox: is_runc,
             resume: self.resume,
             brand: self.brand,
