@@ -11,7 +11,7 @@ use crate::backend::{self, BackendKind};
 /// the same flags.
 #[derive(clap::Args, Clone)]
 pub struct Args {
-    /// Coding backend: dev | claude | codex | cursor | agy | gemini | qwen | opencode | kilo | crush | pi | copilot | amp | grok (default: dev, our own agent). Each is also a flag: `hanzo --gemini`
+    /// Coding backend: dev | claude | codex | cursor | agy | gemini | qwen | opencode | kilo | crush | pi | copilot | amp | grok | muse (default: dev, our own agent). Each is also a flag: `hanzo --muse`
     ///
     /// Equivalent to the tool's own flag (`hanzo dev --claude`). Every spelling
     /// resolves in ONE place — `commands::code::backend::select`.
@@ -272,7 +272,7 @@ mod tests {
     /// Every agent without a flag of its own is one anyway.
     #[test]
     fn an_agent_with_no_declared_flag_is_still_a_flag() {
-        for name in ["gemini", "qwen", "opencode", "kilo", "crush", "pi", "copilot", "amp", "grok"] {
+        for name in ["gemini", "qwen", "opencode", "kilo", "crush", "pi", "copilot", "amp", "grok", "muse"] {
             assert_eq!(backend(&["gen", &format!("--{name}")]).as_str(), name, "--{name}");
         }
         // After `--` an argument is the backend's, whatever it spells.
