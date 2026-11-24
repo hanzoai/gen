@@ -36,6 +36,7 @@ mod kilo;
 mod kimi;
 mod kode;
 mod letta;
+mod muse;
 mod omp;
 mod opencode;
 mod openhands;
@@ -48,6 +49,7 @@ pub const AGENTS: &[Agent] = &[
     cursor::AGENT,
     agy::AGENT,
     gemini::AGENT,
+    muse::AGENT,
     qwen::AGENT,
     opencode::AGENT,
     kilo::AGENT,
