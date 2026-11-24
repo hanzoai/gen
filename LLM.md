@@ -15,6 +15,7 @@ sandbox run`, so every launcher takes the same flags and runs `hanzo_gen::run`.
 | file | what |
 |---|---|
 | `src/lib.rs`, `lifecycle.rs`, `routing.rs`, `stream.rs`, `render.rs`, `supervise/` | `run(host, opts)`: resolve route, link the cloud session, equip MCP + kit, launch, stream, supervise, finalize, print the summary. `Options`, `warn`. |
+| `src/embedded/` | `run_embedded_turn(host, req)`, `StaticHost`, `EmbeddedTurnRequest`, `EmbeddedTurnResult`, `EmbeddedAction`: canonical in-process harness driver for `hanzod`, Hanzo Desktop, and Mobile. |
 | `src/args.rs` | `Args` (the clap flags), `Args::dev(command)` (tool is a flag), `Args::into_options`, `expand` (`--<agent>` → `--backend <agent>`). |
 | `src/host.rs` | `Host` trait, `Account`, `Profile`, `Provider`, `BRAND`, `token(brand)`, `claim` (THE owner/name validator, the CLI's too), and `host::Command` (the standalone host). |
 | `src/root.rs` | `Root`: every path Gen writes under a home, from one value the launcher picks (`Root::user()` / `Root::need()` in a `main`, `Root::at(dir)` in tests). Reads `$HOME` itself: an unset, empty or relative home is no home. |

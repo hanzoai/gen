@@ -197,10 +197,7 @@ async fn finalize_reports_usage_resume_handle_and_terminal_status() {
     let outcome = Outcome {
         backend_session: Some("sid-x".into()),
         usage: Usage { input_tokens: Some(9), ..Default::default() },
-        tool_calls: 0,
-        saw_error: false,
-        final_summary: None,
-        exit: None,
+        ..Default::default()
     };
     let root = crate::root::scratch();
     finalize(&client, "sess_9", &outcome, Status::Done, &snapshot, "https://api.hanzo.ai", "hanzo/z", None, &root, None).await;

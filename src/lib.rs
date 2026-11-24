@@ -31,6 +31,7 @@ pub mod context;
 mod control;
 pub mod contract;
 mod dev;
+pub mod embedded;
 // The status vocabulary IS part of the session client's signature (`set_status`),
 // so anything that can hold a session — `hanzo link` as much as `hanzo dev` —
 // must be able to name the value it is setting.

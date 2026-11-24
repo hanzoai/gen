@@ -22,6 +22,10 @@ pub(crate) struct Outcome {
     pub tool_calls: u64,
     pub saw_error: bool,
     pub final_summary: Option<String>,
+    /// Assistant messages emitted during the run, in order.
+    pub messages: Vec<String>,
+    /// Structured tool, spawn, and log actions captured from the stream.
+    pub actions: Vec<crate::embedded::EmbeddedAction>,
     /// How the newest turn's process ended when not cleanly ("exited with status
     /// 101"); the reason a failed run reports.
     pub exit: Option<String>,
@@ -98,19 +102,32 @@ pub(crate) fn cut(s: &str, n: usize) -> String {
 /// The forward+render sink for a structured event stream. Forwarding fires ONLY
 /// when a cloud client AND session id are present — the privacy gate is
 /// structural: an unlinked run cannot reach the network from here.
-struct Sink {
+struct Sink<'a> {
     client: Option<SessionClient>,
     session_id: Option<String>,
     render: bool,
-    out: Outcome,
+    out: &'a mut Outcome,
 }
 
-impl Sink {
+impl Sink<'_> {
     async fn handle(&mut self, m: Mapped) {
         match m {
             Mapped::Event { kind, payload } => {
                 if kind == Kind::ToolCall {
                     self.out.tool_calls = self.out.tool_calls.saturating_add(1);
+                }
+                if kind == Kind::Message && payload.get("role").and_then(serde_json::Value::as_str) == Some("assistant") {
+                    if let Some(t) = payload
+                        .get("text")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|s| !s.trim().is_empty())
+                    {
+                        self.out.messages.push(t.to_string());
+                        self.out.final_summary = Some(t.to_string());
+                    }
+                }
+                if let Some(action) = crate::embedded::action_from_event(kind, &payload) {
+                    self.out.actions.push(action);
                 }
                 if self.render {
                     render_event(kind, &payload);
@@ -128,6 +145,9 @@ impl Sink {
             Mapped::Terminal { ok, summary } => {
                 if !ok {
                     self.out.saw_error = true;
+                    if summary.is_none() {
+                        self.out.final_summary = None;
+                    }
                 }
                 if summary.is_some() {
                     self.out.final_summary = summary;
@@ -193,21 +213,36 @@ async fn next_bounded_line<R: AsyncBufRead + Unpin>(
     }
 }
 
-/// Drive a backend's structured line stream through parse → forward/render.
-pub(crate) async fn run_stream<R: AsyncBufRead + Unpin>(
+/// Drive a backend's structured line stream into an existing [`Outcome`].
+pub(crate) async fn run_stream_into<R: AsyncBufRead + Unpin>(
     backend: &dyn Backend,
     mut reader: R,
     client: Option<SessionClient>,
     session_id: Option<String>,
     render: bool,
-) -> Result<Outcome> {
-    let mut sink = Sink { client, session_id, render, out: Outcome::default() };
+    out: &mut Outcome,
+) -> Result<()> {
+    let mut sink = Sink { client, session_id, render, out };
     while let Some(line) = next_bounded_line(&mut reader, MAX_LINE).await.context("reading backend stream")? {
         for m in backend.parse(&line) {
             sink.handle(m).await;
         }
     }
-    Ok(sink.out)
+    Ok(())
+}
+
+/// Drive a backend's structured line stream through parse → forward/render.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) async fn run_stream<R: AsyncBufRead + Unpin>(
+    backend: &dyn Backend,
+    reader: R,
+    client: Option<SessionClient>,
+    session_id: Option<String>,
+    render: bool,
+) -> Result<Outcome> {
+    let mut out = Outcome::default();
+    run_stream_into(backend, reader, client, session_id, render, &mut out).await?;
+    Ok(out)
 }
 
 

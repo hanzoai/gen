@@ -19,6 +19,30 @@ pub fn find(name: &str) -> Option<PathBuf> {
     find_in(name, &std::env::var_os("PATH")?)
 }
 
+/// Find `name` under `root`'s user tool directories (`<root>/.local/bin`,
+/// `<root>/.hanzo/bin`) first, else in the absolute entries of `PATH` ([`find`]).
+/// Allows embedded daemon/desktop hosts launched with a minimal system `PATH` to
+/// locate `hanzo.sh`-installed binaries under the session's [`crate::root::Root`].
+pub fn find_for_root(root: &crate::root::Root, name: &str) -> Option<PathBuf> {
+    let named = Path::new(name);
+    if named.components().count() == 1 && !named.is_absolute() {
+        for rel in [".local/bin", ".hanzo/bin"] {
+            let candidate = root.home().join(rel).join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+            #[cfg(windows)]
+            {
+                let exe = root.home().join(rel).join(format!("{name}.exe"));
+                if exe.is_file() {
+                    return Some(exe);
+                }
+            }
+        }
+    }
+    find(name)
+}
+
 /// [`find`] over a given PATH.
 pub fn find_in(name: &str, path: &OsStr) -> Option<PathBuf> {
     let named = Path::new(name);

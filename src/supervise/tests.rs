@@ -4,7 +4,7 @@ use crate::claude::Claude;
 use crate::event::Mapped;
 use crate::register_session;
 use crate::root::Root;
-use crate::stream::reason_of;
+use crate::stream::{reason_of, run_stream};
 use crate::testmock::MockCloud;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;

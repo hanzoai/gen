@@ -1,15 +1,17 @@
 //! Headless turn execution, remote steering/stop control, and long-horizon supervisor loop.
 
 use anyhow::{Context, Result};
+use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::backend::{Backend, Launch, Spec};
 use crate::control::{self, Act, Command};
 use crate::event::Status;
 use crate::session::SessionClient;
-use crate::stream::{cut, how, run_stream, spawn, Outcome};
+use crate::stream::{cut, how, run_stream_into, spawn, Outcome};
 
 /// What a harness's loop guard says when its model repeats a tool call. It ends the
 /// turn with an error; the run is not over, the model is.
@@ -40,6 +42,20 @@ const CONTINUE_COMPACT: &str = "The previous turn hit a context or output token 
 Summarize your current git and workspace progress concisely (3-5 bullets), inspect `git status` / `git diff --stat` \
 if needed without reading huge files whole, and immediately continue executing and verifying the remaining steps \
 until the task is complete.";
+
+/// Execution options for [`supervise_opts`].
+pub(crate) struct SuperviseOpts {
+    pub render: bool,
+    pub null_stdio: bool,
+    pub cancel: Option<tokio::sync::watch::Receiver<bool>>,
+}
+
+/// Terminal disposition returned by [`supervise_opts`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SuperviseEnd {
+    Status(Status),
+    Interrupted,
+}
 
 /// Progressive escalation prompts when a headless turn stops on narration or an offer.
 fn keep_going(attempt: u8) -> String {
@@ -144,17 +160,38 @@ fn change_course_on_repeated_failure(err: &str) -> String {
     )
 }
 
+async fn wait_cancel(rx: &mut Option<tokio::sync::watch::Receiver<bool>>) {
+    let Some(rx) = rx.as_mut() else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    if *rx.borrow() {
+        return;
+    }
+    while rx.changed().await.is_ok() {
+        if *rx.borrow() {
+            return;
+        }
+    }
+    std::future::pending::<()>().await;
+}
+
+async fn recv_control(rx: &mut Option<&mut tokio::sync::mpsc::Receiver<Command>>) -> Option<Command> {
+    match rx.as_mut() {
+        Some(ch) => ch.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn wait_grace(grace: &mut Option<Pin<Box<tokio::time::Sleep>>>) {
+    match grace.as_mut() {
+        Some(s) => s.await,
+        None => std::future::pending().await,
+    }
+}
+
 /// Run ONE headless turn, watching for a steering command while it streams.
-///
-/// The turn ends either because the backend finished (stdout hits EOF) or because
-/// a command arrived and we signalled the child. In BOTH cases we keep reading to
-/// EOF before returning: an interrupted Claude still writes `[Request interrupted
-/// by user for tool use]` and a final `result`, and those are the most useful
-/// events in the whole run — dropping them to exit a millisecond sooner would
-/// throw away the record of what the interrupt actually stopped.
-///
-/// Only the FIRST actionable command is applied per turn (`acted.is_none()`), so
-/// a double-click on the dashboard cannot signal a child twice.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn run_turn(
     backend: &dyn Backend,
     structured: bool,
@@ -163,73 +200,157 @@ pub(crate) async fn run_turn(
     session_id: Option<String>,
     control: Option<&mut tokio::sync::mpsc::Receiver<Command>>,
 ) -> Result<(Outcome, bool, Option<Act>)> {
+    let (out, ok, act, _) = run_turn_opts(
+        backend,
+        structured,
+        launch,
+        client,
+        session_id,
+        control,
+        true,
+        false,
+        &mut None,
+    )
+    .await?;
+    Ok((out, ok, act))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_turn_opts(
+    backend: &dyn Backend,
+    structured: bool,
+    launch: Launch,
+    client: Option<SessionClient>,
+    session_id: Option<String>,
+    mut control: Option<&mut tokio::sync::mpsc::Receiver<Command>>,
+    render: bool,
+    null_stdio: bool,
+    cancel: &mut Option<tokio::sync::watch::Receiver<bool>>,
+) -> Result<(Outcome, bool, Option<Act>, bool)> {
+    if cancel.as_ref().is_some_and(|rx| *rx.borrow()) {
+        return Ok((Outcome::default(), false, None, true));
+    }
+
     let Launch { mut command, cleanup } = launch;
-    command
-        .stdin(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .kill_on_drop(true);
+    if null_stdio {
+        command.stdin(Stdio::null()).stderr(Stdio::null());
+    } else {
+        command.stdin(Stdio::inherit()).stderr(Stdio::inherit());
+    }
+    command.kill_on_drop(true);
     if structured {
         command.stdout(Stdio::piped());
     } else {
         command.stdout(Stdio::inherit());
     }
-    if control.is_some() {
+    if control.is_some() || cancel.is_some() {
         control::hear(&mut command);
     }
-    let mut relay = control::relay();
+    let mut relay = (!null_stdio).then(control::relay);
     let mut child = spawn(&mut command, backend.label())?;
     let pid = child.id();
-    relay.to(pid);
-    let mut acted: Option<Act> = None;
+    if let Some(r) = &mut relay {
+        r.to(pid);
+    }
 
-    let mut outcome = match (structured, control) {
-        (false, _) => Outcome::default(),
-        (true, control) => {
-            let stdout = child.stdout.take().expect("piped stdout");
-            let reader = tokio::io::BufReader::new(stdout);
-            let streaming = run_stream(backend, reader, client, session_id, true);
+    let mut acted: Option<Act> = None;
+    let mut interrupted = false;
+    let mut outcome = Outcome::default();
+
+    if structured {
+        let stdout = child.stdout.take().expect("piped stdout");
+        let reader = tokio::io::BufReader::new(stdout);
+        let mut grace: Option<Pin<Box<tokio::time::Sleep>>> = None;
+        {
+            let streaming = run_stream_into(backend, reader, client, session_id, render, &mut outcome);
             tokio::pin!(streaming);
-            match control {
-                None => streaming.await?,
-                Some(rx) => loop {
-                    tokio::select! {
-                        out = &mut streaming => break out?,
-                        Some(cmd) = rx.recv(), if acted.is_none() => {
-                            let act = cmd.act();
-                            if let Some(sig) = act.signal() {
-                                if let Some(p) = pid {
-                                    if control::send(p, sig).is_err() {
-                                        let _ = child.start_kill();
-                                    }
+            loop {
+                tokio::select! {
+                    res = &mut streaming => {
+                        res?;
+                        break;
+                    }
+                    () = wait_cancel(cancel), if !interrupted && acted.is_none() => {
+                        interrupted = true;
+                        if let Some(p) = pid {
+                            if control::send(p, control::Signal::Int).is_err() {
+                                let _ = child.start_kill();
+                            }
+                        } else {
+                            let _ = child.start_kill();
+                        }
+                        grace = Some(Box::pin(tokio::time::sleep(Duration::from_millis(250))));
+                    }
+                    () = wait_grace(&mut grace), if grace.is_some() => {
+                        let _ = child.start_kill();
+                        if let Ok(res) = tokio::time::timeout(Duration::from_millis(100), &mut streaming).await {
+                            res?;
+                        }
+                        break;
+                    }
+                    Some(cmd) = recv_control(&mut control), if acted.is_none() && !interrupted => {
+                        let act = cmd.act();
+                        if let Some(sig) = act.signal() {
+                            if let Some(p) = pid {
+                                if control::send(p, sig).is_err() {
+                                    let _ = child.start_kill();
                                 }
                             }
-                            if act.ends_turn() {
-                                acted = Some(act);
-                            }
+                        }
+                        if act.ends_turn() {
+                            acted = Some(act);
                         }
                     }
-                },
+                }
             }
         }
-    };
+    }
 
     let status = child.wait().await.context("waiting for backend")?;
     drop(relay);
     drop(cleanup);
     outcome.exit = how(&status);
-    Ok((outcome, status.success(), acted))
+    Ok((outcome, status.success(), acted, interrupted))
 }
 
 /// Drive a headless run to completion under remote control, returning the
 /// accumulated outcome and the status to finalize the cloud session with.
 pub(crate) async fn supervise(
     backend: &dyn Backend,
+    spec: Spec,
+    launch: Launch,
+    structured: bool,
+    client: Option<SessionClient>,
+    session_id: Option<String>,
+) -> Result<(Outcome, Status)> {
+    let (out, end) = supervise_opts(
+        backend,
+        spec,
+        launch,
+        structured,
+        client,
+        session_id,
+        SuperviseOpts { render: true, null_stdio: false, cancel: None },
+    )
+    .await?;
+    let status = match end {
+        SuperviseEnd::Status(s) => s,
+        SuperviseEnd::Interrupted => Status::Paused,
+    };
+    Ok((out, status))
+}
+
+/// Drive a headless run with configurable rendering, stdio confinement, and
+/// caller watch-channel cancellation (used by both CLI `run` and [`crate::embedded`]).
+pub(crate) async fn supervise_opts(
+    backend: &dyn Backend,
     mut spec: Spec,
     mut launch: Launch,
     structured: bool,
     client: Option<SessionClient>,
     session_id: Option<String>,
-) -> Result<(Outcome, Status)> {
+    mut opts: SuperviseOpts,
+) -> Result<(Outcome, SuperviseEnd)> {
     let stop = Arc::new(AtomicBool::new(false));
     let mut rx = match (&client, &session_id) {
         (Some(c), Some(id)) => Some(control::drain(c.clone(), id.clone(), stop.clone())),
@@ -242,14 +363,17 @@ pub(crate) async fn supervise(
     let mut was_nudged = false;
     let mut last_nudged_error: Option<String> = None;
 
-    let status = loop {
-        let (out, ok, act) = run_turn(
+    let end = loop {
+        let (out, ok, act, interrupted) = run_turn_opts(
             backend,
             structured,
             launch,
             client.clone(),
             session_id.clone(),
             rx.as_mut(),
+            opts.render,
+            opts.null_stdio,
+            &mut opts.cancel,
         )
         .await?;
         let said = out.final_summary.clone();
@@ -259,12 +383,18 @@ pub(crate) async fn supervise(
         acc.tool_calls = acc.tool_calls.saturating_add(out.tool_calls);
         acc.saw_error = out.saw_error;
         acc.exit = out.exit;
+        acc.messages.extend(out.messages);
+        acc.actions.extend(out.actions);
         if out.final_summary.is_some() {
             acc.final_summary = out.final_summary;
         }
 
+        if interrupted {
+            break SuperviseEnd::Interrupted;
+        }
+
         match act {
-            Some(Act::End { status, .. }) => break status,
+            Some(Act::End { status, .. }) => break SuperviseEnd::Status(status),
             Some(Act::Steer { prompt, .. }) => {
                 was_nudged = false;
                 last_nudged_error = None;
@@ -289,7 +419,7 @@ pub(crate) async fn supervise(
                         launch = backend.build(&spec)?;
                         continue;
                     }
-                    break Status::of(ok);
+                    break SuperviseEnd::Status(Status::of(ok));
                 }
 
                 let err_trimmed = (!ok)
@@ -324,13 +454,13 @@ pub(crate) async fn supervise(
                     launch = backend.build(&spec)?;
                     continue;
                 }
-                break Status::of(ok);
+                break SuperviseEnd::Status(Status::of(ok));
             }
         }
     };
 
     stop.store(true, Ordering::Relaxed);
-    Ok((acc, status))
+    Ok((acc, end))
 }
 
 #[cfg(test)]

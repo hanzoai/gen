@@ -473,6 +473,24 @@ pub async fn resolve_or_install_mcp(root: &Root, cwd: &Path, ledger: Option<&Pat
     Some(attach_mcp(installed, exe, cwd, ledger))
 }
 
+/// Resolve or auto-install `hanzo-mcp` directly (without wrapping through
+/// `<current_exe> __mcp`), for in-process embedded hosts (`hanzod`, Desktop, Mobile)
+/// whose own executable is not the `gen`/`hanzo` CLI `__mcp` entrypoint.
+pub async fn resolve_or_install_mcp_direct(root: &Root, cwd: &Path) -> Option<McpAttach> {
+    let exe = std::env::current_exe().ok();
+    let program = match beside(exe.as_deref(), MCP_BIN)
+        .or_else(|| local_mcp(root))
+        .or_else(|| crate::exe::find(MCP_BIN))
+    {
+        Some(found) => found,
+        None => ensure_mcp_installed(root).await?,
+    };
+    Some(McpAttach {
+        program: program.display().to_string(),
+        args: vec!["--project-dir".into(), cwd.display().to_string()],
+    })
+}
+
 fn attach_mcp(program: PathBuf, exe: Option<PathBuf>, cwd: &Path, ledger: Option<&Path>) -> McpAttach {
     let direct = McpAttach {
         program: program.display().to_string(),

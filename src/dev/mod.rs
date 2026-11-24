@@ -66,12 +66,17 @@ impl Backend for Agent {
         self.program
     }
 
-    fn version(&self, _: &Root) -> Option<String> {
-        crate::exe::version(self.program, super::backend::VERSION_WAIT)
+    fn version(&self, root: &Root) -> Option<String> {
+        let prog = crate::exe::find_for_root(root, self.program)
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| self.program.to_string());
+        crate::exe::version(&prog, super::backend::VERSION_WAIT)
     }
 
     fn build(&self, spec: &Spec) -> Result<Launch> {
-        let mut cmd = tokio::process::Command::from(crate::exe::command(crate::exe::find(self.program).unwrap_or_else(|| self.program.into())));
+        let mut cmd = tokio::process::Command::from(crate::exe::command(
+            crate::exe::find_for_root(&spec.root, self.program).unwrap_or_else(|| self.program.into()),
+        ));
         cmd.current_dir(&spec.cwd);
 
         let mut args: Vec<String> = Vec::new();

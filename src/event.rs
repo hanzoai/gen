@@ -5,7 +5,7 @@
 //! [`Mapped`] items; the orchestrator forwards them uniformly. Neither the
 //! backends nor the orchestrator know the wire strings — they live here, once.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 /// Cloud's closed event-kind vocabulary (`cloud/clients/agents/sessions.go`).
@@ -78,7 +78,8 @@ impl Status {
 /// Per-session token/cost usage, as reported by a backend's terminal summary.
 /// This is the session-log record of usage; the AUTHORITATIVE universal metering
 /// is the model traffic itself, routed through the Hanzo gateway (see `route`).
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Usage {
     #[serde(rename = "inputTokens", skip_serializing_if = "Option::is_none")]
     pub input_tokens: Option<u64>,
