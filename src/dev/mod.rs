@@ -116,6 +116,12 @@ impl Backend for Agent {
             args.push(cfg_array("mcp_servers.hanzo.args", &mcp.args));
             args.push("-c".into());
             args.push(cfg_array("mcp_servers.hanzo.env_vars", &mcp_env_vars()));
+            if self.program == Agent::DEV.program {
+                args.push("-c".into());
+                args.push("mcp_servers.hanzo.required=true".into());
+                args.push("-c".into());
+                args.push(cfg_string("mcp_servers.hanzo.startup_readiness", "connection"));
+            }
         }
         // The caller's cloud tools: a streamable-HTTP server whose bearer the agent
         // reads from the variable it is NAMED — the value never reaches argv.
