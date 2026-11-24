@@ -14,7 +14,7 @@ path = "src/main.rs"
 [dependencies]
 # The platform client the session, target and kit calls ride on: the same wire
 # the Hanzo CLI uses, consumed by pinned commit as that crate intends.
-hanzo-client = { git = "https://github.com/hanzoai/cli", rev = "695b57aae6abc21dcdfc3bf6a6d61ed965be8af3" }
+hanzo-client = { git = "https://github.com/hanzoai/cli", rev = "287bcbd78185b382a4561eabaccf620d7c05781f" }
 anyhow = "1.0"
 base64 = "0.22"
 chrono = "0.4"

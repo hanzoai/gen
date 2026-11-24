@@ -14,25 +14,26 @@ sandbox run`, so every launcher takes the same flags and runs `hanzo_gen::run`.
 
 | file | what |
 |---|---|
-| `src/lib.rs` | `run(host, opts)`: resolve route, link the cloud session, equip MCP + kit, launch, stream, finalize, print the summary. `Options`, `warn`. |
+| `src/lib.rs`, `lifecycle.rs`, `routing.rs`, `stream.rs`, `render.rs`, `supervise/` | `run(host, opts)`: resolve route, link the cloud session, equip MCP + kit, launch, stream, supervise, finalize, print the summary. `Options`, `warn`. |
 | `src/args.rs` | `Args` (the clap flags), `Args::dev(command)` (tool is a flag), `Args::into_options`, `expand` (`--<agent>` → `--backend <agent>`). |
 | `src/host.rs` | `Host` trait, `Account`, `Profile`, `Provider`, `BRAND`, `token(brand)`, `claim` (THE owner/name validator, the CLI's too), and `host::Command` (the standalone host). |
 | `src/root.rs` | `Root`: every path Gen writes under a home, from one value the launcher picks (`Root::user()` / `Root::need()` in a `main`, `Root::at(dir)` in tests). Reads `$HOME` itself: an unset, empty or relative home is no home. |
-| `src/exe.rs` | THE program resolver: `find` (full path, absolute PATH entries only), `command` / `bare` (THE way to make a `Command`: the child gets only those entries, so a `#!/usr/bin/env node` finds no `./node`; on Windows `NoDefaultCurrentDirectoryInExePath=1`), `version` (in the program's own directory, first line only, with a time limit). `root_is_the_one_resolver` fails the build on a `Command::new` anywhere else; `lib.rs`'s `spawn` refuses a program not named by full path. |
+| `src/exe.rs` | THE program resolver: `find` (full path, absolute PATH entries only), `command` / `bare` (THE way to make a `Command`: the child gets only those entries, so a `#!/usr/bin/env node` finds no `./node`; on Windows `NoDefaultCurrentDirectoryInExePath=1`), `version` (in the program's own directory, first line only, with a time limit). `root_is_the_one_resolver` fails the build on a `Command::new` anywhere else; `stream.rs`'s `spawn` refuses a program not named by full path. |
 | `src/main.rs` | the `gen` binary: `__mcp` proxy, `expand`, parse, `dev("gen")`, `into_options(Root::need()?)`, `run(host::Command::found())`. |
-| `src/backend.rs` | `BackendKind`, `select` (THE one place a backend is resolved), `Spec`, `Route`/`Routing`, `resolve_mcp`. |
+| `src/backend/` | `BackendKind`, `select` (THE one place a backend is resolved), `Spec`, `Route`/`Routing`, `resolve_or_install_mcp`. |
 | `src/agents/` | one adapter per third-party agent + `wire.rs`; `testdata/*.jsonl` are real captured streams. |
-| `src/claude.rs`, `src/dev.rs` | Claude Code; `dev`/codex/interpreter (the codex grammar). |
+| `src/claude/`, `src/dev/` | Claude Code; `dev`/codex/interpreter (the codex grammar). |
 | `src/mcp.rs` | the lazy MCP proxy (`<exe> __mcp -- hanzo-mcp …`). Both `gen` and `hanzo` route `__mcp` here before parsing. |
-| `src/kit.rs` | the org's kit: skills written where the backend reads them, cloud tools as one MCP server. |
+| `src/kit/` | the org's kit + `hanzoskills.com` auto-detection: skills written where the backend reads them, cloud tools as one MCP server. |
 | `src/session.rs`, `event.rs`, `control.rs` | `/v1/agents/sessions` client, event vocabulary, remote steer/stop. |
-| `src/target.rs`, `context.rs`, `sample.rs` | run-target registry + heartbeat (`beat`, `present`), machine snapshot, live metrics. `hanzo up` and `hanzo link` use them too. |
-| `src/runner.rs` | routed runs: claim, run, report (`serve`, `beat_and_serve`). A run in its own checkout, or in place in a granted folder (below). |
+| `src/target.rs`, `context/`, `sample.rs` | run-target registry + heartbeat (`beat`, `present`), machine snapshot + system probes, live metrics. `hanzo up` and `hanzo link` use them too. |
+| `src/runner/` | routed runs: claim, run, git workspace/deploy-key isolation, report (`serve`, `beat_and_serve`). A run in its own checkout, or in place in a granted folder (below). |
+| `src/contract/` | wire-stable `AgentRun`, `HarnessLock`, and `EvidenceRecord` conformance contract + canonical SHA-256 verification. |
 | `src/harness.rs`, `settings.rs`, `native.rs` | connected accounts + usage line, `~/.hanzo/settings.json`, native agent sign-in table (`hanzo auth login` reads it). |
 | `src/summary.rs`, `savings.rs`, `ledger.rs` | end-of-session block; prices/tallies/meter rows/number formatting (the console uses them too); MCP tool-call ledger. |
 | `src/private.rs` | THE owner-only atomic file write (`write`, `create`). The CLI writes its credential store and config through it. |
 | `src/theme.rs`, `home.rs`, `tier.rs` | Claude theme + config home per route; model tiers. |
-| `src/testmock.rs` | `#[cfg(test)]` hand-rolled cloud over TCP. |
+| `src/testmock.rs`, `tests/filesize.rs`, `tests/signals.rs` | `#[cfg(test)]` hand-rolled cloud over TCP; `<= 1,000`-line file size gate; signal relay integration suite. |
 
 ## The Host
 
@@ -132,6 +133,13 @@ built binary. On Windows only Ctrl-C is held.
   with HOME an empty read-only dir, then an empty writable one that must still be
   empty after; locally, the suite also passes with the real HOME bind-mounted
   read-only (bwrap, TMPDIR outside it).
+- Every `.rs` source and test file under `src/` and `tests/` MUST stay `<= 1,000`
+  lines (`tests/filesize.rs` `source_files_under_1000_lines` enforces this at test
+  time). Split growing modules into focused submodules (`<mod>/mod.rs`, helpers,
+  `tests.rs`) well before reaching the ceiling (target `< 850` lines).
+- Shape multi-step changes into small, atomic `<type>(<scope>): <summary>` commits
+  rather than monolithic dumps, keeping every commit green under `cargo test` and
+  `cargo clippy --all-targets -- -D warnings`.
 
 ## Work
 
