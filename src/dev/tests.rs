@@ -368,11 +368,39 @@ fn a_sign_in_token_is_refreshed_on_a_custom_gateway() {
     assert!(args.iter().any(|a| a == r#"model_providers.hanzocode.auth.command="hanzo""#));
     assert!(args.iter().any(|a| a == r#"model_providers.hanzocode.auth.args=["auth","token"]"#));
     assert!(args.iter().any(|a| a == "model_providers.hanzocode.auth.refresh_interval_ms=600000"));
+    assert!(args.iter().any(|a| a == "model_providers.hanzocode.auth.timeout_ms=30000"));
     assert!(!args.iter().any(|a| a.contains("model_providers.hanzocode.env_key")), "auth and env_key cannot both be set");
 
     let key = argv(&Agent::DEV.build(&spec(Mode::Headless, "https://gw.example.com")).unwrap());
     assert!(key.iter().any(|a| a == r#"model_providers.hanzocode.env_key="HANZO_USER_KEY""#));
     assert!(!key.iter().any(|a| a.contains("hanzocode.auth")));
+}
+
+/// Multi-hour native `dev` runs on `https://api.hanzo.ai` also configure
+/// `model_providers.hanzo.auth.*` with `timeout_ms=30000` when given a session JWT,
+/// so 1h IAM tokens refresh through the Host's exact brand instead of expiring at 60m.
+#[test]
+fn native_api_session_token_configures_hanzo_provider_auth_refresh_with_timeout() {
+    let mut s = spec(Mode::Headless, "https://api.hanzo.ai");
+    s.routing = Route::Via(Routing::Gateway {
+        api: "https://api.hanzo.ai".into(),
+        token: "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ6In0.c2ln".into(),
+        org: Some("hanzo".into()),
+        model: "enso-auto".into(),
+        small_fast_model: "enso-flash".into(),
+        context_window: 1_000_000,
+    });
+    s.refresh = vec!["/usr/local/bin/hanzo".into(), "auth".into(), "token".into(), "--brand".into(), "lux".into()];
+    let args = argv(&Agent::DEV.build(&s).unwrap());
+    assert!(args.iter().any(|a| a == r#"model_providers.hanzo.auth.command="/usr/local/bin/hanzo""#), "{args:?}");
+    assert!(args.iter().any(|a| a == r#"model_providers.hanzo.auth.args=["auth","token","--brand","lux"]"#), "{args:?}");
+    assert!(args.iter().any(|a| a == "model_providers.hanzo.auth.refresh_interval_ms=600000"), "{args:?}");
+    assert!(args.iter().any(|a| a == "model_providers.hanzo.auth.timeout_ms=30000"), "{args:?}");
+    assert!(!args.iter().any(|a| a.starts_with("model_provider=")), "native hanzo provider remains the default: {args:?}");
+
+    // And headless instructions carry the <= 1,000-line + atomic commit guidance.
+    let instr = args.iter().find(|a| a.starts_with("developer_instructions=")).unwrap();
+    assert!(instr.contains("<= 1,000 lines") && instr.contains("<type>(<scope>): <summary>"), "{instr}");
 }
 
 /// The gateway route names the model's REAL window through a `model_catalog_json`

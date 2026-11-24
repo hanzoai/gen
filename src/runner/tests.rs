@@ -477,3 +477,8 @@ async fn the_runner_checks_a_claimed_runs_folder_against_the_beat() {
     assert_eq!(denied["ok"], false);
     assert!(denied["error"].as_str().unwrap().starts_with(FOLDER_NOT_GRANTED), "{denied}");
 }
+
+#[test]
+fn default_routed_run_timeout_matches_four_hour_lease_ceiling() {
+    assert_eq!(DEFAULT_RUN_TIMEOUT, Duration::from_secs(14_400));
+}

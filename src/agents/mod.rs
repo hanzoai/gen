@@ -549,7 +549,9 @@ mod tests {
     /// being made, and this session's own are kept.
     #[test]
     fn a_home_is_swept_once_its_lock_is_free() {
-        let s = test::spec(Mode::Headless, test::gateway());
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = test::spec(Mode::Headless, test::gateway());
+        s.root = Root::at(tmp.path());
         let parent = s.root.hanzo().join("pi");
         std::fs::create_dir_all(&parent).unwrap();
         let home = |name: &str, lock: bool| {
@@ -569,7 +571,15 @@ mod tests {
         assert!(parent.join("run-new").is_dir(), "a home being made was swept");
         assert!(Path::new(&mine).is_dir(), "a live session's home was swept");
         drop((live, other, held));
-        sweep(&parent);
+        // Another test thread that forked while `held` was open carries its descriptor
+        // until `execve` closes `FD_CLOEXEC`; wait out that fork-to-exec window.
+        for _ in 0..50 {
+            sweep(&parent);
+            if !parent.join("run-held").exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         assert!(!parent.join("run-held").exists(), "a home was kept after its lock was let go");
         let _ = std::fs::remove_dir_all(parent.join("run-new"));
     }

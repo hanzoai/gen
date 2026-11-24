@@ -26,8 +26,9 @@ use crate::root::Root;
 use crate::sample::Sampler;
 use crate::target::{self, Grants};
 
-/// Default wall-clock cap for a single routed run when `timeoutSeconds == 0`.
-const DEFAULT_RUN_TIMEOUT: Duration = Duration::from_secs(1800);
+/// Default wall-clock cap for a single routed run when `timeoutSeconds == 0` (4 hours,
+/// matching Cloud's 4-hour `dev`/`desktop` lease ceiling).
+pub(crate) const DEFAULT_RUN_TIMEOUT: Duration = Duration::from_secs(14_400);
 
 /// Client HTTP timeout for `/claim` (server long-polls for 25s).
 const CLAIM_HTTP_TIMEOUT: Duration = Duration::from_secs(40);

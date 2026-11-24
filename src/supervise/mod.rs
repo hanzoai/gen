@@ -1,4 +1,4 @@
-//! Headless turn execution, remote steering/stop control, and supervisor loop.
+//! Headless turn execution, remote steering/stop control, and long-horizon supervisor loop.
 
 use anyhow::{Context, Result};
 use std::process::Stdio;
@@ -15,16 +15,60 @@ use crate::stream::{cut, how, run_stream, spawn, Outcome};
 /// turn with an error; the run is not over, the model is.
 const LOOP_MARK: &str = "repeated identical tool-use cycle detected";
 
-/// The longest call a change-of-course message repeats.
+/// Context-window and output-token exhaustion markers that trigger automatic
+/// compact continuation across multi-hour runs instead of aborting.
+const CONTEXT_OVERFLOW_MARKERS: &[&str] = &[
+    "context_length_exceeded",
+    "maximum context length",
+    "prompt is too long",
+    "context window",
+    "max_output_tokens",
+    "token limit",
+];
+
+/// The longest call or error excerpt a course-correction message repeats.
 const CALL_MAX: usize = 300;
 
-/// How many times a run is nudged on before its end stands, whatever stopped it.
-const MAX_NUDGES: u8 = 2;
+/// How many times a run is nudged on before its end stands.
+pub(crate) const MAX_NUDGES: u8 = 4;
 
-/// What a task run is told when its turn ended announcing a next step, or asking a
-/// question nobody is there to answer.
-const KEEP_GOING: &str = "Your turn ended without finishing the task, and nobody is here to answer. \
-Carry on with your tools now, and end your turn only with the finished result.";
+/// Maximum automatic context-overflow / token-limit continuations across a multi-hour session.
+pub(crate) const MAX_CONTINUATIONS: u8 = 6;
+
+/// Compact handoff prompt injected when a turn hits context or output token limits.
+const CONTINUE_COMPACT: &str = "The previous turn hit a context or output token limit before completing the task. \
+Summarize your current git and workspace progress concisely (3-5 bullets), inspect `git status` / `git diff --stat` \
+if needed without reading huge files whole, and immediately continue executing and verifying the remaining steps \
+until the task is complete.";
+
+/// Progressive escalation prompts when a headless turn stops on narration or an offer.
+fn keep_going(attempt: u8) -> String {
+    match attempt {
+        1 => "Your turn ended without finishing the task, and nobody is here to answer. \
+Carry on with your tools now, and end your turn only with the finished result."
+            .to_string(),
+        2 => "You stopped to announce a next step again, and nobody is here to answer. \
+Stop narrating plans — invoke your tools right now to execute and verify the work, \
+ending only when everything is complete."
+            .to_string(),
+        3 => format!(
+            "Escalation (nudge 3/{MAX_NUDGES}): nobody is here to reply. Do not end your turn with \
+             a colon, status update, or question. Run every remaining edit, build, and test tool call \
+             now, and conclude only with the final verified result."
+        ),
+        _ => format!(
+            "Final autonomous escalation (nudge {attempt}/{MAX_NUDGES}): nobody is here to answer. \
+             Complete all remaining tool executions and verification immediately in this turn, then \
+             output only the final summary."
+        ),
+    }
+}
+
+/// Whether `said` reports context-window or output-token exhaustion.
+pub(crate) fn context_overflow(said: &str) -> bool {
+    let lower = said.to_ascii_lowercase();
+    CONTEXT_OVERFLOW_MARKERS.iter().any(|m| lower.contains(m))
+}
 
 /// Whether `said` ends a turn on an announcement or an offer instead of a result: a last
 /// line that ends in a colon, or starts "let me", "now I'll", "would you like" and the like.
@@ -33,10 +77,28 @@ fn narrating(said: &str) -> bool {
     if s.ends_with(':') {
         return true;
     }
-    let last = s.lines().last().unwrap_or("").trim_start_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
+    let last = s
+        .lines()
+        .last()
+        .unwrap_or("")
+        .trim_start_matches(|c: char| !c.is_alphanumeric())
+        .to_lowercase();
     [
-        "let me ", "let's ", "now let me", "now let's", "now i'll ", "now i will ", "next i'll ", "next i will ",
-        "next, i'll ", "next, i will ", "i'll now ", "i will now ", "would you like", "do you want me to", "shall i ",
+        "let me ",
+        "let's ",
+        "now let me",
+        "now let's",
+        "now i'll ",
+        "now i will ",
+        "next i'll ",
+        "next i will ",
+        "next, i'll ",
+        "next, i will ",
+        "i'll now ",
+        "i will now ",
+        "would you like",
+        "do you want me to",
+        "shall i ",
         "should i ",
     ]
     .iter()
@@ -45,16 +107,42 @@ fn narrating(said: &str) -> bool {
 
 /// What a model stopped by the loop guard is told: the call it repeated and to change it.
 fn change_course(said: &str) -> String {
-    let call = said.split_once("duplicate tool calls:").map(|(_, c)| c.trim()).unwrap_or("");
-    let mut told = String::from("You made the same tool call twice in a row and got the same result, so your turn was stopped.");
+    let call = said
+        .split_once("duplicate tool calls:")
+        .map(|(_, c)| c.trim())
+        .unwrap_or("");
+    let mut told = String::from(
+        "You made the same tool call twice in a row and got the same result, so your turn was stopped.",
+    );
     if !call.is_empty() {
         told.push_str(" The call was: ");
         told.push_str(&cut(call, CALL_MAX));
     }
-    told.push_str("\n\nDo not make it again. Use a different command or different arguments, and carry on with the task.");
+    told.push_str(
+        "\n\nDo not make it again. Use a different command or different arguments, and carry on with the task.",
+    );
     told
 }
 
+/// Recovery prompt when a first nudged turn fails with an error summary.
+fn recover_nudged_failure(err: &str) -> String {
+    format!(
+        "Your previous resumed turn failed with: {}\n\n\
+         Inspect why it failed, fix the root cause with your tools, and carry on to finish the task.",
+        cut(err.trim(), CALL_MAX)
+    )
+}
+
+/// Targeted course-correction prompt when two consecutive nudged turns fail with the
+/// exact same error summary (oscillation guard).
+fn change_course_on_repeated_failure(err: &str) -> String {
+    format!(
+        "Course correction — you must change course: two consecutive turns failed with the exact same error:\n  {}\n\n\
+         Do NOT repeat the failing command or approach. Diagnose the root cause by inspecting the relevant \
+         files/state, switch to a different strategy, and complete the task.",
+        cut(err.trim(), CALL_MAX)
+    )
+}
 
 /// Run ONE headless turn, watching for a steering command while it streams.
 ///
@@ -76,8 +164,10 @@ pub(crate) async fn run_turn(
     control: Option<&mut tokio::sync::mpsc::Receiver<Command>>,
 ) -> Result<(Outcome, bool, Option<Act>)> {
     let Launch { mut command, cleanup } = launch;
-    // A run given up on (its time limit, its folder revoked) takes its agent with it.
-    command.stdin(Stdio::inherit()).stderr(Stdio::inherit()).kill_on_drop(true);
+    command
+        .stdin(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true);
     if structured {
         command.stdout(Stdio::piped());
     } else {
@@ -100,8 +190,6 @@ pub(crate) async fn run_turn(
             let streaming = run_stream(backend, reader, client, session_id, true);
             tokio::pin!(streaming);
             match control {
-                // Unlinked: nothing can steer this run, so there is nothing to
-                // select on. The privacy gate is structural here too.
                 None => streaming.await?,
                 Some(rx) => loop {
                     tokio::select! {
@@ -109,11 +197,6 @@ pub(crate) async fn run_turn(
                         Some(cmd) = rx.recv(), if acted.is_none() => {
                             let act = cmd.act();
                             if let Some(sig) = act.signal() {
-                                // A signal we cannot deliver (Windows has no
-                                // SIGINT for another process) must still stop the
-                                // run — fall back to the platform's own kill
-                                // rather than let a remote stop silently do
-                                // nothing.
                                 if let Some(p) = pid {
                                     if control::send(p, sig).is_err() {
                                         let _ = child.start_kill();
@@ -139,12 +222,6 @@ pub(crate) async fn run_turn(
 
 /// Drive a headless run to completion under remote control, returning the
 /// accumulated outcome and the status to finalize the cloud session with.
-///
-/// A `message` command makes this loop: the child is interrupted, the spec is
-/// rebuilt with the backend's OWN resume handle plus the new instruction, and the
-/// next turn continues the SAME conversation — native `--resume`, never injected
-/// keystrokes. The cloud session id never changes across a steer, so the
-/// dashboard watches one unbroken session while the turns underneath it restart.
 pub(crate) async fn supervise(
     backend: &dyn Backend,
     mut spec: Spec,
@@ -153,8 +230,6 @@ pub(crate) async fn supervise(
     client: Option<SessionClient>,
     session_id: Option<String>,
 ) -> Result<(Outcome, Status)> {
-    // The drain runs only for a linked run — same structural auth gate as the
-    // event stream. An unlinked run holds no client, so nothing can steer it.
     let stop = Arc::new(AtomicBool::new(false));
     let mut rx = match (&client, &session_id) {
         (Some(c), Some(id)) => Some(control::drain(c.clone(), id.clone(), stop.clone())),
@@ -163,15 +238,22 @@ pub(crate) async fn supervise(
 
     let mut acc = Outcome::default();
     let mut nudged = 0u8;
+    let mut continuations = 0u8;
+    let mut was_nudged = false;
+    let mut last_nudged_error: Option<String> = None;
+
     let status = loop {
-        let (out, ok, act) =
-            run_turn(backend, structured, launch, client.clone(), session_id.clone(), rx.as_mut())
-                .await?;
+        let (out, ok, act) = run_turn(
+            backend,
+            structured,
+            launch,
+            client.clone(),
+            session_id.clone(),
+            rx.as_mut(),
+        )
+        .await?;
         let said = out.final_summary.clone();
 
-        // Fold this turn into the run. The backend session id is set once — it is
-        // the SAME conversation across every steer — while usage accumulates and
-        // the newest summary wins.
         acc.backend_session = acc.backend_session.or(out.backend_session);
         acc.usage.merge(out.usage);
         acc.tool_calls = acc.tool_calls.saturating_add(out.tool_calls);
@@ -182,39 +264,60 @@ pub(crate) async fn supervise(
         }
 
         match act {
-            // Commanded end: the COMMAND decides the status, not the exit code —
-            // a stop exits 143 and is still a clean `done`, never an `error`.
             Some(Act::End { status, .. }) => break status,
             Some(Act::Steer { prompt, .. }) => {
-                // Resume the conversation the run has BUILT UP — unless there
-                // isn't one yet. A turn that never disclosed a session id was
-                // interrupted before the backend finished starting, so there is
-                // no transcript to preserve and a fresh launch loses nothing;
-                // relaunching either way is what makes a steer land whenever the
-                // human clicks it, rather than only after start-up completes.
+                was_nudged = false;
+                last_nudged_error = None;
                 spec.resume = acc.backend_session.clone();
                 spec.task = Some(prompt);
-                // `--resume` and `--session-id` are mutually exclusive, so a
-                // resumed turn drops the pre-set id.
                 if spec.resume.is_some() {
                     spec.preset_session = None;
                 }
                 launch = backend.build(&spec)?;
             }
-            // Uncommanded end: the backend finished (or failed) on its own.
-            //
-            // A turn the loop guard stopped, or one that ended announcing a next step,
-            // is nudged in the same conversation, up to MAX_NUDGES times; only then
-            // does its end stand.
             None | Some(Act::Ignore) => {
-                let nudge = match said.as_deref() {
-                    Some(m) if !ok && m.contains(LOOP_MARK) => Some(change_course(m)),
-                    Some(m) if ok && narrating(m) => Some(KEEP_GOING.to_string()),
-                    _ => None,
+                if said.as_deref().is_some_and(context_overflow) {
+                    if continuations < MAX_CONTINUATIONS && acc.backend_session.is_some() {
+                        continuations += 1;
+                        crate::warn(&format!(
+                            "{} hit context/token limit; auto-continuing ({continuations}/{MAX_CONTINUATIONS})",
+                            backend.label()
+                        ));
+                        spec.resume = acc.backend_session.clone();
+                        spec.task = Some(CONTINUE_COMPACT.to_string());
+                        spec.preset_session = None;
+                        launch = backend.build(&spec)?;
+                        continue;
+                    }
+                    break Status::of(ok);
+                }
+
+                let err_trimmed = (!ok)
+                    .then(|| said.as_deref().map(str::trim).filter(|s| !s.is_empty()))
+                    .flatten();
+                let repeated_nudged_error =
+                    was_nudged && err_trimmed.is_some() && last_nudged_error.as_deref() == err_trimmed;
+
+                let nudge = if repeated_nudged_error {
+                    Some(change_course_on_repeated_failure(err_trimmed.unwrap()))
+                } else if let Some(m) = err_trimmed.filter(|m| m.contains(LOOP_MARK)) {
+                    Some(change_course(m))
+                } else if let Some(err) = err_trimmed.filter(|_| was_nudged) {
+                    Some(recover_nudged_failure(err))
+                } else if ok && said.as_deref().is_some_and(narrating) {
+                    Some(keep_going(nudged + 1))
+                } else {
+                    None
                 };
+
                 if let Some(told) = nudge.filter(|_| nudged < MAX_NUDGES && acc.backend_session.is_some()) {
                     nudged += 1;
-                    crate::warn(&format!("{} stopped short; nudging it on ({nudged}/{MAX_NUDGES})", backend.label()));
+                    last_nudged_error = err_trimmed.map(String::from);
+                    was_nudged = true;
+                    crate::warn(&format!(
+                        "{} stopped short; nudging it on ({nudged}/{MAX_NUDGES})",
+                        backend.label()
+                    ));
                     spec.resume = acc.backend_session.clone();
                     spec.task = Some(told);
                     spec.preset_session = None;
@@ -229,7 +332,6 @@ pub(crate) async fn supervise(
     stop.store(true, Ordering::Relaxed);
     Ok((acc, status))
 }
-
 
 #[cfg(test)]
 mod tests;

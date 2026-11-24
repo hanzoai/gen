@@ -164,8 +164,13 @@ impl Backend for Agent {
                 }
                 // Only `dev` ships a native `hanzo` provider. codex and Open Interpreter
                 // are told about the gateway on every run, or they call api.openai.com.
-                if api.trim_end_matches('/') != NATIVE_API || self.program != Agent::DEV.program {
-                    let base = format!("{}/v1", api.trim_end_matches('/'));
+                let trimmed = api.trim_end_matches('/');
+                if trimmed != NATIVE_API || self.program != Agent::DEV.program {
+                    let base = if trimmed.ends_with("/v1") || trimmed.contains("/v1/") {
+                        trimmed.to_string()
+                    } else {
+                        format!("{trimmed}/v1")
+                    };
                     args.push("-c".into());
                     args.push(cfg_string("model_providers.hanzocode.name", "Hanzo Code"));
                     args.push("-c".into());
@@ -175,18 +180,19 @@ impl Backend for Agent {
                     if let (true, Some((program, rest))) = (is_session_token(token), spec.refresh.split_first()) {
                         // A sign-in token ages out within the hour, so the agent asks
                         // the host for it again rather than reading it once.
-                        args.push("-c".into());
-                        args.push(cfg_string("model_providers.hanzocode.auth.command", program));
-                        args.push("-c".into());
-                        args.push(cfg_array("model_providers.hanzocode.auth.args", rest));
-                        args.push("-c".into());
-                        args.push(format!("model_providers.hanzocode.auth.refresh_interval_ms={TOKEN_REFRESH_MS}"));
+                        push_auth_refresh(&mut args, "hanzocode", program, rest);
                     } else {
                         args.push("-c".into());
                         args.push(cfg_string("model_providers.hanzocode.env_key", "HANZO_USER_KEY"));
                     }
                     args.push("-c".into());
                     args.push(cfg_string("model_provider", "hanzocode"));
+                } else if let (true, Some((program, rest))) = (is_session_token(token), spec.refresh.split_first()) {
+                    // `dev` on https://api.hanzo.ai already defaults to `model_providers.hanzo`,
+                    // whose built-in `auth.command` runs `dev token`. Point `hanzo.auth` at the
+                    // Host's refresh command with a 30s timeout so multi-hour runs auto-refresh
+                    // expiring 1h IAM JWTs for the active brand instead of 401-ing at 60m.
+                    push_auth_refresh(&mut args, "hanzo", program, rest);
                 }
             }
             // Direct OpenAI: the user's own key on codex's native `openai`
@@ -392,10 +398,24 @@ fn model_catalog(model: &str, context_window: u64) -> String {
     .to_string()
 }
 
-/// A `-c key=value` override where `value` is a TOML string literal.
 /// How often the agent asks for the sign-in token again: well inside the hour
 /// an IAM token lives.
 const TOKEN_REFRESH_MS: u64 = 600_000;
+
+/// Timeout for the external auth-refresh command (`hanzo auth token`), generous
+/// enough to ride out transient IAM/network latency during multi-hour sessions.
+const AUTH_TIMEOUT_MS: u64 = 30_000;
+
+fn push_auth_refresh(args: &mut Vec<String>, provider: &str, program: &str, rest: &[String]) {
+    args.push("-c".into());
+    args.push(cfg_string(&format!("model_providers.{provider}.auth.command"), program));
+    args.push("-c".into());
+    args.push(cfg_array(&format!("model_providers.{provider}.auth.args"), rest));
+    args.push("-c".into());
+    args.push(format!("model_providers.{provider}.auth.refresh_interval_ms={TOKEN_REFRESH_MS}"));
+    args.push("-c".into());
+    args.push(format!("model_providers.{provider}.auth.timeout_ms={AUTH_TIMEOUT_MS}"));
+}
 
 /// An IAM sign-in token (a JWT, which ages out) rather than an API key.
 fn is_session_token(value: &str) -> bool {
@@ -496,11 +516,15 @@ fn cfg_string(key: &str, val: &str) -> String {
     format!("{key}={}", toml_string(val))
 }
 
-/// What a task run's agent is told: nobody is present to answer it.
-const NO_ONE_TO_ASK: &str = "This run is non-interactive: nobody is present to answer a question or approve a step. \
-Do the whole task with your tools before you end your turn. Do not stop to ask whether to continue, \
-do not offer follow-up work, and do not announce a next step without taking it; end your turn only \
-when the task is complete, with the result.";
+/// What a task run's agent is told: nobody is present to answer it, plus
+/// long-horizon modularization and atomic git hygiene invariants.
+pub(crate) const NO_ONE_TO_ASK: &str = "This run is non-interactive: nobody is present to answer a question or approve a step. \
+Inspect the codebase, decide, execute the whole task with your tools, and verify before you end your turn. \
+Do not stop to ask whether to continue, do not offer follow-up work, and do not announce a next step without taking it; \
+end your turn only when the task is complete, with the result. \
+Keep modules clean and <= 1,000 lines; split files into focused submodules before they grow unwieldy. \
+When working in a git repository on multi-step changes, shape work into small, atomic `<type>(<scope>): <summary>` commits \
+when appropriate rather than giant monolithic dumps, without force-pushing or discarding user work.";
 
 /// A `-c key=value` override where `value` is a TOML array of strings.
 fn cfg_array(key: &str, items: &[String]) -> String {

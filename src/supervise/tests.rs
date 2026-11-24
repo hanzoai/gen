@@ -602,3 +602,76 @@ async fn an_unlinked_run_is_unsteerable() {
     assert_eq!(status, Status::Done);
     assert_eq!(out.final_summary.as_deref(), Some("finished"));
 }
+
+#[tokio::test]
+async fn context_overflow_auto_continues_with_compact_handoff_up_to_six_times() {
+    const OVERFLOW_FAIL: &str = concat!(
+        r#"echo '{"type":"system","subtype":"init","session_id":"bsid-ctx","model":"m"}'; "#,
+        r#"echo '{"type":"result","subtype":"error_during_execution","is_error":true,"session_id":"bsid-ctx","result":"API Error: context_length_exceeded: maximum context length reached"}'; "#,
+        "exit 1",
+    );
+    const MAX_OUT_END: &str = concat!(
+        r#"echo '{"type":"system","subtype":"init","session_id":"bsid-ctx","model":"m"}'; "#,
+        r#"echo '{"type":"result","subtype":"success","is_error":false,"session_id":"bsid-ctx","result":"Stopped due to max_output_tokens limit"}'"#,
+    );
+    const DONE: &str = concat!(
+        r#"echo '{"type":"system","subtype":"init","session_id":"bsid-ctx","model":"m"}'; "#,
+        r#"echo '{"type":"result","subtype":"success","is_error":false,"session_id":"bsid-ctx","result":"All steps completed and verified.","num_turns":2}'"#,
+    );
+
+    let mock = MockCloud::start().await;
+    let (out, status, built, _) =
+        supervise_with(&mock, "sess_ctx", vec![OVERFLOW_FAIL, MAX_OUT_END, DONE]).await;
+    let built = built.lock().unwrap().clone();
+    assert_eq!(built.len(), 3, "{built:?}");
+    assert_eq!(built[1].0.as_deref(), Some("bsid-ctx"));
+    assert!(built[1].1.as_deref().unwrap().contains("context or output token limit"));
+    assert_eq!(built[2].0.as_deref(), Some("bsid-ctx"));
+    assert_eq!(status, Status::Done);
+    assert_eq!(out.final_summary.as_deref(), Some("All steps completed and verified."));
+
+    // And an endless overflow stops cleanly after MAX_CONTINUATIONS (6) continuations.
+    assert_eq!(MAX_CONTINUATIONS, 6);
+    let mock2 = MockCloud::start().await;
+    let (_, status2, built2, _) = supervise_with(&mock2, "sess_ctx_cap", vec![OVERFLOW_FAIL]).await;
+    assert_eq!(built2.lock().unwrap().len(), 1 + MAX_CONTINUATIONS as usize);
+    assert_eq!(status2, Status::Error);
+}
+
+#[tokio::test]
+async fn consecutive_identical_nudged_failures_inject_targeted_change_course_and_progressive_narrating() {
+    assert_eq!(MAX_NUDGES, 4);
+    const NARRATE_1: &str = concat!(
+        r#"echo '{"type":"system","subtype":"init","session_id":"bsid-osc","model":"m"}'; "#,
+        r#"echo '{"type":"result","subtype":"success","is_error":false,"session_id":"bsid-osc","result":"Now let me build the crate:"}'"#,
+    );
+    const SAME_ERR: &str = concat!(
+        r#"echo '{"type":"system","subtype":"init","session_id":"bsid-osc","model":"m"}'; "#,
+        r#"echo '{"type":"result","subtype":"error_during_execution","is_error":true,"session_id":"bsid-osc","result":"cargo build failed: missing linker flag -lz"}'; "#,
+        "exit 1",
+    );
+    const RECOVERED: &str = concat!(
+        r#"echo '{"type":"system","subtype":"init","session_id":"bsid-osc","model":"m"}'; "#,
+        r#"echo '{"type":"result","subtype":"success","is_error":false,"session_id":"bsid-osc","result":"Switched to pure-Rust backend; all tests pass."}'"#,
+    );
+
+    let mock = MockCloud::start().await;
+    let (out, status, built, _) =
+        supervise_with(&mock, "sess_osc", vec![NARRATE_1, SAME_ERR, SAME_ERR, RECOVERED]).await;
+    let built = built.lock().unwrap().clone();
+    assert_eq!(built.len(), 4, "{built:?}");
+    // Turn 1: initial narrating nudge
+    assert!(built[1].1.as_deref().unwrap().contains("nobody is here"));
+    // Turn 2: first failure after nudge -> recover
+    assert!(built[2].1.as_deref().unwrap().contains("missing linker flag -lz"));
+    // Turn 3: second consecutive nudged failure with identical summary -> change course!
+    let pivot = built[3].1.as_deref().unwrap();
+    assert!(pivot.contains("change course") && pivot.contains("two consecutive turns failed"), "{pivot}");
+    assert_eq!(status, Status::Done);
+    assert_eq!(out.final_summary.as_deref(), Some("Switched to pure-Rust backend; all tests pass."));
+
+    // Progressive escalation across 4 narrating nudges gives distinct escalating prompts.
+    assert_ne!(keep_going(1), keep_going(2));
+    assert!(keep_going(3).contains("3/4"));
+    assert!(keep_going(4).contains("4/4"));
+}
