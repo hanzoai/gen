@@ -29,7 +29,7 @@ fn build(r: &mut Run) -> Result<()> {
             "command": m.program,
             "args": m.args,
         });
-        r.arg("-c").arg(format!("mcpServers.hanzo={cfg}"));
+        r.arg("-c").arg(format!("mcpServers.hanzo-tools={cfg}"));
     }
     if r.auto() {
         r.arg("--yolo");
@@ -98,14 +98,14 @@ mod tests {
         let a = argv(&h);
         assert_eq!(a[0], "exec");
         assert_eq!(a[1], "-c");
-        assert!(a[2].starts_with("mcpServers.hanzo={"), "got {}", a[2]);
+        assert!(a[2].starts_with("mcpServers.hanzo-tools={"), "got {}", a[2]);
         assert_eq!(&a[3..], ["--yolo", "fix the test"]);
         assert!(env(&h, "OPENAI_API_KEY").is_none());
 
         let i = build("muse", &spec(Mode::Interactive, Route::Inherit));
         let ia = argv(&i);
         assert_eq!(ia[0], "-c");
-        assert!(ia[1].starts_with("mcpServers.hanzo={"), "got {}", ia[1]);
+        assert!(ia[1].starts_with("mcpServers.hanzo-tools={"), "got {}", ia[1]);
         assert_eq!(&ia[2..], ["--yolo"]);
     }
 
