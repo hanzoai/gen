@@ -461,6 +461,10 @@ pub async fn run_embedded_turn(
 
     let mut passthrough = Vec::new();
     if matches!(kind, BackendKind::Dev | BackendKind::Codex | BackendKind::Interpreter) {
+        if local {
+            passthrough.push("-c".to_string());
+            passthrough.push("model_providers.hanzocode.wire_api=\"chat\"".to_string());
+        }
         if let Some(eff) = req
             .effort
             .as_deref()
