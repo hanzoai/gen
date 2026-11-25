@@ -566,7 +566,16 @@ pub async fn run(host: Arc<dyn Host>, opts: Options) -> Result<()> {
     // so keep it for the pointer recorded after the child exits — the supervisor
     // consumes `spec`. One value, read twice; never re-derived.
     let route = spec.routing.clone();
-    let launch = backend.build(&spec)?;
+    let launch = match backend.build(&spec) {
+        Ok(launch) => launch,
+        Err(e) => {
+            if let (Some(c), Some(id)) = (&client, &session_id) {
+                let why = cut(&format!("{e:#}"), REASON_MAX);
+                finalize(c, id, &Outcome::default(), Status::Error, &snapshot, &api, &who, None, &root, Some(&why)).await;
+            }
+            return Err(e);
+        }
+    };
 
     // The session id we watch for the interactive transcript tail.
     let watch_sid = resume_handle.clone().or(preset_session);
@@ -584,13 +593,13 @@ pub async fn run(host: Arc<dyn Host>, opts: Options) -> Result<()> {
                 Ok((o, s)) => (o.clone(), *s),
                 Err(_) => (Outcome::default(), Status::Error),
             };
+            let reason = (status == Status::Error).then(|| reason_of(&run, backend.label()));
             if let (Some(c), Some(id)) = (&client, &session_id) {
                 let transcript = outcome
                     .backend_session
                     .as_ref()
                     .and_then(|bs| backend.transcript_path(&root, &route, &cwd, bs))
                     .map(|p| p.display().to_string());
-                let reason = (status == Status::Error).then(|| reason_of(&run, backend.label()));
                 finalize(c, id, &outcome, status, &snapshot, &api, &who, transcript, &root, reason.as_deref()).await;
             }
             spent.end(&*host, &opts.brand, backend.label(), kind == BackendKind::Claude, &outcome.usage, session_id.as_deref(), tools.as_deref().map_err(String::as_str)).await;
@@ -601,7 +610,10 @@ pub async fn run(host: Arc<dyn Host>, opts: Options) -> Result<()> {
             // A task run is scripted, so its exit status is the answer: an agent
             // that failed fails `hanzo`, and a caller's `&&` or CI step sees it.
             if status == Status::Error {
-                bail!("{} did not finish the task: it exited with an error", backend.label());
+                let why = reason.unwrap_or_else(|| {
+                    format!("{} did not finish the task: it exited with an error", backend.label())
+                });
+                bail!("{why}");
             }
         }
         Mode::Interactive => {

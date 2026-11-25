@@ -500,9 +500,19 @@ pub async fn run_embedded_turn(
         root: req.root,
     };
 
-    let launch = backend.build(&spec)?;
     let mirror_sid = client.as_ref().and(link_id);
-    let (outcome, end) = supervise_opts(
+    let launch = match backend.build(&spec) {
+        Ok(launch) => launch,
+        Err(e) => {
+            if let (Some(c), Some(sid)) = (&client, mirror_sid.as_deref()) {
+                let _ = c
+                    .record_error(sid, &crate::stream::cut(&format!("{e:#}"), crate::stream::REASON_MAX))
+                    .await;
+            }
+            return Err(e);
+        }
+    };
+    let (outcome, end) = match supervise_opts(
         &*backend,
         spec,
         launch,
@@ -515,7 +525,18 @@ pub async fn run_embedded_turn(
             cancel: req.cancel,
         },
     )
-    .await?;
+    .await
+    {
+        Ok(res) => res,
+        Err(e) => {
+            if let (Some(c), Some(sid)) = (&client, mirror_sid.as_deref()) {
+                let _ = c
+                    .record_error(sid, &crate::stream::cut(&format!("{e:#}"), crate::stream::REASON_MAX))
+                    .await;
+            }
+            return Err(e);
+        }
+    };
 
     if let (Some(c), Some(sid)) = (&client, mirror_sid.as_deref()) {
         if !outcome.usage.is_empty() {
@@ -532,6 +553,9 @@ pub async fn run_embedded_turn(
         SuperviseEnd::Status(Status::Running) => (true, "running".to_string(), None),
         SuperviseEnd::Status(Status::Error) => {
             let why = reason_of(&Ok((outcome.clone(), Status::Error)), backend.label());
+            if let (Some(c), Some(sid)) = (&client, mirror_sid.as_deref()) {
+                let _ = c.record_error(sid, &why).await;
+            }
             (false, "error".to_string(), Some(why))
         }
     };

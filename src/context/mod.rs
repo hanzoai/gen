@@ -54,6 +54,8 @@ pub struct Snapshot {
     pub backend: String,
     #[serde(rename = "backendVersion", skip_serializing_if = "Option::is_none")]
     pub backend_version: Option<String>,
+    #[serde(rename = "genVersion", default, skip_serializing_if = "Option::is_none")]
+    pub gen_version: Option<String>,
     #[serde(skip_serializing_if = "Repo::is_empty")]
     pub repo: Repo,
 }
@@ -70,6 +72,7 @@ impl Snapshot {
             cwd: cwd.display().to_string(),
             backend: backend.to_string(),
             backend_version,
+            gen_version: Some(env!("CARGO_PKG_VERSION").to_string()),
             repo: git_repo(cwd),
         }
     }

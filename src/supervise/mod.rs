@@ -233,10 +233,11 @@ async fn run_turn_opts(
 
     let Launch { mut command, cleanup } = launch;
     if null_stdio {
-        command.stdin(Stdio::null()).stderr(Stdio::null());
+        command.stdin(Stdio::null());
     } else {
-        command.stdin(Stdio::inherit()).stderr(Stdio::inherit());
+        command.stdin(Stdio::inherit());
     }
+    command.stderr(Stdio::piped());
     command.kill_on_drop(true);
     if structured {
         command.stdout(Stdio::piped());
@@ -248,6 +249,10 @@ async fn run_turn_opts(
     }
     let mut relay = (!null_stdio).then(control::relay);
     let mut child = spawn(&mut command, backend.label())?;
+    let stderr_task = child
+        .stderr
+        .take()
+        .map(|err| crate::stream::spawn_stderr_tee(err, !null_stdio));
     let pid = child.id();
     if let Some(r) = &mut relay {
         r.to(pid);
@@ -307,6 +312,16 @@ async fn run_turn_opts(
     }
 
     let status = child.wait().await.context("waiting for backend")?;
+    if let Some(handle) = stderr_task {
+        let abort = handle.abort_handle();
+        if let Ok(Ok(tail)) = tokio::time::timeout(Duration::from_millis(250), handle).await {
+            if !status.success() {
+                outcome.stderr_tail = tail;
+            }
+        } else {
+            abort.abort();
+        }
+    }
     drop(relay);
     drop(cleanup);
     outcome.exit = how(&status);
@@ -383,6 +398,7 @@ pub(crate) async fn supervise_opts(
         acc.tool_calls = acc.tool_calls.saturating_add(out.tool_calls);
         acc.saw_error = out.saw_error;
         acc.exit = out.exit;
+        acc.stderr_tail = out.stderr_tail;
         acc.messages.extend(out.messages);
         acc.actions.extend(out.actions);
         if out.final_summary.is_some() {
