@@ -185,6 +185,61 @@ async fn a_runs_deploy_key_is_held_for_the_run_and_removed_after() {
     assert!(!format!("{run:?}").contains("PRIVATE-KEY"));
 }
 
+// A clone that fails reports git's own reason, not only the wrapper that names the step:
+// "Permission denied (publickey)" is what tells the owner what to fix.
+#[tokio::test]
+async fn a_failed_clone_reports_gits_reason() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut run = folder_run(tmp.path());
+    run.dir = String::new();
+    run.session_id = "sess_clone_fail".into();
+    run.base = "main".into();
+    run.clone_url = tmp.path().join("no-such-repo").to_string_lossy().into_owned();
+    let exec: Executor = Arc::new(|_run, _cwd| Box::pin(async { Ok(None) }));
+    let report = execute_workspace_run(&tmp.path().join("workspace"), &run, exec).await;
+    assert!(!report.ok);
+    assert!(report.error.starts_with("workspace setup failed: git clone failed"), "{}", report.error);
+    assert!(report.error.contains("does not exist"), "git's reason was lost: {}", report.error);
+}
+
+// A push the origin refuses reports the origin's words too, not only "git push ... failed".
+#[cfg(unix)]
+#[tokio::test]
+async fn a_refused_push_reports_gits_reason() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let origin = tmp.path().join("origin.git");
+    let seed = tmp.path().join("seed");
+    run_git(None, &["init", "--bare", "--initial-branch=main", &origin.to_string_lossy()]).await.unwrap();
+    run_git(None, &["clone", &origin.to_string_lossy(), &seed.to_string_lossy()]).await.unwrap();
+    run_git(Some(&seed), &["config", "user.email", "test@hanzo.ai"]).await.unwrap();
+    run_git(Some(&seed), &["config", "user.name", "Test"]).await.unwrap();
+    std::fs::write(seed.join("README.md"), "hello\n").unwrap();
+    run_git(Some(&seed), &["add", "."]).await.unwrap();
+    run_git(Some(&seed), &["commit", "-m", "initial"]).await.unwrap();
+    run_git(Some(&seed), &["push", "origin", "HEAD:refs/heads/main"]).await.unwrap();
+    let hook = origin.join("hooks").join("pre-receive");
+    std::fs::write(&hook, "#!/bin/sh\necho \"refused by test\" >&2\nexit 1\n").unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut run = folder_run(tmp.path());
+    run.dir = String::new();
+    run.session_id = "sess_push_refused".into();
+    run.base = "main".into();
+    run.branch = "hanzo/refused".into();
+    run.clone_url = origin.to_string_lossy().into_owned();
+    let exec: Executor = Arc::new(|_run, cwd| {
+        Box::pin(async move {
+            std::fs::write(cwd.join("README.md"), "changed\n")?;
+            Ok(None)
+        })
+    });
+    let report = execute_workspace_run(&tmp.path().join("workspace"), &run, exec).await;
+    assert!(!report.ok);
+    assert!(report.error.contains("git push origin HEAD:refs/heads/"), "{}", report.error);
+    assert!(report.error.contains("refused by test"), "the origin's reason was lost: {}", report.error);
+}
+
 // A run with no repository still works in a directory the agent accepts: `dev`
 // (codex exec) refuses one that is not inside a git work tree and exits at once, which is
 // how every bare run on a linked machine ended in an error nobody read.

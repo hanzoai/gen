@@ -562,7 +562,7 @@ pub async fn execute_workspace_run(work_dir: &Path, run: &RoutedRun, executor: E
     let access = if has_repo && !run.deploy_key.0.is_empty() {
         match Access::make(work_dir, &run.deploy_key.0, &run.known_hosts) {
             Ok(a) => Some(a),
-            Err(e) => return failure_report(&run.branch, format!("workspace setup failed: {e}")),
+            Err(e) => return failure_report(&run.branch, format!("workspace setup failed: {e:#}")),
         }
     } else {
         None
@@ -571,7 +571,7 @@ pub async fn execute_workspace_run(work_dir: &Path, run: &RoutedRun, executor: E
     if has_repo {
         let ssh = access.as_ref().map(|a| a.ssh.as_str());
         if let Err(e) = prepare_git_workspace(work_dir, &run.clone_url, &run.base, &run.branch, ssh).await {
-            return failure_report(&run.branch, format!("workspace setup failed: {e}"));
+            return failure_report(&run.branch, format!("workspace setup failed: {e:#}"));
         }
         base_sha = git_stdout(work_dir, &["rev-parse", "HEAD"]).await.unwrap_or_default();
     } else {
@@ -581,7 +581,7 @@ pub async fn execute_workspace_run(work_dir: &Path, run: &RoutedRun, executor: E
             return failure_report(&run.branch, format!("creating workspace dir: {e}"));
         }
         if let Err(e) = run_git(Some(work_dir), &["init", "--quiet"]).await {
-            return failure_report(&run.branch, format!("workspace setup failed: {e}"));
+            return failure_report(&run.branch, format!("workspace setup failed: {e:#}"));
         }
     }
 
@@ -625,9 +625,9 @@ pub async fn execute_workspace_run(work_dir: &Path, run: &RoutedRun, executor: E
             Err(push_err) => {
                 ok = false;
                 if err_msg.is_empty() {
-                    err_msg = push_err.to_string();
+                    err_msg = format!("{push_err:#}");
                 } else {
-                    err_msg = format!("{err_msg}; git finalize failed: {push_err}");
+                    err_msg = format!("{err_msg}; git finalize failed: {push_err:#}");
                 }
             }
         }
