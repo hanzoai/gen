@@ -583,6 +583,45 @@ async fn the_runner_checks_a_claimed_runs_folder_against_the_beat() {
     assert!(denied["error"].as_str().unwrap().starts_with(FOLDER_NOT_GRANTED), "{denied}");
 }
 
+// The runner reports what became of a folder run queued after it started, with the
+// folder granted (or not) only after the runner last heard the grants.
+async fn folder_run_after_the_runner_heard_the_grants(grant_it: bool) -> serde_json::Value {
+    let tmp = tempfile::tempdir().unwrap();
+    let site = tmp.path().join("site");
+    std::fs::create_dir_all(&site).unwrap();
+    let mock = MockCloud::start_with_routed_runs(Vec::new(), false).await;
+    let root = crate::root::Root::at(tmp.path().join("hanzo-root"));
+    let host = Arc::new(StubHost { api: mock.base_url(), org: None });
+    let exec: Executor = Arc::new(|_run, _cwd| Box::pin(async { Ok(None) }));
+    let held = serve_with(host, &root, "hanzo", &mock.base_url(), "mach_1", "evo", target::grants(), exec);
+    let path = "/v1/agent/targets/tgt_mock/runs/sess_folder_1/report";
+    // A claim poll means the runner has already heard the (empty) grants.
+    until("the first claim", || mock.requests().iter().any(|r| r.path.ends_with("/claim"))).await;
+    if grant_it {
+        mock.grant(&[&site.to_string_lossy()]);
+    }
+    mock.queue(folder_run(&site));
+    until("the report", || mock.requests().iter().any(|r| r.path == path)).await;
+    drop(held);
+    mock.requests().into_iter().find(|r| r.path == path).unwrap().json()
+}
+
+// A folder granted after the runner's last beat runs: the runner asks cloud again
+// before it refuses, instead of waiting for the next beat.
+#[tokio::test]
+async fn a_folder_granted_since_the_last_beat_runs() {
+    let report = folder_run_after_the_runner_heard_the_grants(true).await;
+    assert_eq!(report["ok"], true, "{report}");
+}
+
+// The fresh answer decides: a folder cloud still does not list is refused.
+#[tokio::test]
+async fn a_folder_still_not_granted_after_the_refresh_is_refused() {
+    let report = folder_run_after_the_runner_heard_the_grants(false).await;
+    assert_eq!(report["ok"], false, "{report}");
+    assert!(report["error"].as_str().unwrap().starts_with(FOLDER_NOT_GRANTED), "{report}");
+}
+
 #[test]
 fn default_routed_run_timeout_matches_four_hour_lease_ceiling() {
     assert_eq!(DEFAULT_RUN_TIMEOUT, Duration::from_secs(14_400));
