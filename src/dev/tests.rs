@@ -503,3 +503,31 @@ fn gateway_route_passes_unified_cloud_iam_auth_and_env_vars_to_hanzo_mcp() {
     assert!(!envs.contains_key("HANZO_API_KEY"), "existing HANZO_API_KEY must be preserved");
     assert!(!envs.contains_key("HANZO_ORG"));
 }
+
+#[test]
+fn readonly_task_uses_readonly_sandbox_and_never_injects_no_one_to_ask() {
+    let mut s = spec(Mode::Headless, "https://api.hanzo.ai");
+    s.task = Some(
+        "Do a read-only repo scan first and wait for confirmation before writing code".into(),
+    );
+    let l = Agent::DEV.build(&s).unwrap();
+    let args = argv(&l);
+
+    assert!(
+        args.iter().any(|a| a == r#"sandbox_mode="read-only""#),
+        "read-only directive must clamp default sandbox_mode to read-only: {args:?}"
+    );
+    assert!(
+        !args.iter().any(|a| a == r#"sandbox_mode="workspace-write""#),
+        "must not pass workspace-write on unconfirmed read-only task: {args:?}"
+    );
+    assert!(
+        !args.iter().any(|a| a.contains("nobody is present to answer")),
+        "must not inject NO_ONE_TO_ASK on read-only / wait-for-confirmation prompt: {args:?}"
+    );
+    assert!(
+        args.iter()
+            .any(|a| a.contains("developer_instructions=") && a.contains("read-only")),
+        "must inject READ_ONLY_INSTRUCTIONS: {args:?}"
+    );
+}

@@ -675,3 +675,42 @@ async fn consecutive_identical_nudged_failures_inject_targeted_change_course_and
     assert!(keep_going(3).contains("3/4"));
     assert!(keep_going(4).contains("4/4"));
 }
+
+#[tokio::test]
+async fn readonly_confirmation_task_never_nudges_turn_1_confirmation_question_into_turn_2() {
+    const SCAN_AND_ASK: &str = concat!(
+        r#"printf '%s\n' '{"type":"system","subtype":"init","session_id":"bsid-ro","model":"m"}'; "#,
+        r#"printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"session_id":"bsid-ro","result":"Scan complete: found 2 issues in llm_client.py.\nWould you like me to proceed with applying these fixes?"}'"#,
+    );
+
+    let mock = MockCloud::start().await;
+    let client = SessionClient::new(&mock.base_url(), "T").unwrap();
+    let (backend, built) = ScriptBackend::new(vec![SCAN_AND_ASK]);
+    let spec = spec_for(
+        "Do a read-only repo scan first and wait for confirmation before writing code",
+    );
+    let launch = backend.build(&spec).unwrap();
+    let (out, status) = supervise(
+        &backend,
+        spec,
+        launch,
+        true,
+        Some(client),
+        Some("sess_ro".into()),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(status, Status::Done);
+    assert_eq!(
+        built.lock().unwrap().len(),
+        1,
+        "supervisor must NOT relaunch Turn 2 when user asked for read-only / confirmation"
+    );
+    assert!(
+        out.final_summary
+            .as_deref()
+            .unwrap()
+            .contains("Would you like me to proceed")
+    );
+}

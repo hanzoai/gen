@@ -377,6 +377,10 @@ pub(crate) async fn supervise_opts(
     let mut continuations = 0u8;
     let mut was_nudged = false;
     let mut last_nudged_error: Option<String> = None;
+    let mut readonly_gate = spec
+        .task
+        .as_deref()
+        .is_some_and(crate::readonly::requests_readonly_or_confirmation);
 
     let end = loop {
         let (out, ok, act, interrupted) = run_turn_opts(
@@ -414,6 +418,11 @@ pub(crate) async fn supervise_opts(
             Some(Act::Steer { prompt, .. }) => {
                 was_nudged = false;
                 last_nudged_error = None;
+                if crate::readonly::requests_readonly_or_confirmation(&prompt) {
+                    readonly_gate = true;
+                } else if readonly_gate && crate::readonly::confirms_proceeding(&prompt) {
+                    readonly_gate = false;
+                }
                 spec.resume = acc.backend_session.clone();
                 spec.task = Some(prompt);
                 if spec.resume.is_some() {
@@ -450,7 +459,7 @@ pub(crate) async fn supervise_opts(
                     Some(change_course(m))
                 } else if let Some(err) = err_trimmed.filter(|_| was_nudged) {
                     Some(recover_nudged_failure(err))
-                } else if ok && said.as_deref().is_some_and(narrating) {
+                } else if ok && !readonly_gate && said.as_deref().is_some_and(narrating) {
                     Some(keep_going(nudged + 1))
                 } else {
                     None

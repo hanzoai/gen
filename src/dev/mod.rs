@@ -95,11 +95,21 @@ impl Backend for Agent {
             args.push("--json".into());
         }
 
+        let readonly_task = headless
+            && spec
+                .task
+                .as_deref()
+                .is_some_and(crate::readonly::requests_readonly_or_confirmation);
+
         // Auto-approve. `Auto` (the default) stops asking but KEEPS the workspace
-        // sandbox; `Bypass` (`--no-sandbox`) drops it entirely; `Ask` leaves the
-        // user's own mode. codex 0.144.x has no `--full-auto`/`--yolo`.
+        // sandbox (or clamps to `read-only` when the prompt explicitly requests a
+        // read-only scan / confirmation before editing); `Bypass` (`--no-sandbox`)
+        // drops it entirely; `Ask` leaves the user's own mode.
         match spec.approval {
-            Approval::Auto => args.extend(auto_overrides(user_config(&spec.root, self.program).as_ref())),
+            Approval::Auto => args.extend(auto_overrides_for(
+                user_config(&spec.root, self.program).as_ref(),
+                readonly_task,
+            )),
             Approval::Bypass => args.push("--dangerously-bypass-approvals-and-sandbox".into()),
             Approval::Ask => {}
         }
@@ -232,11 +242,17 @@ impl Backend for Agent {
         }
 
         // A task run has nobody to answer, so it is told so, unless the caller named
-        // developer instructions of their own.
+        // developer instructions of their own or explicitly requested a read-only scan /
+        // confirmation before modifying files.
         let own = spec.passthrough.iter().any(|a| a.starts_with("developer_instructions="));
         if headless && spec.task.is_some() && !own {
+            let instructions = if readonly_task {
+                crate::readonly::READ_ONLY_INSTRUCTIONS
+            } else {
+                NO_ONE_TO_ASK
+            };
             args.push("-c".into());
-            args.push(cfg_string("developer_instructions", NO_ONE_TO_ASK));
+            args.push(cfg_string("developer_instructions", instructions));
         }
 
         // Passthrough flags precede positionals so they can't swallow the prompt.
@@ -436,7 +452,12 @@ fn is_session_token(value: &str) -> bool {
 /// The auto-approve overrides, less any the user's own config already sets: the
 /// `approval_policy` and `sandbox_mode` they chose there stand. A key counts as
 /// set at the top level or in the profile the config selects.
+#[cfg(test)]
 fn auto_overrides(user: Option<&toml::Table>) -> Vec<String> {
+    auto_overrides_for(user, false)
+}
+
+fn auto_overrides_for(user: Option<&toml::Table>, readonly: bool) -> Vec<String> {
     let sets = |key: &str| {
         let Some(user) = user else { return false };
         let profile = user
@@ -445,8 +466,9 @@ fn auto_overrides(user: Option<&toml::Table>) -> Vec<String> {
             .and_then(|name| user.get("profiles")?.get(name));
         user.contains_key(key) || profile.is_some_and(|profile| profile.get(key).is_some())
     };
+    let sandbox_mode = if readonly { "read-only" } else { "workspace-write" };
     let mut args = Vec::new();
-    for (key, value) in [("approval_policy", "never"), ("sandbox_mode", "workspace-write")] {
+    for (key, value) in [("approval_policy", "never"), ("sandbox_mode", sandbox_mode)] {
         if !sets(key) {
             args.push("-c".into());
             args.push(cfg_string(key, value));
