@@ -44,6 +44,9 @@ impl Info {
     }
 }
 
+/// Fallback reason attached if a caller moves a session to `error` without saying why.
+const DEFAULT_ERROR_REASON: &str = "session ended in error without a reported reason";
+
 impl SessionClient {
     pub fn new(api: &str, token: &str) -> Result<Self> {
         let wire = reqwest::Client::builder()
@@ -124,14 +127,47 @@ impl SessionClient {
         if status.is_terminal() {
             body["terminal"] = json!("");
         }
-        if let (Status::Error, Some(why)) = (status, reason) {
-            if !why.trim().is_empty() {
-                body["error"] = json!(why);
-            }
+        if status == Status::Error {
+            let why = reason
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(DEFAULT_ERROR_REASON);
+            body["error"] = json!(why);
         }
         self.send(Method::PATCH, &format!("/v1/agents/sessions/{id}"), Some(&body))
             .await?;
         Ok(())
+    }
+
+    /// Append a closing `status` event carrying the error reason so both the
+    /// session's event timeline (`endedWhy`) and live stream record why it failed.
+    pub async fn record_error(&self, id: &str, reason: &str) -> Result<()> {
+        let why = match reason.trim() {
+            "" => DEFAULT_ERROR_REASON,
+            s => s,
+        };
+        self.event(
+            id,
+            Kind::Status,
+            json!({
+                "type": "ended",
+                "status": Status::Error.as_str(),
+                "error": why,
+            }),
+        )
+        .await
+    }
+
+    /// Close a session in `error`, recording the reason on both a closing `status`
+    /// event and the terminal `PATCH` update. The event is best-effort so a
+    /// transient event failure never prevents closing the session row.
+    pub async fn fail(&self, id: &str, reason: &str) -> Result<()> {
+        let why = match reason.trim() {
+            "" => DEFAULT_ERROR_REASON,
+            s => s,
+        };
+        let _ = self.record_error(id, why).await;
+        self.set_ended(id, Status::Error, Some(why)).await
     }
 
     /// Publish where this session's live terminal can be WATCHED. Cloud stores
@@ -297,7 +333,45 @@ mod tests {
             assert_eq!(reqs.len(), 1, "the close is one request, not two");
             assert_eq!(reqs[0].json()["status"], status.as_str());
             assert_eq!(reqs[0].json()["terminal"], "", "an ended session is not watchable");
+            if status == Status::Error {
+                assert_eq!(reqs[0].json()["error"], DEFAULT_ERROR_REASON);
+            } else {
+                assert!(reqs[0].json().get("error").is_none());
+            }
         }
+    }
+
+    #[tokio::test]
+    async fn fail_records_status_event_and_error_patch_with_reason() {
+        let mock = MockCloud::start().await;
+        let client = SessionClient::new(&mock.base_url(), "T").unwrap();
+
+        client.fail("sess_err", "dev exited with status 101: panic").await.unwrap();
+
+        let reqs = mock.requests();
+        assert_eq!(reqs.len(), 2, "fail emits closing status event then terminal PATCH");
+        assert_eq!(reqs[0].method, "POST");
+        assert_eq!(reqs[0].path, "/v1/agents/sessions/sess_err/events");
+        assert_eq!(reqs[0].json()["kind"], "status");
+        assert_eq!(reqs[0].json()["payload"]["type"], "ended");
+        assert_eq!(reqs[0].json()["payload"]["status"], "error");
+        assert_eq!(reqs[0].json()["payload"]["error"], "dev exited with status 101: panic");
+        assert_eq!(reqs[1].method, "PATCH");
+        assert_eq!(reqs[1].path, "/v1/agents/sessions/sess_err");
+        assert_eq!(reqs[1].json()["status"], "error");
+        assert_eq!(reqs[1].json()["terminal"], "");
+        assert_eq!(reqs[1].json()["error"], "dev exited with status 101: panic");
+    }
+
+    #[tokio::test]
+    async fn blank_error_reason_still_populates_non_empty_fallback() {
+        let mock = MockCloud::start().await;
+        let client = SessionClient::new(&mock.base_url(), "T").unwrap();
+
+        client.set_ended("sess_blank", Status::Error, Some("   \n\t ")).await.unwrap();
+        let reqs = mock.requests();
+        assert_eq!(reqs[0].json()["status"], "error");
+        assert_eq!(reqs[0].json()["error"], DEFAULT_ERROR_REASON);
     }
 
     /// The converse: a session that is merely moving between LIVE states keeps

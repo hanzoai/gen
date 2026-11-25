@@ -10,6 +10,7 @@ fn snapshot_carries_no_secrets_and_only_allowlisted_keys() {
         cwd: "/home/z/proj".into(),
         backend: "claude".into(),
         backend_version: Some("2.1.0".into()),
+        gen_version: Some(env!("CARGO_PKG_VERSION").into()),
         repo: Repo {
             root: Some("/home/z/proj".into()),
             remote: Some("https://github.com/o/r.git".into()),
@@ -22,7 +23,7 @@ fn snapshot_carries_no_secrets_and_only_allowlisted_keys() {
     // Exactly the location/identity keys — nothing environment-derived.
     let allowed: std::collections::HashSet<&str> = [
         "type", "machineId", "host", "os", "arch", "cwd", "backend",
-        "backendVersion", "repo",
+        "backendVersion", "genVersion", "repo",
     ]
     .into_iter()
     .collect();

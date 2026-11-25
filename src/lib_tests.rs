@@ -12,6 +12,7 @@ pub(crate) fn snapshot(backend: &str) -> Snapshot {
         cwd: "/w".into(),
         backend: backend.into(),
         backend_version: None,
+        gen_version: Some(env!("CARGO_PKG_VERSION").into()),
         repo: Default::default(),
     }
 }
@@ -228,16 +229,43 @@ async fn finalize_interactive_suspends_to_paused_and_failure_is_error() {
     let client2 = SessionClient::new(&mock2.base_url(), "T").unwrap();
     finalize(&client2, "sess_e", &outcome, Status::Error, &snapshot, "https://api.hanzo.ai", "hanzo/z", None, &crate::root::scratch(), Some("dev exited with status 101")).await;
     assert!(mock2.requests().iter().any(|r| r.method == "PATCH" && r.json()["status"] == "error"));
-    // The reason rides the status request; a status that is not an error takes none.
+    // The reason rides BOTH a closing status event and the PATCH; a status that is not an error takes none.
+    assert!(
+        mock2.requests().iter().any(|r| {
+            r.method == "POST"
+                && r.path.ends_with("/events")
+                && r.json()["kind"] == "status"
+                && r.json()["payload"]["status"] == "error"
+                && r.json()["payload"]["error"] == "dev exited with status 101"
+        }),
+        "the reason did not reach a closing status event: {:?}",
+        mock2.requests().iter().map(|r| r.json().to_string()).collect::<Vec<_>>()
+    );
     assert!(
         mock2.requests().iter().any(|r| r.method == "PATCH" && r.json()["error"] == "dev exited with status 101"),
         "the reason did not reach the PATCH: {:?}",
         mock2.requests().iter().map(|r| r.json().to_string()).collect::<Vec<_>>()
     );
+    // Even if a caller passes no reason on Status::Error, finalize synthesizes a non-empty reason on event + PATCH.
+    let mock_no_reason = MockCloud::start().await;
+    let client_no_reason = SessionClient::new(&mock_no_reason.base_url(), "T").unwrap();
+    finalize(&client_no_reason, "sess_nr", &outcome, Status::Error, &snapshot, "https://api.hanzo.ai", "hanzo/z", None, &crate::root::scratch(), None).await;
+    assert!(mock_no_reason.requests().iter().any(|r| {
+        r.method == "POST"
+            && r.path.ends_with("/events")
+            && r.json()["kind"] == "status"
+            && r.json()["payload"]["error"] == "dev ended with an error"
+    }));
+    assert!(mock_no_reason.requests().iter().any(|r| {
+        r.method == "PATCH"
+            && r.json()["status"] == "error"
+            && r.json()["error"] == "dev ended with an error"
+    }));
     let mock3 = MockCloud::start().await;
     let client3 = SessionClient::new(&mock3.base_url(), "T").unwrap();
     finalize(&client3, "sess_d", &outcome, Status::Done, &snapshot, "https://api.hanzo.ai", "hanzo/z", None, &crate::root::scratch(), Some("not an error")).await;
     assert!(mock3.requests().iter().all(|r| r.method != "PATCH" || r.json().get("error").is_none()));
+    assert!(mock3.requests().iter().all(|r| !r.path.ends_with("/events")));
 }
 
 

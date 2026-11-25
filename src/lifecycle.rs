@@ -14,7 +14,7 @@ use crate::root::Root;
 use crate::routing::resolve_routing;
 use crate::session::SessionClient;
 use crate::settings::Settings;
-use crate::stream::Outcome;
+use crate::stream::{cut, reason_of, Outcome, REASON_MAX};
 use crate::supervise::supervise;
 use crate::{configured_agent, contract, home, kit, summary};
 
@@ -147,8 +147,16 @@ pub(crate) async fn run_routed_agent(
         refresh: host.refresh(brand),
         root: root.clone(),
     };
-    let launch = backend.build(&spec)?;
-    let (outcome, status) = supervise(
+    let launch = match backend.build(&spec) {
+        Ok(launch) => launch,
+        Err(e) => {
+            if let Some(c) = &client {
+                let _ = c.record_error(session_id, &cut(&format!("{e:#}"), REASON_MAX)).await;
+            }
+            return Err(e);
+        }
+    };
+    let (outcome, status) = match supervise(
         &*backend,
         spec,
         launch,
@@ -156,7 +164,16 @@ pub(crate) async fn run_routed_agent(
         client.clone(),
         client.as_ref().map(|_| session_id.to_string()),
     )
-    .await?;
+    .await
+    {
+        Ok(res) => res,
+        Err(e) => {
+            if let Some(c) = &client {
+                let _ = c.record_error(session_id, &cut(&format!("{e:#}"), REASON_MAX)).await;
+            }
+            return Err(e);
+        }
+    };
 
     if let Some(c) = &client {
         if !outcome.usage.is_empty() {
@@ -167,7 +184,11 @@ pub(crate) async fn run_routed_agent(
     }
 
     if status == Status::Error {
-        bail!("{} did not finish the routed run: it exited with an error", backend.label());
+        let why = reason_of(&Ok((outcome.clone(), status)), backend.label());
+        if let Some(c) = &client {
+            let _ = c.record_error(session_id, &why).await;
+        }
+        bail!("{why}");
     }
 
     let elapsed_ms = outcome
@@ -313,5 +334,14 @@ pub(crate) async fn finalize(
         let _ = client.event(session_id, Kind::Status, rec.resume_payload()).await;
     }
 
-    let _ = client.set_ended(session_id, status, reason).await;
+    if status == Status::Error {
+        let why = reason
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{} ended with an error", snapshot.backend));
+        let _ = client.fail(session_id, &why).await;
+    } else {
+        let _ = client.set_ended(session_id, status, None).await;
+    }
 }

@@ -232,3 +232,52 @@ async fn embedded_turn_mirrors_to_linked_cloud_session_and_redacts_host_secrets(
         .collect();
     assert!(posted.len() >= 3, "expected context + spawn + message + usage events: {posted:?}");
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn embedded_turn_stderr_crash_records_closing_error_status_event_and_reason() {
+    let mock = crate::testmock::MockCloud::start().await;
+    let root_dir = tempfile::tempdir().unwrap();
+    let ws_dir = tempfile::tempdir().unwrap();
+    let root = Root::at(root_dir.path());
+
+    // Simulates `dev` exiting non-zero with only stderr output and no stdout JSONL.
+    let script = concat!(
+        r#"echo "error: MCP server 'hanzo' failed handshake" >&2"#, "\n",
+        "exit 2\n",
+    );
+    install_mock_tools(&root, script);
+
+    let host_val = StaticHost::cloud(
+        mock.base_url(),
+        "hanzo",
+        "z",
+        Arc::new(|| Some("TOK_LIVE".into())),
+    );
+    let mut req = EmbeddedTurnRequest::new(root, ws_dir.path(), "machines");
+    req.link_session_id = Some("sess_embed_err".into());
+
+    let res = run_embedded_turn(Arc::new(host_val), req).await.unwrap();
+    assert!(!res.ok);
+    assert_eq!(res.status, "error");
+    let err = res.error.as_deref().unwrap_or("");
+    assert!(err.contains("dev exited with status 2"), "got: {err}");
+    assert!(err.contains("MCP server 'hanzo' failed handshake"), "got: {err}");
+
+    let status_events: Vec<_> = mock
+        .requests()
+        .into_iter()
+        .filter(|r| {
+            r.path == "/v1/agents/sessions/sess_embed_err/events"
+                && r.json()["kind"] == "status"
+                && r.json()["payload"]["status"] == "error"
+        })
+        .collect();
+    assert_eq!(status_events.len(), 1, "expected closing error status event");
+    let ev_err = status_events[0].json()["payload"]["error"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    assert!(ev_err.contains("dev exited with status 2"), "got: {ev_err}");
+    assert!(ev_err.contains("MCP server 'hanzo' failed handshake"), "got: {ev_err}");
+}

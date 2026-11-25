@@ -29,6 +29,9 @@ pub(crate) struct Outcome {
     /// How the newest turn's process ended when not cleanly ("exited with status
     /// 101"); the reason a failed run reports.
     pub exit: Option<String>,
+    /// Cleaned tail of stderr from a failed headless turn, used when the backend
+    /// exited non-zero without emitting a structured error event.
+    pub stderr_tail: Option<String>,
 }
 
 /// How a finished process ended, when not cleanly.
@@ -72,18 +75,138 @@ fn interrupted(status: &std::process::ExitStatus) -> bool {
 pub(crate) const REASON_MAX: usize = 600;
 
 /// Why a run ended in error: the launch that failed, or how the process ended and
-/// the error it reported last. Never empty.
+/// the error it reported last (structured stream error, stderr tail, or summary).
+/// Never empty.
 pub(crate) fn reason_of(run: &Result<(Outcome, Status)>, label: &str) -> String {
     match run {
         Err(e) => cut(&format!("{e:#}"), REASON_MAX),
         Ok((o, _)) => {
             let how = o.exit.as_deref().unwrap_or("ended with an error");
-            match o.final_summary.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            let summary = o.final_summary.as_deref().map(str::trim).filter(|s| !s.is_empty());
+            let stderr = o.stderr_tail.as_deref().map(str::trim).filter(|s| !s.is_empty());
+            let detail = if o.saw_error { summary.or(stderr) } else { stderr.or(summary) };
+            match detail {
                 Some(said) => cut(&format!("{label} {how}: {said}"), REASON_MAX),
                 None => format!("{label} {how}"),
             }
         }
     }
+}
+
+/// Maximum raw stderr bytes retained in the rolling tail per headless turn.
+const STDERR_CAPTURE_MAX: usize = 4096;
+
+/// Drain a child's stderr pipe, forwarding raw bytes to this process's stderr
+/// when `forward` is true, and return a clean, bounded tail for error reporting.
+pub(crate) fn spawn_stderr_tee(
+    mut stderr: tokio::process::ChildStderr,
+    forward: bool,
+) -> tokio::task::JoinHandle<Option<String>> {
+    tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
+        let mut raw = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let mut out = forward.then(tokio::io::stderr);
+        loop {
+            match stderr.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let slice = &chunk[..n];
+                    if let Some(sink) = out.as_mut() {
+                        let _ = sink.write_all(slice).await;
+                    }
+                    raw.extend_from_slice(slice);
+                    if raw.len() > STDERR_CAPTURE_MAX {
+                        let drop_n = raw.len() - STDERR_CAPTURE_MAX;
+                        raw.drain(..drop_n);
+                    }
+                }
+            }
+        }
+        format_stderr_tail(&raw)
+    })
+}
+
+/// Strip ANSI escapes/control chars, redact inline credentials, and return the
+/// trailing non-empty lines bounded to [`REASON_MAX`].
+pub(crate) fn format_stderr_tail(raw: &[u8]) -> Option<String> {
+    let text = strip_ansi(&String::from_utf8_lossy(raw));
+    let lines: Vec<String> = text
+        .lines()
+        .map(|l| redact_tokens(l.trim()))
+        .filter(|l| !l.is_empty())
+        .collect();
+    if lines.is_empty() {
+        return None;
+    }
+    let mut picked: Vec<&str> = Vec::new();
+    let mut len = 0usize;
+    for line in lines.iter().rev() {
+        let sep = if picked.is_empty() { 0 } else { 3 };
+        if !picked.is_empty() && len + sep + line.len() > REASON_MAX {
+            break;
+        }
+        picked.push(line.as_str());
+        len += sep + line.len();
+    }
+    picked.reverse();
+    Some(cut(&picked.join(" | "), REASON_MAX))
+}
+
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            match chars.peek().copied() {
+                Some('[') => {
+                    chars.next();
+                    for nc in chars.by_ref() {
+                        if ('@'..='~').contains(&nc) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    chars.next();
+                    while let Some(nc) = chars.next() {
+                        if nc == '\x07' || (nc == '\x1b' && chars.peek() == Some(&'\\')) {
+                            if nc == '\x1b' {
+                                chars.next();
+                            }
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        } else if !c.is_control() || matches!(c, '\n' | '\t') {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn redact_tokens(line: &str) -> String {
+    let mut prev_bearer = false;
+    let mut out = Vec::new();
+    for word in line.split_whitespace() {
+        let lower = word.to_ascii_lowercase();
+        let trimmed = word.trim_matches(|c: char| matches!(c, '"' | '\'' | ',' | ';' | '(' | ')' | '[' | ']'));
+        let secret = prev_bearer
+            || trimmed.starts_with("hk-") && trimmed.len() >= 11
+            || trimmed.starts_with("sk-") && trimmed.len() >= 11
+            || trimmed.starts_with("hz-") && trimmed.len() >= 11
+            || trimmed.starts_with("eyJ") && trimmed.matches('.').count() >= 2;
+        if secret {
+            out.push("<redacted>");
+            prev_bearer = false;
+        } else {
+            prev_bearer = lower == "bearer" || lower.ends_with("bearer:");
+            out.push(word);
+        }
+    }
+    out.join(" ")
 }
 
 
@@ -284,7 +407,11 @@ pub(crate) async fn run_interactive(
     if status.success() || interrupted(&status) {
         return Ok(true);
     }
-    Err(anyhow!("{} {}", backend.label(), how(&status).unwrap_or_default()))
+    Err(anyhow!(
+        "{} {}",
+        backend.label(),
+        how(&status).unwrap_or_else(|| "exited with an error".to_string())
+    ))
 }
 
 /// Follow a Claude transcript JSONL, forwarding newly-appended events to the
@@ -505,6 +632,50 @@ mod tests {
 
         let long: Result<(Outcome, Status)> = Ok((Outcome { final_summary: Some("é".repeat(2000)), ..Default::default() }, Status::Error));
         assert!(reason_of(&long, "dev").len() <= REASON_MAX, "a reason is bounded, at a character boundary");
+
+        // When a process crashes after emitting a normal assistant message (saw_error == false),
+        // stderr carries the crash reason rather than the stale assistant message.
+        let crashed_with_stderr: Result<(Outcome, Status)> = Ok((
+            Outcome {
+                exit: Some("exited with status 101".into()),
+                final_summary: Some("Let me check the files.".into()),
+                stderr_tail: Some("thread 'main' panicked at src/main.rs:9: boom".into()),
+                saw_error: false,
+                ..Default::default()
+            },
+            Status::Error,
+        ));
+        assert_eq!(
+            reason_of(&crashed_with_stderr, "dev"),
+            "dev exited with status 101: thread 'main' panicked at src/main.rs:9: boom"
+        );
+
+        // When the backend emitted a structured error event (saw_error == true), prefer it over noisy stderr.
+        let structured_err: Result<(Outcome, Status)> = Ok((
+            Outcome {
+                exit: Some("exited with status 1".into()),
+                final_summary: Some("401 Unauthorized".into()),
+                stderr_tail: Some("WARN noisy diagnostic".into()),
+                saw_error: true,
+                ..Default::default()
+            },
+            Status::Error,
+        ));
+        assert_eq!(reason_of(&structured_err, "dev"), "dev exited with status 1: 401 Unauthorized");
+    }
+
+    #[test]
+    fn format_stderr_tail_strips_ansi_bounds_length_and_redacts_secrets() {
+        assert_eq!(format_stderr_tail(b"   \n\t\n"), None);
+        let raw = b"\x1b[31merror:\x1b[0m auth failed with Bearer eyJhbGciOi.payload.sig and hk-1234567890abcdef\n";
+        let got = format_stderr_tail(raw).unwrap();
+        assert_eq!(got, "error: auth failed with Bearer <redacted> and <redacted>");
+        assert!(!got.contains("eyJ") && !got.contains("hk-123"));
+
+        let huge = (0..100).map(|i| format!("line {i} diagnostic output\n")).collect::<String>();
+        let bounded = format_stderr_tail(huge.as_bytes()).unwrap();
+        assert!(bounded.len() <= REASON_MAX);
+        assert!(bounded.contains("line 99"), "should preserve trailing lines: {bounded}");
     }
 
 
