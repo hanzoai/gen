@@ -38,6 +38,13 @@ const CLAIM_HTTP_TIMEOUT: Duration = Duration::from_secs(40);
 /// every 25s so `serving` stays `true` throughout long runs.
 const MAX_CONCURRENT_RUNS: usize = 2;
 
+/// Pause before the next claim after one that failed, or that came back empty
+/// sooner than `HELD` (the server did not hold the call).
+const RETRY_WAIT: Duration = Duration::from_secs(3);
+
+/// A claim the server held at least this long was a real long poll.
+const HELD: Duration = Duration::from_secs(1);
+
 /// Clamp limits matching `cloud/apps/agents/routing_http.go`.
 const MAX_SHA_CHARS: usize = 128;
 const MAX_TEXT_BYTES: usize = 60 * 1024;
@@ -428,9 +435,13 @@ async fn run_loop(
             },
         };
 
+        let started = std::time::Instant::now();
         match client.claim_once(&token, &target_id, &claim_key).await {
             Ok(ClaimPoll::Empty) => {
                 drop(permit);
+                if started.elapsed() < HELD {
+                    tokio::time::sleep(RETRY_WAIT).await;
+                }
             }
             Ok(ClaimPoll::Forbidden) => {
                 drop(permit);
@@ -487,7 +498,7 @@ async fn run_loop(
             Err(e) => {
                 tracing::debug!("target claim poll failed ({e})");
                 drop(permit);
-                tokio::time::sleep(Duration::from_secs(3)).await;
+                tokio::time::sleep(RETRY_WAIT).await;
             }
         }
     }

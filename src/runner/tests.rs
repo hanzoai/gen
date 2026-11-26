@@ -678,3 +678,21 @@ async fn a_folder_still_not_granted_after_the_refresh_is_refused() {
 fn default_routed_run_timeout_matches_four_hour_lease_ceiling() {
     assert_eq!(DEFAULT_RUN_TIMEOUT, Duration::from_secs(14_400));
 }
+
+// A server that answers every claim "nothing for you" at once, instead of holding
+// the call, must not be called in a tight loop.
+#[tokio::test]
+async fn an_instantly_empty_claim_waits_before_the_next() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = MockCloud::start_with_routed_runs(Vec::new(), false).await;
+    let root = crate::root::Root::at(tmp.path().join("hanzo-root"));
+    let host = Arc::new(StubHost { api: mock.base_url(), org: None });
+    let exec: Executor = Arc::new(|_, _| Box::pin(async { Ok(None) }));
+
+    let held = serve_with(host, &root, "hanzo", &mock.base_url(), "mach_1", "host", target::grants(), exec);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    drop(held);
+
+    let claims = mock.requests().iter().filter(|r| r.method == "POST" && r.path.ends_with("/claim")).count();
+    assert!((1..6).contains(&claims), "expected 1 to 5 claims in 3 seconds, saw {claims}");
+}
