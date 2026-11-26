@@ -382,7 +382,7 @@ pub(crate) async fn run_interactive(
     cwd: &Path,
     watch_sid: Option<String>,
 ) -> Result<bool> {
-    let Launch { mut command, cleanup } = launch;
+    let Launch { mut command, cleanup, .. } = launch;
     command.stdin(Stdio::inherit()).stdout(Stdio::inherit()).stderr(Stdio::inherit());
     let mut relay = control::relay();
     let mut child = spawn(&mut command, backend.label())?;

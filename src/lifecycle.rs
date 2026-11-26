@@ -32,6 +32,7 @@ pub(crate) async fn run_routed_agent(
     model: Option<&str>,
     effort: Option<&str>,
     instructions: Option<&str>,
+    read_only: bool,
 ) -> Result<Option<contract::AgentRun>> {
     let started = std::time::Instant::now();
     let kind = match configured_agent(root) {
@@ -147,7 +148,7 @@ pub(crate) async fn run_routed_agent(
         refresh: host.refresh(brand),
         root: root.clone(),
     };
-    let launch = match backend.build(&spec) {
+    let mut launch = match backend.build(&spec) {
         Ok(launch) => launch,
         Err(e) => {
             if let Some(c) = &client {
@@ -156,6 +157,12 @@ pub(crate) async fn run_routed_agent(
             return Err(e);
         }
     };
+    // A routed read-only run is contained by the OS for every turn, not by the
+    // prompt. The guard is applied where the child is spawned; if it cannot be
+    // built the run fails closed rather than becoming writable.
+    if read_only {
+        launch.readonly = Some(crate::runner::readonly::Recipe { workspace: cwd.to_path_buf(), root: root.clone() });
+    }
     let (outcome, status) = match supervise(
         &*backend,
         spec,

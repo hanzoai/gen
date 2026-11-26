@@ -80,6 +80,11 @@ pub struct RoutedRun {
     /// Empty is a run in its own checkout.
     #[serde(default)]
     pub dir: String,
+    /// Contain this ONE run in a read-only workspace: no writes to the granted
+    /// folder or checkout, no commit, no push, no PR. The harness is refused if it
+    /// cannot build the OS guard. NOT the same as `deploy_key` being read-only.
+    #[serde(default)]
+    pub read_only: bool,
 }
 
 /// A secret that a debug line leaves out.
@@ -159,6 +164,7 @@ pub fn serve(
                 Some(run.model.as_str()),
                 Some(run.effort.as_str()),
                 Some(run.instructions.as_str()),
+                run.read_only,
             )
             .await
         })
@@ -497,7 +503,12 @@ async fn handle_claimed_run(
     grants: &Grants,
     executor: Executor,
 ) {
-    let report = if run.dir.is_empty() {
+    // Refuse BEFORE touching a checkout or the granted folder when this harness
+    // has no way to contain writes. An agent must never be started writable with
+    // a read-only flag on the wire.
+    let report = if run.read_only && !readonly::supported() {
+        failure_report(&run.branch, format!("{}: this harness has no read-only workspace sandbox", readonly::READ_ONLY_UNSUPPORTED))
+    } else if run.dir.is_empty() {
         let run_slug = sanitize_id(&run.session_id);
         let work_dir = root.data().join("runs").join(format!(
             "{}-{:08x}",
@@ -589,7 +600,21 @@ pub async fn execute_workspace_run(work_dir: &Path, run: &RoutedRun, executor: E
     let mut commit_sha = String::new();
     let mut diffstat = String::new();
 
-    if has_repo && !run.branch.trim().is_empty() {
+    if run.read_only {
+        // No commit, no push, no PR — ever. The OS guard keeps the agent from
+        // writing the checkout; this second check fails the run closed if one
+        // slipped through, instead of reporting a false "worked".
+        if let Ok(status) = git_stdout(work_dir, &["status", "--porcelain"]).await {
+            if !status.trim().is_empty() {
+                ok = false;
+                err_msg = if err_msg.is_empty() {
+                    "read_only_violation: the checkout changed during a read-only run".to_string()
+                } else {
+                    format!("{err_msg}; read_only_violation: the checkout changed during a read-only run")
+                };
+            }
+        }
+    } else if has_repo && !run.branch.trim().is_empty() {
         match finalize_git_changes(work_dir, &base_sha, &run.branch).await {
             Ok(Some((sha, stat))) => {
                 changed = true;
@@ -688,6 +713,7 @@ pub fn inside(dir: &Path, folders: &[String]) -> Result<PathBuf> {
 
 mod git;
 use git::*;
+pub(crate) mod readonly;
 
 fn failure_report(branch: &str, err: String) -> RunReport {
     RunReport {

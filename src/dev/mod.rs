@@ -269,7 +269,7 @@ impl Backend for Agent {
         }
 
         cmd.args(&args);
-        Ok(Launch { command: cmd, cleanup })
+        Ok(Launch { command: cmd, cleanup, readonly: None })
     }
 
     fn parse(&self, line: &str) -> Vec<Mapped> {

@@ -145,6 +145,7 @@ fn sample_spec() -> Spec {
         cpus: 20,
         memory: 137438953472,
         gpus: vec![Gpu { vendor: "nvidia".into(), model: "GB10".into(), memory: 103079215104 }],
+        ..Default::default()
     }
 }
 
@@ -418,6 +419,21 @@ fn parse_vm_stat_saturates_instead_of_panicking() {
              Pages wired down:          9223372036854775807.\n";
     let (used, _free) = parse_vm_stat(s);
     assert!(used >= 0);
+}
+
+// A machine advertises readOnlyRuns only when true; absent/false is what an old
+// harness sends and what cloud reads as unsupported.
+#[test]
+fn read_only_runs_is_wire_stable_and_absent_when_unsupported() {
+    let plain = sample_spec();
+    let wire = serde_json::to_value(&plain).unwrap();
+    assert!(wire.get("readOnlyRuns").is_none(), "an unsupported machine must not claim the capability");
+
+    let capable = Spec { read_only_runs: true, ..plain };
+    let wire = serde_json::to_value(&capable).unwrap();
+    assert_eq!(wire["readOnlyRuns"], true);
+    let back: Spec = serde_json::from_value(wire).unwrap();
+    assert!(back.read_only_runs);
 }
 
 #[test]

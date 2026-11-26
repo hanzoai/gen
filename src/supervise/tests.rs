@@ -32,7 +32,7 @@ impl Backend for FakeBackend {
         let path = f.into_temp_path();
         let mut command = tokio::process::Command::from(crate::exe::command(crate::exe::find("cat").expect("cat")));
         command.arg(&*path);
-        Ok(Launch { command, cleanup: crate::backend::Scratch { files: vec![path], ..Default::default() } })
+        Ok(Launch { command, cleanup: crate::backend::Scratch { files: vec![path], ..Default::default() }, readonly: None })
     }
     fn parse(&self, line: &str) -> Vec<Mapped> {
         Claude.parse(line)
@@ -156,7 +156,7 @@ impl Backend for ScriptBackend {
                 Ok(())
             });
         }
-        Ok(Launch { command, cleanup: Default::default() })
+        Ok(Launch { command, cleanup: Default::default(), readonly: None })
     }
     /// The real Claude parser — so these tests exercise the SAME mapping the
     /// production stream does, on the same recorded shapes.
