@@ -1,6 +1,6 @@
 [package]
 name = "hanzo-gen"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 authors = ["Hanzo AI"]
 description = "Hanzo Gen — the agentic harness: launch and route any coding agent (Hanzo, Claude Code, Codex, Cursor, …) with Hanzo MCP and one model router"
