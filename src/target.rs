@@ -365,6 +365,7 @@ mod tests {
                 cpus: 20,
                 memory: 137438953472,
                 gpus: vec![Gpu { vendor: "nvidia".into(), model: "GB10".into(), memory: 103079215104 }],
+                ..Default::default()
             },
             metrics: Metrics { load1: 1.5, load5: 1.2, load15: 0.9, mem_used: 42, mem_free: 7, gpu_util: 0.4, ..Default::default() },
         }
@@ -372,7 +373,7 @@ mod tests {
 
     fn laptop_machine() -> Machine {
         Machine {
-            spec: Spec { os: "macos".into(), arch: "arm64".into(), cpus: 8, memory: 16 * (1i64 << 30), gpus: vec![] },
+            spec: Spec { os: "macos".into(), arch: "arm64".into(), cpus: 8, memory: 16 * (1i64 << 30), gpus: vec![], ..Default::default() },
             metrics: Metrics { load1: 0.3, ..Default::default() },
         }
     }

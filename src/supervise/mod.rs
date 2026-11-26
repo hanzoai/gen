@@ -13,6 +13,14 @@ use crate::event::Status;
 use crate::session::SessionClient;
 use crate::stream::{cut, how, run_stream_into, spawn, Outcome};
 
+/// Rebuild a launch for another turn without losing the read-only recipe: a
+/// steer or a continuation must not quietly become a writable run.
+fn rebuild(backend: &dyn Backend, spec: &Spec, recipe: Option<crate::runner::readonly::Recipe>) -> Result<Launch> {
+    let mut next = backend.build(spec)?;
+    next.readonly = recipe;
+    Ok(next)
+}
+
 /// What a harness's loop guard says when its model repeats a tool call. It ends the
 /// turn with an error; the run is not over, the model is.
 const LOOP_MARK: &str = "repeated identical tool-use cycle detected";
@@ -231,7 +239,13 @@ async fn run_turn_opts(
         return Ok((Outcome::default(), false, None, true));
     }
 
-    let Launch { mut command, cleanup } = launch;
+    // A read-only routed run gets a real OS-enforced workspace guard on EVERY
+    // turn (including steers and continuations), never just the first one.
+    let mut launch = launch;
+    if let Some(recipe) = launch.readonly.clone() {
+        recipe.guard(&mut launch)?;
+    }
+    let Launch { mut command, cleanup, .. } = launch;
     if null_stdio {
         command.stdin(Stdio::null());
     } else {
@@ -382,6 +396,7 @@ pub(crate) async fn supervise_opts(
         .as_deref()
         .is_some_and(crate::readonly::requests_readonly_or_confirmation);
 
+    let recipe = launch.readonly.clone();
     let end = loop {
         let (out, ok, act, interrupted) = run_turn_opts(
             backend,
@@ -428,7 +443,7 @@ pub(crate) async fn supervise_opts(
                 if spec.resume.is_some() {
                     spec.preset_session = None;
                 }
-                launch = backend.build(&spec)?;
+                launch = rebuild(backend, &spec, recipe.clone())?;
             }
             None | Some(Act::Ignore) => {
                 if said.as_deref().is_some_and(context_overflow) {
@@ -441,7 +456,7 @@ pub(crate) async fn supervise_opts(
                         spec.resume = acc.backend_session.clone();
                         spec.task = Some(CONTINUE_COMPACT.to_string());
                         spec.preset_session = None;
-                        launch = backend.build(&spec)?;
+                        launch = rebuild(backend, &spec, recipe.clone())?;
                         continue;
                     }
                     break SuperviseEnd::Status(Status::of(ok));
@@ -476,7 +491,7 @@ pub(crate) async fn supervise_opts(
                     spec.resume = acc.backend_session.clone();
                     spec.task = Some(told);
                     spec.preset_session = None;
-                    launch = backend.build(&spec)?;
+                    launch = rebuild(backend, &spec, recipe.clone())?;
                     continue;
                 }
                 break SuperviseEnd::Status(Status::of(ok));

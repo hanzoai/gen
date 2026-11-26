@@ -123,6 +123,10 @@ pub struct Spec {
     pub memory: i64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gpus: Vec<Gpu>,
+    /// This harness can run one routed run in a read-only workspace and refuses
+    /// one it cannot contain. False/absent on the wire means unsupported.
+    #[serde(default, rename = "readOnlyRuns", skip_serializing_if = "std::ops::Not::not")]
+    pub read_only_runs: bool,
 }
 
 /// A machine's LIVE sample — what it is DOING now. Matches cloud's `agent.Metrics`
@@ -224,6 +228,10 @@ impl Machine {
                 cpus: cpus(),
                 memory: total,
                 gpus,
+                // Advertise the capability ONLY when this binary actually has an
+                // OS sandbox to enforce it. Cloud refuses a read-only route to a
+                // machine that does not say so.
+                read_only_runs: crate::runner::readonly::supported(),
             },
             metrics: Metrics {
                 load1: finite(load1),

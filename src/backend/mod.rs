@@ -386,6 +386,9 @@ impl Spec {
 pub struct Launch {
     pub command: tokio::process::Command,
     pub cleanup: Scratch,
+    /// When set, every turn of this run is wrapped in a read-only workspace
+    /// sandbox before its child starts (routed read-only runs only).
+    pub readonly: Option<crate::runner::readonly::Recipe>,
 }
 
 /// What a launch made for its one run, removed when the run ends: config files,

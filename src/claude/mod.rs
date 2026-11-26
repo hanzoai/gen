@@ -235,7 +235,7 @@ impl Backend for Claude {
         }
 
         cmd.args(&spec.passthrough);
-        Ok(Launch { command: cmd, cleanup })
+        Ok(Launch { command: cmd, cleanup, readonly: None })
     }
 
     fn parse(&self, line: &str) -> Vec<Mapped> {

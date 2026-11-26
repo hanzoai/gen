@@ -411,7 +411,7 @@ impl Backend for Session {
         let mut run = Run::new(spec, &program);
         (a.build)(&mut run)?;
         run.cmd.args(&spec.passthrough);
-        Ok(Launch { command: run.cmd, cleanup: run.cleanup })
+        Ok(Launch { command: run.cmd, cleanup: run.cleanup, readonly: None })
     }
 
     fn parse(&self, line: &str) -> Vec<Mapped> {

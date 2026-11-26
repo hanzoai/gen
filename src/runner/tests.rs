@@ -73,7 +73,8 @@ async fn runner_mints_key_claims_clones_commits_pushes_and_reports() {
         deploy_key: Secret::default(),
         known_hosts: String::new(),
         dir: String::new(),
-    };
+       read_only: false,
+ };
 
     let mock = MockCloud::start_with_routed_runs(vec![queued], true).await;
     let root = crate::root::Root::at(tmp.path().join("hanzo-root"));
@@ -156,7 +157,8 @@ async fn a_runs_deploy_key_is_held_for_the_run_and_removed_after() {
         deploy_key: serde_json::from_str("\"PRIVATE-KEY\"").unwrap(),
         known_hosts: "git.test ssh-ed25519 AAAA".into(),
         dir: String::new(),
-    };
+       read_only: false,
+ };
     let seen = keys.clone();
     let exec: Executor = Arc::new(move |_run, cwd| {
         let keys = seen.clone();
@@ -205,7 +207,8 @@ async fn a_run_without_a_repository_works_inside_a_git_work_tree() {
         deploy_key: Secret::default(),
         known_hosts: String::new(),
         dir: String::new(),
-    };
+       read_only: false,
+ };
     let exec: Executor = Arc::new(|_run, cwd| {
         Box::pin(async move {
             let inside = git_stdout(&cwd, &["rev-parse", "--is-inside-work-tree"]).await?;
@@ -216,6 +219,51 @@ async fn a_run_without_a_repository_works_inside_a_git_work_tree() {
     let report = execute_workspace_run(&work_dir, &run, exec).await;
     assert!(report.ok, "a bare run failed: {}", report.error);
     assert!(!report.changed);
+}
+
+// A read-only run answers with changed:false and NEVER reaches the commit/push
+// finalize step, even when the workspace has a branch to push to.
+#[tokio::test]
+async fn a_read_only_workspace_run_never_pushes_and_answers_changed_false() {
+    let tmp = tempfile::tempdir().unwrap();
+    let work_dir = tmp.path().join("workspace");
+    let mut run = RoutedRun {
+        session_id: "sess_readonly_1".into(),
+        repo: String::new(),
+        project: String::new(),
+        base: String::new(),
+        branch: "agent/should-not-be-written".into(),
+        prompt: "review it".into(),
+        clone_url: String::new(),
+        timeout_seconds: 30,
+        model: String::new(),
+        effort: String::new(),
+        instructions: String::new(),
+        deploy_key: Secret::default(),
+        known_hosts: String::new(),
+        dir: String::new(),
+        read_only: true,
+    };
+    let exec: Executor = Arc::new(|_run, cwd| Box::pin(async move {
+        std::fs::write(cwd.join("notes.txt"), "answer only\n")?;
+        // The runner's second check sees the write and refuses the run. A real
+        // agent is also blocked by the OS guard before it can get here.
+        Ok(None)
+    }));
+    let report = execute_workspace_run(&work_dir, &run, exec).await;
+    assert!(!report.ok, "a write in a read-only run must fail closed");
+    assert!(!report.changed, "no commit may be reported for a read-only run");
+    assert!(report.commit_sha.is_empty());
+    assert!(report.error.contains("read_only_violation"), "{}", report.error);
+    assert!(git_stdout(&work_dir, &["status", "--porcelain"]).await.unwrap().contains("notes.txt"));
+
+    // The same run with no writes is an answer: ok, changed:false, no push.
+    run.session_id = "sess_readonly_2".into();
+    let clean_dir = tmp.path().join("workspace-clean");
+    let exec: Executor = Arc::new(|_run, _cwd| Box::pin(async move { Ok(None) }));
+    let report = execute_workspace_run(&clean_dir, &run, exec).await;
+    assert!(report.ok, "{}", report.error);
+    assert!(!report.changed && report.commit_sha.is_empty());
 }
 
 #[tokio::test]
@@ -237,7 +285,8 @@ async fn execute_workspace_run_propagates_valid_agent_run_telemetry() {
         deploy_key: Secret::default(),
         known_hosts: String::new(),
         dir: String::new(),
-    };
+       read_only: false,
+ };
     let exec: Executor = Arc::new(|r, _cwd| {
         Box::pin(async move {
             let mut telemetry = AgentRun::new(
@@ -287,7 +336,8 @@ fn folder_run(dir: &Path) -> RoutedRun {
         deploy_key: Secret::default(),
         known_hosts: String::new(),
         dir: dir.to_string_lossy().into_owned(),
-    }
+       read_only: false,
+ }
 }
 
 fn granted(folders: &[&Path]) -> Grants {
