@@ -456,6 +456,7 @@ async fn run_loop(
                     Ok(k) => {
                         save_claim_key(&root, &api, org.as_deref(), &refreshed_id, &k);
                         cached_key = Some((refreshed_id, k));
+                        tokio::time::sleep(RETRY_WAIT).await;
                     }
                     Err(e) => {
                         tracing::debug!("claim key re-mint failed ({e})");

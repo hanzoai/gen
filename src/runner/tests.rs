@@ -696,3 +696,21 @@ async fn an_instantly_empty_claim_waits_before_the_next() {
     let claims = mock.requests().iter().filter(|r| r.method == "POST" && r.path.ends_with("/claim")).count();
     assert!((1..6).contains(&claims), "expected 1 to 5 claims in 3 seconds, saw {claims}");
 }
+
+// A server that refuses every claim with 403 makes the loop re-register and
+// re-mint a key on each pass; that must not be a tight loop either.
+#[tokio::test]
+async fn a_refused_claim_waits_before_the_next() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = MockCloud::start_refusing_claims().await;
+    let root = crate::root::Root::at(tmp.path().join("hanzo-root"));
+    let host = Arc::new(StubHost { api: mock.base_url(), org: None });
+    let exec: Executor = Arc::new(|_, _| Box::pin(async { Ok(None) }));
+
+    let held = serve_with(host, &root, "hanzo", &mock.base_url(), "mach_1", "host", target::grants(), exec);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    drop(held);
+
+    let claims = mock.requests().iter().filter(|r| r.method == "POST" && r.path.ends_with("/claim")).count();
+    assert!((1..6).contains(&claims), "expected 1 to 5 claims in 3 seconds, saw {claims}");
+}

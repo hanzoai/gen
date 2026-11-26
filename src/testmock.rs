@@ -77,6 +77,8 @@ struct Config {
     routed_runs: Arc<Mutex<std::collections::VecDeque<crate::runner::RoutedRun>>>,
     key_mints: Arc<std::sync::atomic::AtomicUsize>,
     reject_first_key: bool,
+    /// Every routed-run claim answers 403, whatever key it carries.
+    refuse_claims: bool,
     /// Answer 503 to the first this-many requests, then serve normally.
     refuse_first: usize,
     refused: Arc<std::sync::atomic::AtomicUsize>,
@@ -105,6 +107,7 @@ impl Default for Config {
             routed_runs: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             key_mints: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             reject_first_key: false,
+            refuse_claims: false,
             refuse_first: 0,
             refused: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             folders: Arc::new(Mutex::new(Vec::new())),
@@ -239,6 +242,11 @@ impl MockCloud {
             ..Config::default()
         })
         .await
+    }
+
+    /// A mock whose claim endpoint answers 403 every time, though key minting succeeds.
+    pub async fn start_refusing_claims() -> MockCloud {
+        Self::with(Config { refuse_claims: true, ..Config::default() }).await
     }
 
     pub fn base_url(&self) -> String {
@@ -419,7 +427,7 @@ fn respond(cfg: &Config, method: &str, path: &str, bearer: bool, claim_key: Opti
     }
     // target routed-run claim -> 403 on wrong key, 200 on queued run, 204 when empty
     if method == "POST" && path.starts_with("/v1/agent/targets/") && path.ends_with("/claim") {
-        if claim_key != Some("ck_fresh") {
+        if cfg.refuse_claims || claim_key != Some("ck_fresh") {
             return ("403 Forbidden".into(), r#"{"error":"forbidden"}"#.to_string());
         }
         if let Some(run) = cfg.routed_runs.lock().unwrap().pop_front() {
