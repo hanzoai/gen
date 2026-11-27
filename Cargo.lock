@@ -375,7 +375,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -541,7 +541,7 @@ dependencies = [
 [[package]]
 name = "hanzo-client"
 version = "0.1.1"
-source = "git+https://github.com/hanzoai/cli?rev=287bcbd78185b382a4561eabaccf620d7c05781f#287bcbd78185b382a4561eabaccf620d7c05781f"
+source = "git+https://github.com/hanzoai/cli?rev=6c3be2bd5a076684b82c926664822a501f6b4142#6c3be2bd5a076684b82c926664822a501f6b4142"
 dependencies = [
  "httpdate",
  "rand 0.8.6",
@@ -1140,7 +1140,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1322,7 +1322,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.11.0",
- "windows-sys 0.61.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1610,7 +1610,7 @@ dependencies = [
  "getrandom 0.3.3",
  "once_cell",
  "rustix 1.1.2",
- "windows-sys 0.61.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
