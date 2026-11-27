@@ -92,7 +92,12 @@ use supervise::supervise;
 /// every warning looks the same and none of them lands on stdout, where it would
 /// corrupt what a caller is piping (`hanzo auth token`).
 pub fn warn(msg: &str) {
-    eprintln!("{} {}", "warning:".yellow().bold(), msg);
+    warn_to(&mut std::io::stderr(), msg);
+}
+
+fn warn_to(w: &mut impl std::io::Write, msg: &str) {
+    // Never panic on a closed stderr: a warning from the beat task must not end the beat.
+    let _ = writeln!(w, "{} {}", "warning:".yellow().bold(), msg);
 }
 
 /// Parsed `hanzo dev` invocation.

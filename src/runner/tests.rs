@@ -50,6 +50,7 @@ async fn runner_mints_key_claims_clones_commits_pushes_and_reports() {
     let seed = tmp.path().join("seed");
 
     run_git(None, &["init", "--bare", "--initial-branch=main", &origin.to_string_lossy()]).await.unwrap();
+    run_git(Some(&origin), &["config", "core.hooksPath", "hooks"]).await.unwrap();
     run_git(None, &["clone", &origin.to_string_lossy(), &seed.to_string_lossy()]).await.unwrap();
     run_git(Some(&seed), &["config", "user.email", "test@hanzo.ai"]).await.unwrap();
     run_git(Some(&seed), &["config", "user.name", "Test"]).await.unwrap();
@@ -211,6 +212,7 @@ async fn a_refused_push_reports_gits_reason() {
     let origin = tmp.path().join("origin.git");
     let seed = tmp.path().join("seed");
     run_git(None, &["init", "--bare", "--initial-branch=main", &origin.to_string_lossy()]).await.unwrap();
+    run_git(Some(&origin), &["config", "core.hooksPath", "hooks"]).await.unwrap();
     run_git(None, &["clone", &origin.to_string_lossy(), &seed.to_string_lossy()]).await.unwrap();
     run_git(Some(&seed), &["config", "user.email", "test@hanzo.ai"]).await.unwrap();
     run_git(Some(&seed), &["config", "user.name", "Test"]).await.unwrap();
@@ -259,6 +261,7 @@ async fn a_refused_push_redacts_tokens_in_remote_stderr() {
     let origin = tmp.path().join("origin.git");
     let seed = tmp.path().join("seed");
     run_git(None, &["init", "--bare", "--initial-branch=main", &origin.to_string_lossy()]).await.unwrap();
+    run_git(Some(&origin), &["config", "core.hooksPath", "hooks"]).await.unwrap();
     run_git(None, &["clone", &origin.to_string_lossy(), &seed.to_string_lossy()]).await.unwrap();
     run_git(Some(&seed), &["config", "user.email", "test@hanzo.ai"]).await.unwrap();
     run_git(Some(&seed), &["config", "user.name", "Test"]).await.unwrap();

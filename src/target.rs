@@ -149,8 +149,8 @@ fn answer(v: Value) -> Result<Answer> {
 /// none or the stored target is gone (deleted / different org). BEST-EFFORT: every
 /// failure is logged at debug and swallowed — the coding session never depends on
 /// this. The caller runs it detached so neither the capture nor the cloud write is
-/// on the session's critical path. Answers the granted folders when cloud answered.
-pub async fn sync(root: &Root, api: &str, token: &str, org: Option<&str>, machine_id: &str, host: &str, machine: &Machine) -> Option<Vec<String>> {
+/// on the session's critical path. Answers what cloud answered: the target id and its granted folders.
+pub async fn sync(root: &Root, api: &str, token: &str, org: Option<&str>, machine_id: &str, host: &str, machine: &Machine) -> Option<Answer> {
     let client = match TargetClient::new(api, token) {
         Ok(c) => c.with_org(org),
         Err(e) => {
@@ -179,9 +179,9 @@ pub async fn sync(root: &Root, api: &str, token: &str, org: Option<&str>, machin
     };
 
     match answer {
-        Some(Answer { id, folders }) => {
+        Some(answer) => {
             let rec = TargetRecord {
-                id,
+                id: answer.id.clone(),
                 host: host.to_string(),
                 machine_id: machine_id.to_string(),
                 api: api.to_string(),
@@ -190,13 +190,30 @@ pub async fn sync(root: &Root, api: &str, token: &str, org: Option<&str>, machin
             if let Err(e) = rec.save(root) {
                 tracing::debug!("could not persist target id ({e})");
             }
-            Some(folders)
+            Some(answer)
         }
         None => {
             tracing::debug!("run-target register failed; session proceeds without a target");
             None
         }
     }
+}
+
+/// What a machine with no granted folder tells its owner, once: a linked, beating
+/// machine reads ready, but no run from the web can touch a file until a grant.
+fn no_folder_notice(id: &str, folders: &[String]) -> Option<String> {
+    folders.is_empty().then(|| {
+        format!("no folder on this machine ({id}) is granted to the web: `hanzo link grant <folder>` grants one")
+    })
+}
+
+/// Keep an answer's granted folders in `grants`; the notice for the FIRST answer
+/// this beat hears, if it granted nothing. `heard` is the beat's own latch.
+fn heard_answer(grants: &Grants, heard: &mut bool, answer: Answer) -> Option<String> {
+    let first = !std::mem::replace(heard, true);
+    let notice = first.then(|| no_folder_notice(&answer.id, &answer.folders)).flatten();
+    grants.send_replace(Some(answer.folders));
+    notice
 }
 
 /// How often a held-open machine says it is still alive.
@@ -244,11 +261,12 @@ impl Drop for Beat {
 /// refreshes: the credential is the host's shared state, not a value held here.
 /// It is asked for `brand`'s account, the one the session it beats for runs as.
 pub fn beat(host: Arc<dyn Host>, root: &Root, brand: &str, api: &str, machine_id: &str, name: &str) -> Beat {
-    beat_with(host, root, brand, api, machine_id, name, grants())
+    beat_with(host, root, brand, api, machine_id, name, None)
 }
 
-/// [`beat`], writing each answer's granted folders to `grants`.
-fn beat_with(host: Arc<dyn Host>, root: &Root, brand: &str, api: &str, machine_id: &str, name: &str, grants: Grants) -> Beat {
+/// [`beat`], writing each answer's granted folders to `grants` when someone serves
+/// on them; the first answer with none says so once.
+fn beat_with(host: Arc<dyn Host>, root: &Root, brand: &str, api: &str, machine_id: &str, name: &str, grants: Option<Grants>) -> Beat {
     let creds = Creds::Refreshing { host, brand: brand.to_string() };
     beat_every(BEAT, creds, root, api, machine_id, name, grants)
 }
@@ -305,7 +323,7 @@ pub fn beat_and_serve(
 ) -> (Beat, crate::runner::Runner) {
     let api = api.trim_end_matches('/');
     let grants = grants();
-    let b = beat_with(host.clone(), root, brand, api, machine_id, name, grants.clone());
+    let b = beat_with(host.clone(), root, brand, api, machine_id, name, Some(grants.clone()));
     let r = crate::runner::serve(host, root, brand, api, machine_id, name, grants);
     (b, r)
 }
@@ -325,7 +343,7 @@ pub async fn present(host: Arc<dyn Host>, root: &Root, brand: &str) -> Result<()
 /// [`beat`] with the period as a parameter, so a test can watch the loop repeat
 /// without waiting minutes for it. `BEAT` is the ONE period production uses — this
 /// is the mechanism, not a setting.
-fn beat_every(period: Duration, mut creds: Creds, root: &Root, api: &str, machine_id: &str, host: &str, grants: Grants) -> Beat {
+fn beat_every(period: Duration, mut creds: Creds, root: &Root, api: &str, machine_id: &str, host: &str, grants: Option<Grants>) -> Beat {
     let root = root.clone();
     let api = api.to_string();
     let (machine_id, host) = (machine_id.to_string(), host.to_string());
@@ -334,14 +352,19 @@ fn beat_every(period: Duration, mut creds: Creds, root: &Root, api: &str, machin
         // carries the rates over the window since the one before it.
         let mut sampler = Sampler::new();
         let org = creds.org().await;
+        let mut heard = false;
         loop {
             // A beat with no credential is a beat that cannot land, so skip the
             // capture too rather than probe the machine for nothing.
             match creds.bearer().await {
                 Some(token) => {
                     let machine = sampler.machine().await;
-                    if let Some(folders) = sync(&root, &api, &token, org.as_deref(), &machine_id, &host, &machine).await {
-                        grants.send_replace(Some(folders));
+                    if let Some(answer) = sync(&root, &api, &token, org.as_deref(), &machine_id, &host, &machine).await {
+                        if let Some(grants) = &grants {
+                            if let Some(line) = heard_answer(grants, &mut heard, answer) {
+                                crate::warn(&line);
+                            }
+                        }
                     }
                 }
                 None => tracing::debug!("no credential for this beat; the machine will read offline"),
@@ -526,7 +549,7 @@ mod tests {
         let machine = format!("beat_{}", std::process::id());
         let _ = std::fs::remove_file(crate::context::target_path_for_test(&root, &machine));
 
-        let held = beat_every(Duration::from_millis(10), Creds::Fixed("T".into()), &root, &mock.base_url(), &machine, "evo", grants());
+        let held = beat_every(Duration::from_millis(10), Creds::Fixed("T".into()), &root, &mock.base_url(), &machine, "evo", Some(grants()));
         until("a machine to keep beating", || mock.requests().len() >= 3).await;
         drop(held);
 
@@ -552,7 +575,7 @@ mod tests {
             &mock.base_url(),
             &machine,
             "evo",
-            grants(),
+            Some(grants()),
         );
         until("several beats", || mock.requests().len() >= 3).await;
         drop(held);
@@ -601,6 +624,36 @@ mod tests {
         let _ = std::fs::remove_file(crate::context::target_path_for_test(&root, &machine));
     }
 
+    fn answer_of(folders: &[&str]) -> Answer {
+        Answer { id: "tgt_1".into(), folders: folders.iter().map(|f| f.to_string()).collect() }
+    }
+
+    #[test]
+    fn the_notice_names_the_command_only_when_nothing_is_granted() {
+        let line = no_folder_notice("tgt_1", &[]).unwrap();
+        assert!(line.contains("hanzo link grant"), "{line}");
+        assert!(line.contains("tgt_1"), "{line}");
+        assert_eq!(no_folder_notice("tgt_1", &["/home/me/site".to_string()]), None);
+    }
+
+    #[test]
+    fn two_empty_answers_give_one_notice() {
+        let g = grants();
+        let mut heard = false;
+        assert!(heard_answer(&g, &mut heard, answer_of(&[])).is_some());
+        assert!(heard_answer(&g, &mut heard, answer_of(&[])).is_none());
+        assert_eq!(g.borrow().as_deref(), Some(&[][..]));
+    }
+
+    #[test]
+    fn a_first_answer_with_a_folder_gives_none_now_or_after_a_revoke() {
+        let g = grants();
+        let mut heard = false;
+        assert!(heard_answer(&g, &mut heard, answer_of(&["/home/me/site"])).is_none());
+        assert!(heard_answer(&g, &mut heard, answer_of(&[])).is_none());
+        assert_eq!(g.borrow().as_deref(), Some(&[][..]));
+    }
+
     /// Each beat keeps the folders cloud answers as granted, so a revoke lands on the next.
     #[tokio::test]
     async fn a_beat_keeps_the_granted_folders() {
@@ -609,7 +662,7 @@ mod tests {
         let root = crate::root::scratch();
         let machine = format!("beatgrants_{}", std::process::id());
         let g = grants();
-        let held = beat_every(Duration::from_millis(10), Creds::Fixed("T".into()), &root, &mock.base_url(), &machine, "evo", g.clone());
+        let held = beat_every(Duration::from_millis(10), Creds::Fixed("T".into()), &root, &mock.base_url(), &machine, "evo", Some(g.clone()));
         until("the grants", || g.borrow().as_ref().is_some_and(|f| f.len() == 2)).await;
         mock.grant(&["/home/me/notes"]);
         until("the revoke", || g.borrow().as_deref() == Some(&["/home/me/notes".to_string()][..])).await;
@@ -626,7 +679,7 @@ mod tests {
         let machine = format!("beatdrop_{}", std::process::id());
         let _ = std::fs::remove_file(crate::context::target_path_for_test(&root, &machine));
 
-        let held = beat_every(Duration::from_millis(10), Creds::Fixed("T".into()), &root, &mock.base_url(), &machine, "evo", grants());
+        let held = beat_every(Duration::from_millis(10), Creds::Fixed("T".into()), &root, &mock.base_url(), &machine, "evo", Some(grants()));
         until("the first beat", || !mock.requests().is_empty()).await;
         drop(held);
         // A beat already in flight may still land, so settle before reading the mark.

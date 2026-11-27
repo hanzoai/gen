@@ -342,8 +342,8 @@ async fn resolve_target_id(
 #[allow(clippy::too_many_arguments)]
 async fn sync(root: &Root, api: &str, token: &str, org: Option<&str>, machine_id: &str, host_name: &str, sampler: &mut Sampler, grants: &Grants) {
     let machine = sampler.machine().await;
-    if let Some(folders) = target::sync(root, api, token, org, machine_id, host_name, &machine).await {
-        grants.send_replace(Some(folders));
+    if let Some(answer) = target::sync(root, api, token, org, machine_id, host_name, &machine).await {
+        grants.send_replace(Some(answer.folders));
     }
 }
 

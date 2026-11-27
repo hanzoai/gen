@@ -312,3 +312,17 @@ fn cwd_or_friendly_explains_a_missing_directory() {
     assert!(!err.contains("resolving current dir"), "got: {err}");
 }
 
+#[test]
+fn warn_does_not_panic_on_a_closed_stream() {
+    struct ClosedPipe;
+    impl std::io::Write for ClosedPipe {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        }
+    }
+    warn_to(&mut ClosedPipe, "no folder granted");
+}
+
