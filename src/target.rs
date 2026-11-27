@@ -51,6 +51,11 @@ pub struct Register {
     pub host: String,
     pub spec: Spec,
     pub metrics: Metrics,
+    /// The https url this machine's own `hanzo link` publishes its shell at. Absent
+    /// leaves cloud's copy unchanged, `""` clears it, a url sets it — so a beat
+    /// from `hanzo dev` or `hanzo shell`, which publish no shell, never wipes it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal: Option<String>,
 }
 
 impl Register {
@@ -67,6 +72,7 @@ impl Register {
             host: host.to_string(),
             spec: m.spec.clone(),
             metrics: m.metrics.clone(),
+            terminal: None,
         }
     }
 }
@@ -87,6 +93,14 @@ pub type Grants = Arc<watch::Sender<Option<Vec<String>>>>;
 
 /// Grants nobody has heard yet.
 pub fn grants() -> Grants {
+    Arc::new(watch::Sender::new(None))
+}
+
+/// The url this machine's shell is published at, as the process that publishes it
+/// last said; `None` when it publishes none. The caller writes it, the beat reads it.
+type Terminal = Arc<watch::Sender<Option<String>>>;
+
+fn terminal() -> Terminal {
     Arc::new(watch::Sender::new(None))
 }
 
@@ -150,7 +164,9 @@ fn answer(v: Value) -> Result<Answer> {
 /// failure is logged at debug and swallowed — the coding session never depends on
 /// this. The caller runs it detached so neither the capture nor the cloud write is
 /// on the session's critical path. Answers what cloud answered: the target id and its granted folders.
-pub async fn sync(root: &Root, api: &str, token: &str, org: Option<&str>, machine_id: &str, host: &str, machine: &Machine) -> Option<Answer> {
+/// The `body` is what to state; its `terminal` is stated as given: `None` says
+/// nothing, `Some("")` clears it.
+pub async fn sync(root: &Root, api: &str, token: &str, org: Option<&str>, machine_id: &str, host: &str, body: Register) -> Option<Answer> {
     let client = match TargetClient::new(api, token) {
         Ok(c) => c.with_org(org),
         Err(e) => {
@@ -158,7 +174,6 @@ pub async fn sync(root: &Root, api: &str, token: &str, org: Option<&str>, machin
             return None;
         }
     };
-    let body = Register::from_machine(host, machine);
 
     // Reuse the stored id ONLY for the same machine + host + api, so a copied data
     // dir or a renamed host re-registers instead of clobbering another target.
@@ -236,11 +251,35 @@ pub const BEAT: Duration = Duration::from_secs(30);
 /// machine reads offline on its own. A second "I am leaving" message would be a
 /// second way to say the same thing, and the one that gets lost when the power
 /// cord goes.
-pub struct Beat(tokio::task::JoinHandle<()>);
+pub struct Beat {
+    task: tokio::task::JoinHandle<()>,
+    terminal: Terminal,
+    /// The url cloud last accepted from this beat: what `withdraw` waits on.
+    acked: Terminal,
+}
 
 impl Drop for Beat {
     fn drop(&mut self) {
-        self.0.abort();
+        self.task.abort();
+    }
+}
+
+impl Beat {
+    /// State the url this machine's shell is published at, now and on every beat
+    /// after; `None` withdraws it, saying so once. The terminal is a fact about the
+    /// MACHINE, so it lives on this row, whose beat cloud already reads for
+    /// liveness, and not on a session, which cloud stops after an hour idle.
+    pub fn terminal(&self, url: Option<&str>) {
+        self.terminal.send_replace(url.map(str::to_string));
+    }
+
+    /// Withdraw the terminal and wait, for a few seconds at most, until cloud has
+    /// heard it. A link ends by dropping this guard, which stops the beat, so a
+    /// withdrawal left to the next beat would never be said.
+    pub async fn withdraw(&self) {
+        self.terminal(None);
+        let mut acked = self.acked.subscribe();
+        let _ = tokio::time::timeout(Duration::from_secs(5), acked.wait_for(Option::is_none)).await;
     }
 }
 
@@ -347,19 +386,35 @@ fn beat_every(period: Duration, mut creds: Creds, root: &Root, api: &str, machin
     let root = root.clone();
     let api = api.to_string();
     let (machine_id, host) = (machine_id.to_string(), host.to_string());
-    Beat(tokio::spawn(async move {
+    let (said, acked) = (terminal(), terminal());
+    let term_acked = acked.clone();
+    let mut wanted = said.subscribe();
+    let task = tokio::spawn(async move {
         // One sampler for the life of the beat, so every beat after the first
         // carries the rates over the window since the one before it.
         let mut sampler = Sampler::new();
         let org = creds.org().await;
         let mut heard = false;
+        // Whether cloud holds a url from this beat, so that withdrawing it is said
+        // once — and again next beat if that one is lost.
+        let mut stated = false;
         loop {
             // A beat with no credential is a beat that cannot land, so skip the
             // capture too rather than probe the machine for nothing.
             match creds.bearer().await {
                 Some(token) => {
                     let machine = sampler.machine().await;
-                    if let Some(answer) = sync(&root, &api, &token, org.as_deref(), &machine_id, &host, &machine).await {
+                    let url = wanted.borrow_and_update().clone();
+                    let say = match (&url, stated) {
+                        (Some(u), _) => Some(u.as_str()),
+                        (None, true) => Some(""),
+                        (None, false) => None,
+                    };
+                    let mut body = Register::from_machine(&host, &machine);
+                    body.terminal = say.map(str::to_string);
+                    if let Some(answer) = sync(&root, &api, &token, org.as_deref(), &machine_id, &host, body).await {
+                        stated = url.is_some();
+                        term_acked.send_replace(url);
                         if let Some(grants) = &grants {
                             if let Some(line) = heard_answer(grants, &mut heard, answer) {
                                 crate::warn(&line);
@@ -369,9 +424,14 @@ fn beat_every(period: Duration, mut creds: Creds, root: &Root, api: &str, machin
                 }
                 None => tracing::debug!("no credential for this beat; the machine will read offline"),
             }
-            tokio::time::sleep(period).await;
+            // A change of terminal is stated at once rather than a period late.
+            tokio::select! {
+                () = tokio::time::sleep(period) => {}
+                _ = wanted.changed() => {}
+            }
         }
-    }))
+    });
+    Beat { task, terminal: said, acked }
 }
 
 #[cfg(test)]
@@ -418,6 +478,7 @@ mod tests {
         assert_eq!(v["metrics"]["memUsed"], 42);
         assert_eq!(v["metrics"]["gpuUtil"], 0.4);
         assert!(v["metrics"].get("at").is_none(), "must not send the metrics timestamp");
+        assert!(v.get("terminal").is_none(), "a body with no terminal says nothing about one");
     }
 
     #[test]
@@ -475,7 +536,7 @@ mod tests {
         let root = crate::root::scratch();
         let machine = format!("syncfresh_{}", std::process::id());
         let _ = std::fs::remove_file(crate::context::target_path_for_test(&root, &machine));
-        sync(&root, &mock.base_url(), "T", None, &machine, "evo", &gpu_machine()).await;
+        sync(&root, &mock.base_url(), "T", None, &machine, "evo", Register::from_machine("evo", &gpu_machine())).await;
 
         assert!(mock.requests().iter().any(|r| r.method == "POST" && r.path == "/v1/agent/targets"));
         let rec = TargetRecord::load(&root, &machine).unwrap().unwrap();
@@ -502,7 +563,7 @@ mod tests {
         .save(&root)
         .unwrap();
 
-        sync(&root, &mock.base_url(), "T", None, &machine, "evo", &gpu_machine()).await;
+        sync(&root, &mock.base_url(), "T", None, &machine, "evo", Register::from_machine("evo", &gpu_machine())).await;
 
         let reqs = mock.requests();
         assert!(reqs.iter().any(|r| r.method == "PATCH" && r.path == "/v1/agent/targets/tgt_stale"), "tries the heartbeat first");
@@ -666,6 +727,78 @@ mod tests {
         until("the grants", || g.borrow().as_ref().is_some_and(|f| f.len() == 2)).await;
         mock.grant(&["/home/me/notes"]);
         until("the revoke", || g.borrow().as_deref() == Some(&["/home/me/notes".to_string()][..])).await;
+        drop(held);
+        let _ = std::fs::remove_file(crate::context::target_path_for_test(&root, &machine));
+    }
+
+    #[tokio::test]
+    async fn a_beat_states_the_terminal_it_was_given() {
+        let mock = MockCloud::start().await;
+        let root = crate::root::scratch();
+        let machine = format!("beatterm_{}", std::process::id());
+        let _ = std::fs::remove_file(crate::context::target_path_for_test(&root, &machine));
+        let held = beat_every(Duration::from_millis(10), Creds::Fixed("T".into()), &root, &mock.base_url(), &machine, "evo", Some(grants()));
+        held.terminal(Some("https://box.share.hanzo.ai"));
+        until("the url stated", || mock.requests().iter().any(|r| r.json()["terminal"] == "https://box.share.hanzo.ai")).await;
+        let seen = mock.requests().len();
+        until("three more beats", || mock.requests().len() >= seen + 3).await;
+        drop(held);
+        let reqs = mock.requests();
+        assert!(
+            reqs[seen..].iter().all(|r| r.json()["terminal"] == "https://box.share.hanzo.ai"),
+            "every beat after it is set states the terminal",
+        );
+        let _ = std::fs::remove_file(crate::context::target_path_for_test(&root, &machine));
+    }
+
+    #[tokio::test]
+    async fn a_beat_with_no_terminal_sends_no_key() {
+        let mock = MockCloud::start().await;
+        let root = crate::root::scratch();
+        let machine = format!("beatnoterm_{}", std::process::id());
+        let _ = std::fs::remove_file(crate::context::target_path_for_test(&root, &machine));
+        let held = beat_every(Duration::from_millis(10), Creds::Fixed("T".into()), &root, &mock.base_url(), &machine, "evo", Some(grants()));
+        until("three beats", || mock.requests().len() >= 3).await;
+        drop(held);
+        assert!(
+            mock.requests().iter().all(|r| r.json().get("terminal").is_none()),
+            "a beat that has no terminal says nothing about it",
+        );
+        let _ = std::fs::remove_file(crate::context::target_path_for_test(&root, &machine));
+    }
+
+    #[tokio::test]
+    async fn clearing_the_terminal_says_so_once() {
+        let mock = MockCloud::start().await;
+        let root = crate::root::scratch();
+        let machine = format!("beatclear_{}", std::process::id());
+        let _ = std::fs::remove_file(crate::context::target_path_for_test(&root, &machine));
+        let held = beat_every(Duration::from_millis(10), Creds::Fixed("T".into()), &root, &mock.base_url(), &machine, "evo", Some(grants()));
+        held.terminal(Some("https://box.share.hanzo.ai"));
+        until("the url stated", || mock.requests().iter().any(|r| r.json()["terminal"] == "https://box.share.hanzo.ai")).await;
+        held.terminal(None);
+        until("the clear", || mock.requests().iter().any(|r| r.json()["terminal"] == "")).await;
+        let settled = mock.requests().len();
+        until("beats after the clear", || mock.requests().len() >= settled + 3).await;
+        drop(held);
+        let said: Vec<_> = mock.requests().iter().filter_map(|r| r.json().get("terminal").cloned()).collect();
+        assert_eq!(said.iter().filter(|v| *v == "").count(), 1, "cleared once: {said:?}");
+        assert_eq!(said.last().unwrap(), "", "nothing after the clear restates the url: {said:?}");
+        let _ = std::fs::remove_file(crate::context::target_path_for_test(&root, &machine));
+    }
+
+    #[tokio::test]
+    async fn a_terminal_change_is_said_at_once_and_withdraw_waits_for_it() {
+        let mock = MockCloud::start().await;
+        let root = crate::root::scratch();
+        let machine = format!("beatwithdraw_{}", std::process::id());
+        let _ = std::fs::remove_file(crate::context::target_path_for_test(&root, &machine));
+        let held = beat_every(Duration::from_secs(3600), Creds::Fixed("T".into()), &root, &mock.base_url(), &machine, "evo", Some(grants()));
+        until("the first beat", || !mock.requests().is_empty()).await;
+        held.terminal(Some("https://box.share.hanzo.ai"));
+        until("the url stated within the hour", || mock.requests().iter().any(|r| r.json()["terminal"] == "https://box.share.hanzo.ai")).await;
+        held.withdraw().await;
+        assert!(mock.requests().iter().any(|r| r.json()["terminal"] == ""), "the clear was heard before withdraw returned");
         drop(held);
         let _ = std::fs::remove_file(crate::context::target_path_for_test(&root, &machine));
     }
