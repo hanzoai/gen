@@ -116,6 +116,7 @@ pub struct MockCloud {
     port: u16,
     requests: Arc<Mutex<Vec<Recorded>>>,
     folders: Arc<Mutex<Vec<String>>>,
+    routed_runs: Arc<Mutex<std::collections::VecDeque<crate::runner::RoutedRun>>>,
 }
 
 impl MockCloud {
@@ -214,6 +215,7 @@ impl MockCloud {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let reqs = requests.clone();
         let folders = cfg.folders.clone();
+        let routed_runs = cfg.routed_runs.clone();
         tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else { break };
@@ -222,7 +224,7 @@ impl MockCloud {
                 tokio::spawn(async move { serve_conn(stream, reqs, cfg).await });
             }
         });
-        MockCloud { port, requests, folders }
+        MockCloud { port, requests, folders, routed_runs }
     }
 
 
@@ -245,6 +247,11 @@ impl MockCloud {
 
     pub fn requests(&self) -> Vec<Recorded> {
         self.requests.lock().unwrap().clone()
+    }
+
+    /// Queue a routed run for the runner's next claim.
+    pub fn queue(&self, run: crate::runner::RoutedRun) {
+        self.routed_runs.lock().unwrap().push_back(run);
     }
 
     /// Set the folders the machine's owner has granted, as the next target answer says.
