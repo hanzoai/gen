@@ -11,6 +11,8 @@ use anyhow::{Context, Result};
 use hanzo_client::{Http, Method, Request, Transport};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use super::event::{Kind, Status};
@@ -22,6 +24,9 @@ pub struct SessionClient {
     token: String,
     /// The org selected with `--org`, sent as `X-Org-Id` (`Config::org`).
     org: Option<String>,
+    /// Set while the last event append was lost: see [`Self::event`]. Shared by
+    /// every clone, since they all forward to the one cloud.
+    lost: Arc<AtomicBool>,
 }
 
 /// The result of registering a session — cloud mints the id.
@@ -58,6 +63,7 @@ impl SessionClient {
             api: api.trim_end_matches('/').to_string(),
             token: token.to_string(),
             org: None,
+            lost: Arc::default(),
         })
     }
 
@@ -98,11 +104,26 @@ impl SessionClient {
     }
 
     /// Append one event to a session's ordered log.
+    ///
+    /// The append names itself with a `requestId`, so the wire may make it again
+    /// after a 5xx (`hanzo_client`'s one retry policy repeats a POST only when it is
+    /// named) and the platform stores the turn once. Without the name a turn cloud
+    /// refused for a moment (503, its audit trail busy) was lost from the transcript.
+    ///
+    /// The stream forwards each turn in line with reading the agent, so those tries
+    /// hold the agent's output while they wait. A cloud that stays down is therefore
+    /// waited on once: after a turn is lost the next go unnamed (one try) until one
+    /// lands.
     pub async fn event(&self, id: &str, kind: Kind, payload: Value) -> Result<()> {
-        let body = json!({ "kind": kind.as_str(), "payload": payload });
-        self.send(Method::POST, &format!("/v1/agents/sessions/{id}/events"), Some(&body))
-            .await?;
-        Ok(())
+        let mut body = json!({ "kind": kind.as_str(), "payload": payload });
+        if !self.lost.load(Ordering::Relaxed) {
+            body["requestId"] = json!(format!("{:032x}", rand::random::<u128>()));
+        }
+        let sent = self
+            .send(Method::POST, &format!("/v1/agents/sessions/{id}/events"), Some(&body))
+            .await;
+        self.lost.store(sent.is_err(), Ordering::Relaxed);
+        sent.map(drop)
     }
 
     /// Set the session's status (running/paused/done/error). Cloud refuses to
@@ -315,6 +336,73 @@ mod tests {
         assert_eq!(reqs[1].method, "PATCH");
         assert_eq!(reqs[1].path, "/v1/agents/sessions/sess_1");
         assert_eq!(reqs[1].json()["status"], "done");
+    }
+
+    /// A transcript turn the cloud refuses with a 503 (its audit trail could not
+    /// record the request, so nothing was applied) is made again, not dropped: the
+    /// append names itself with a `requestId`, which is what lets the wire repeat a
+    /// POST, and the repeat carries the SAME id so the platform stores the turn once.
+    ///
+    /// MUTATION: drop `requestId` from the body, and the first assertion reads Err
+    /// (the refused turn is lost, as it was when a stream said "event dropped").
+    #[tokio::test]
+    async fn a_refused_event_is_made_again_under_the_same_request_id() {
+        let mock = MockCloud::start_refusing_first(1).await;
+        let client = SessionClient::new(&mock.base_url(), "T").unwrap();
+
+        client
+            .event("sess_1", Kind::ToolCall, json!({"name":"Bash"}))
+            .await
+            .expect("a 503 on a transcript turn is retried, not dropped");
+
+        let reqs = mock.requests();
+        assert_eq!(reqs.len(), 2, "one refusal, one repeat");
+        let named = |i: usize| reqs[i].json()["requestId"].as_str().unwrap_or_default().to_string();
+        assert!(!named(0).is_empty(), "the append names itself");
+        assert_eq!(named(0), named(1), "the repeat is the same request");
+        assert_eq!(reqs[1].path, "/v1/agents/sessions/sess_1/events");
+    }
+
+    /// A cloud that stays down costs the run ONE turn's retries, not every turn's.
+    /// The stream forwards each turn in line with reading the agent, so a named
+    /// append that waits out the wire's backoff holds the agent's output for that
+    /// long. Once a turn has used every try, the next ones go unnamed (one try, as
+    /// before) until one lands; then turns are named again.
+    ///
+    /// MUTATION: always name the append, and the down cloud is asked 4 times for the
+    /// second turn too (the count below reads 8, and the run waits on each turn).
+    #[tokio::test]
+    async fn a_cloud_that_stays_down_is_waited_on_once() {
+        // Refuses 5: all 4 tries of the first turn, and the single try of the second.
+        let mock = MockCloud::start_refusing_first(5).await;
+        let client = SessionClient::new(&mock.base_url(), "T").unwrap();
+        let turn = || client.event("sess_1", Kind::Log, json!({"line":"x"}));
+
+        assert!(turn().await.is_err(), "every try refused");
+        assert_eq!(mock.requests().len(), 4, "the named turn used every try");
+
+        assert!(turn().await.is_err());
+        let reqs = mock.requests();
+        assert_eq!(reqs.len(), 5, "a turn after a lost one is tried once");
+        assert!(reqs[4].json().get("requestId").is_none(), "unnamed, so the wire does not repeat it");
+
+        turn().await.expect("cloud is back");
+        turn().await.unwrap();
+        let reqs = mock.requests();
+        assert_eq!(reqs.len(), 7);
+        assert!(reqs[6].json()["requestId"].is_string(), "a turn landed, so turns are named again");
+    }
+
+    /// Two turns are two requests: the id names one append, never the session.
+    #[tokio::test]
+    async fn each_event_names_itself_apart() {
+        let mock = MockCloud::start().await;
+        let client = SessionClient::new(&mock.base_url(), "T").unwrap();
+        for _ in 0..2 {
+            client.event("sess_1", Kind::Log, json!({"line":"x"})).await.unwrap();
+        }
+        let reqs = mock.requests();
+        assert_ne!(reqs[0].json()["requestId"], reqs[1].json()["requestId"]);
     }
 
     /// Ending a session and withdrawing its terminal URL are ONE act, in ONE
