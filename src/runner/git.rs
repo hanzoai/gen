@@ -146,10 +146,69 @@ pub(super) async fn run_git(cwd: Option<&Path>, args: &[&str]) -> Result<String>
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
         let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        let detail = if !stderr.is_empty() { stderr } else { stdout };
+        let detail = redact_git_detail(if !stderr.is_empty() { &stderr } else { &stdout });
         bail!("git {} exited {}: {detail}", args.first().copied().unwrap_or(""), out.status);
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Scrub URL userinfo (`https://user:secret@host` / `https://token@host`), auth
+/// headers (`Bearer ...`, `Basic ...`), and known token prefixes from git output
+/// before reporting an error chain back to the session transcript.
+pub(super) fn redact_git_detail(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(pos) = rest.find("://") {
+        out.push_str(&rest[..pos + 3]);
+        rest = &rest[pos + 3..];
+        let end = rest
+            .find(|c: char| c.is_whitespace() || matches!(c, '/' | '\'' | '"' | ')' | '>'))
+            .unwrap_or(rest.len());
+        let authority = &rest[..end];
+        if let Some(at) = authority.rfind('@') {
+            out.push_str("***@");
+            out.push_str(&authority[at + 1..]);
+        } else {
+            out.push_str(authority);
+        }
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+
+    let prefixes = [
+        "ghp_",
+        "ghs_",
+        "gho_",
+        "ghu_",
+        "github_pat_",
+        "glpat-",
+        "sk-",
+        "hk-",
+    ];
+    let mut tokens_scrubbed = String::with_capacity(out.len());
+    let mut prev_auth_scheme = false;
+    for (idx, chunk) in out.split_inclusive(|c: char| c.is_whitespace()).enumerate() {
+        let trimmed_ws = chunk.trim_end_matches(|c: char| c.is_whitespace());
+        let trailing = &chunk[trimmed_ws.len()..];
+        let core = trimmed_ws.trim_matches(|c: char| matches!(c, '\'' | '"' | ',' | ';' | ':' | '(' | ')' | '[' | ']'));
+        let lead_len = trimmed_ws.find(core).unwrap_or(0);
+        let lead = &trimmed_ws[..lead_len];
+        let tail = &trimmed_ws[lead_len + core.len()..];
+
+        let scrub = prev_auth_scheme
+            || prefixes.iter().any(|p| core.starts_with(p) && core.len() > p.len() + 3);
+        let _ = idx;
+        prev_auth_scheme = core.eq_ignore_ascii_case("bearer") || core.eq_ignore_ascii_case("basic");
+        if scrub {
+            tokens_scrubbed.push_str(lead);
+            tokens_scrubbed.push_str("***");
+            tokens_scrubbed.push_str(tail);
+            tokens_scrubbed.push_str(trailing);
+        } else {
+            tokens_scrubbed.push_str(chunk);
+        }
+    }
+    tokens_scrubbed
 }
 
 pub(super) async fn git_stdout(cwd: &Path, args: &[&str]) -> Result<String> {
