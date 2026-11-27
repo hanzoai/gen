@@ -680,7 +680,7 @@ fn default_routed_run_timeout_matches_four_hour_lease_ceiling() {
 }
 
 // A server that answers every claim "nothing for you" at once, instead of holding
-// the call, must not be called in a tight loop.
+// the call, must wait at least RETRY_WAIT before the next claim.
 #[tokio::test]
 async fn an_instantly_empty_claim_waits_before_the_next() {
     let tmp = tempfile::tempdir().unwrap();
@@ -690,15 +690,18 @@ async fn an_instantly_empty_claim_waits_before_the_next() {
     let exec: Executor = Arc::new(|_, _| Box::pin(async { Ok(None) }));
 
     let held = serve_with(host, &root, "hanzo", &mock.base_url(), "mach_1", "host", target::grants(), exec);
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    until("two empty claims", || {
+        mock.requests().iter().filter(|r| r.method == "POST" && r.path.ends_with("/claim")).count() >= 2
+    }).await;
     drop(held);
 
-    let claims = mock.requests().iter().filter(|r| r.method == "POST" && r.path.ends_with("/claim")).count();
-    assert!((1..6).contains(&claims), "expected 1 to 5 claims in 3 seconds, saw {claims}");
+    let claims: Vec<_> = mock.requests().into_iter().filter(|r| r.method == "POST" && r.path.ends_with("/claim")).collect();
+    let gap = claims[1].at.duration_since(claims[0].at);
+    assert!(gap >= Duration::from_millis(2900), "expected >= 2.9s inter-claim delay, saw {gap:?}");
 }
 
 // A server that refuses every claim with 403 makes the loop re-register and
-// re-mint a key on each pass; that must not be a tight loop either.
+// re-mint a key on each pass; that must enforce RETRY_WAIT before the next claim.
 #[tokio::test]
 async fn a_refused_claim_waits_before_the_next() {
     let tmp = tempfile::tempdir().unwrap();
@@ -708,9 +711,35 @@ async fn a_refused_claim_waits_before_the_next() {
     let exec: Executor = Arc::new(|_, _| Box::pin(async { Ok(None) }));
 
     let held = serve_with(host, &root, "hanzo", &mock.base_url(), "mach_1", "host", target::grants(), exec);
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    until("two refused claims", || {
+        mock.requests().iter().filter(|r| r.method == "POST" && r.path.ends_with("/claim")).count() >= 2
+    }).await;
     drop(held);
 
-    let claims = mock.requests().iter().filter(|r| r.method == "POST" && r.path.ends_with("/claim")).count();
-    assert!((1..6).contains(&claims), "expected 1 to 5 claims in 3 seconds, saw {claims}");
+    let claims: Vec<_> = mock.requests().into_iter().filter(|r| r.method == "POST" && r.path.ends_with("/claim")).collect();
+    let gap = claims[1].at.duration_since(claims[0].at);
+    assert!(gap >= Duration::from_millis(2900), "expected >= 2.9s inter-claim delay, saw {gap:?}");
+}
+
+// A genuine long poll held >= HELD (1s) dispatches the next claim immediately without RETRY_WAIT.
+#[tokio::test]
+async fn a_held_long_poll_claim_does_not_add_retry_wait() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = MockCloud::start_holding_claims(Duration::from_millis(1100)).await;
+    let root = crate::root::Root::at(tmp.path().join("hanzo-root"));
+    let host = Arc::new(StubHost { api: mock.base_url(), org: None });
+    let exec: Executor = Arc::new(|_, _| Box::pin(async { Ok(None) }));
+
+    let held = serve_with(host, &root, "hanzo", &mock.base_url(), "mach_1", "host", target::grants(), exec);
+    until("two held claims", || {
+        mock.requests().iter().filter(|r| r.method == "POST" && r.path.ends_with("/claim")).count() >= 2
+    }).await;
+    drop(held);
+
+    let claims: Vec<_> = mock.requests().into_iter().filter(|r| r.method == "POST" && r.path.ends_with("/claim")).collect();
+    let gap = claims[1].at.duration_since(claims[0].at);
+    assert!(
+        (Duration::from_millis(1050)..Duration::from_millis(2200)).contains(&gap),
+        "held long poll should re-poll immediately after 1.1s hold, saw {gap:?}"
+    );
 }

@@ -13,6 +13,7 @@ use tokio::net::TcpListener;
 /// One request the mock observed, captured for assertions.
 #[derive(Debug, Clone)]
 pub struct Recorded {
+    pub at: std::time::Instant,
     pub method: String,
     pub path: String,
     pub headers: Vec<(String, String)>,
@@ -79,6 +80,8 @@ struct Config {
     reject_first_key: bool,
     /// Every routed-run claim answers 403, whatever key it carries.
     refuse_claims: bool,
+    /// Optional server-side long-poll hold on `/claim` before answering.
+    claim_hold: std::time::Duration,
     /// Answer 503 to the first this-many requests, then serve normally.
     refuse_first: usize,
     refused: Arc<std::sync::atomic::AtomicUsize>,
@@ -108,6 +111,7 @@ impl Default for Config {
             key_mints: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             reject_first_key: false,
             refuse_claims: false,
+            claim_hold: std::time::Duration::ZERO,
             refuse_first: 0,
             refused: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             folders: Arc::new(Mutex::new(Vec::new())),
@@ -249,6 +253,11 @@ impl MockCloud {
         Self::with(Config { refuse_claims: true, ..Config::default() }).await
     }
 
+    /// A mock whose claim endpoint holds each poll for `hold` before answering 204.
+    pub async fn start_holding_claims(hold: std::time::Duration) -> MockCloud {
+        Self::with(Config { claim_hold: hold, ..Config::default() }).await
+    }
+
     pub fn base_url(&self) -> String {
         format!("http://127.0.0.1:{}", self.port)
     }
@@ -325,6 +334,7 @@ async fn serve_conn(
             .iter()
             .any(|(k, v)| k.eq_ignore_ascii_case("authorization") && v.starts_with("Bearer ") && v.len() > 7);
         reqs.lock().unwrap().push(Recorded {
+            at: std::time::Instant::now(),
             method: method.clone(),
             path: path.clone(),
             headers,
@@ -336,6 +346,9 @@ async fn serve_conn(
             .unwrap()
             .last()
             .and_then(|r| r.header("x-target-key"));
+        if method == "POST" && path.ends_with("/claim") && !cfg.claim_hold.is_zero() {
+            tokio::time::sleep(cfg.claim_hold).await;
+        }
         let (status, payload) = respond(&cfg, &method, &path, bearer, claim_key.as_deref());
         let resp = format!(
             "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{payload}",

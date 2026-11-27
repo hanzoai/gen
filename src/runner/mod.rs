@@ -38,12 +38,18 @@ const CLAIM_HTTP_TIMEOUT: Duration = Duration::from_secs(40);
 /// every 25s so `serving` stays `true` throughout long runs.
 const MAX_CONCURRENT_RUNS: usize = 2;
 
-/// Pause before the next claim after one that failed, or that came back empty
-/// sooner than `HELD` (the server did not hold the call).
+/// Base pause before the next claim after one that failed, or that came back empty
+/// sooner than `HELD` (the server did not hold the call), plus bounded jitter so a
+/// fleet of linked machines does not synchronize retries.
 const RETRY_WAIT: Duration = Duration::from_secs(3);
+const RETRY_JITTER_MS: u64 = 500;
 
 /// A claim the server held at least this long was a real long poll.
 const HELD: Duration = Duration::from_secs(1);
+
+fn retry_wait() -> Duration {
+    RETRY_WAIT + Duration::from_millis(u64::from(rand::random::<u16>()) % RETRY_JITTER_MS)
+}
 
 /// Clamp limits matching `cloud/apps/agents/routing_http.go`.
 const MAX_SHA_CHARS: usize = 128;
@@ -440,7 +446,7 @@ async fn run_loop(
             Ok(ClaimPoll::Empty) => {
                 drop(permit);
                 if started.elapsed() < HELD {
-                    tokio::time::sleep(RETRY_WAIT).await;
+                    tokio::time::sleep(retry_wait()).await;
                 }
             }
             Ok(ClaimPoll::Forbidden) => {
@@ -456,7 +462,7 @@ async fn run_loop(
                     Ok(k) => {
                         save_claim_key(&root, &api, org.as_deref(), &refreshed_id, &k);
                         cached_key = Some((refreshed_id, k));
-                        tokio::time::sleep(RETRY_WAIT).await;
+                        tokio::time::sleep(retry_wait()).await;
                     }
                     Err(e) => {
                         tracing::debug!("claim key re-mint failed ({e})");
@@ -499,7 +505,7 @@ async fn run_loop(
             Err(e) => {
                 tracing::debug!("target claim poll failed ({e})");
                 drop(permit);
-                tokio::time::sleep(RETRY_WAIT).await;
+                tokio::time::sleep(retry_wait()).await;
             }
         }
     }
