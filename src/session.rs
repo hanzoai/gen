@@ -393,6 +393,25 @@ mod tests {
         assert!(reqs[6].json()["requestId"].is_string(), "a turn landed, so turns are named again");
     }
 
+    /// A retried turn lands before the turn after it: the stream forwards in line, so
+    /// the transcript keeps the agent's order across a refusal.
+    ///
+    /// MUTATION: forward the next turn while the first is still retrying, and B's
+    /// request is recorded before A's repeat.
+    #[tokio::test]
+    async fn turns_keep_their_order_across_a_retry() {
+        let mock = MockCloud::start_refusing_first(1).await;
+        let client = SessionClient::new(&mock.base_url(), "T").unwrap();
+        client.event("sess_1", Kind::Log, json!({"line":"a"})).await.unwrap();
+        client.event("sess_1", Kind::Log, json!({"line":"b"})).await.unwrap();
+
+        let reqs = mock.requests();
+        let lines: Vec<String> = reqs.iter().map(|r| r.json()["payload"]["line"].as_str().unwrap_or_default().to_string()).collect();
+        assert_eq!(lines, ["a", "a", "b"], "refused a, a again, then b");
+        assert_eq!(reqs[0].json()["requestId"], reqs[1].json()["requestId"], "a's repeat is a");
+        assert_ne!(reqs[1].json()["requestId"], reqs[2].json()["requestId"], "b is its own request");
+    }
+
     /// Two turns are two requests: the id names one append, never the session.
     #[tokio::test]
     async fn each_event_names_itself_apart() {
