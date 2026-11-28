@@ -245,6 +245,11 @@ impl<'a> Run<'a> {
         }
     }
 
+    /// Resolved reasoning effort level, if explicitly configured.
+    pub fn effort(&self) -> Option<crate::reasoning::ReasoningEffort> {
+        self.spec.effort
+    }
+
     /// A file of this run's, removed when the session ends.
     pub fn file(&mut self, doc: &Value) -> Result<PathBuf> {
         let mut f = tempfile::Builder::new().prefix("hanzo-agent-").suffix(".json").tempfile().context("creating a config file")?;
@@ -443,6 +448,7 @@ pub(crate) mod test {
             preset_session: None,
             trust_project: false,
             resume: None,
+            effort: None,
             passthrough: vec![],
             refresh: vec!["hanzo".into(), "auth".into(), "token".into()],
             root: crate::root::scratch(),

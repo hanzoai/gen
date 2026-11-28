@@ -234,6 +234,25 @@ impl Backend for Claude {
             cmd.arg("--dangerously-skip-permissions");
         }
 
+        // Reasoning effort: full expanded ladder. `Auto` leaves depth to
+        // Enso's per-tier router; `Off` disables thinking via
+        // `MAX_THINKING_TOKENS=0`; explicit levels pass `--effort <level>` and
+        // `CLAUDE_CODE_EFFORT_LEVEL=<level>` unless overridden in passthrough.
+        if let Some(eff) = spec.effort {
+            if eff.claude_disables_thinking() {
+                cmd.env("MAX_THINKING_TOKENS", "0");
+            } else if let Some(level) = eff.claude_wire() {
+                let own_effort = spec
+                    .passthrough
+                    .iter()
+                    .any(|a| a == "--effort" || a.starts_with("--effort="));
+                if !own_effort {
+                    cmd.args(["--effort", level]);
+                }
+                cmd.env("CLAUDE_CODE_EFFORT_LEVEL", level);
+            }
+        }
+
         cmd.args(&spec.passthrough);
         Ok(Launch { command: cmd, cleanup, readonly: None })
     }

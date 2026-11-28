@@ -123,13 +123,7 @@ pub(crate) async fn run_routed_agent(
         Some(extra) => format!("{extra}\n\n---\n\n{prompt}"),
         None => prompt.to_string(),
     };
-    let mut passthrough = Vec::new();
-    if kind == BackendKind::Dev {
-        if let Some(eff) = effort.map(str::trim).filter(|s| matches!(*s, "low" | "medium" | "high")) {
-            passthrough.push("-c".to_string());
-            passthrough.push(format!("model_reasoning_effort=\"{eff}\""));
-        }
-    }
+    let resolved_effort = effort.and_then(crate::reasoning::ReasoningEffort::parse);
 
     let structured = client.is_some();
     let spec = Spec {
@@ -144,7 +138,8 @@ pub(crate) async fn run_routed_agent(
         preset_session: None,
         trust_project: false,
         resume: None,
-        passthrough,
+        effort: resolved_effort,
+        passthrough: Vec::new(),
         refresh: host.refresh(brand),
         root: root.clone(),
     };

@@ -48,20 +48,29 @@ fn status_lines(
     session: Option<&str>,
 ) -> (String, String) {
     let strip = |u: &str| u.trim_start_matches("https://").trim_start_matches("http://").trim_end_matches('/').to_string();
+    let effort_suffix = opts
+        .effort
+        .filter(|e| *e != crate::reasoning::ReasoningEffort::Auto)
+        .map(|e| format!(" · effort {}", e.as_str()))
+        .unwrap_or_default();
     let route = match routing {
-        Some(Routing::Gateway { api, .. }) => {
-            format!("model routing: Hanzo cloud → {} (prompts + code go here; usage metered to your org)", strip(api))
+        Some(Routing::Gateway { api, model, .. }) => {
+            let display = crate::enso::format_model_id(model);
+            format!(
+                "model routing: Hanzo cloud → {} · {display}{effort_suffix} (prompts + code go here; usage metered to your org)",
+                strip(api)
+            )
         }
         Some(Routing::Anthropic { .. }) => {
-            "model routing: on → api.anthropic.com (your Anthropic key; usage billed by Anthropic)".to_string()
+            format!("model routing: on → api.anthropic.com{effort_suffix} (your Anthropic key; usage billed by Anthropic)")
         }
         Some(Routing::OpenAI { .. }) => {
-            "model routing: on → api.openai.com (your OpenAI key; usage billed by OpenAI)".to_string()
+            format!("model routing: on → api.openai.com{effort_suffix} (your OpenAI key; usage billed by OpenAI)")
         }
         None if opts.backend == BackendKind::Dev && !signed_in => {
             "model routing: off (sign in with `hanzo auth login` to route + meter model calls)".to_string()
         }
-        None => "model routing: your account, direct (code stays with your provider)".to_string(),
+        None => format!("model routing: your account, direct{effort_suffix} (code stays with your provider)"),
     };
     let stream = match session {
         Some(id) => format!("session stream: on → {}", summary::url(id)),
@@ -165,15 +174,17 @@ mod tests {
             task: None,
             theme: None,
             model: None,
+            effort: None,
             passthrough: vec![],
             root: crate::root::scratch(),
         };
         // Routing ON (gateway), stream OFF — the case that regressed:
         // --no-link but model calls still ship code to the gateway.
-        let gw = Routing::Gateway { api: "https://api.hanzo.ai".into(), token: "T".into(), org: None, model: "enso".into(), small_fast_model: "enso-flash".into(), context_window: 1_000_000 };
+        let gw = Routing::Gateway { api: "https://api.hanzo.ai".into(), token: "T".into(), org: None, model: "enso-auto".into(), small_fast_model: "enso-flash".into(), context_window: 1_000_000 };
         let (route, stream) = status_lines(&opts, Some(&gw), true, None);
         assert!(route.contains("model routing: Hanzo cloud"), "got: {route}");
         assert!(route.contains("api.hanzo.ai"));
+        assert!(route.contains("○ enso-auto"), "gateway route must display progressive Enso glyph: {route}");
         assert!(route.contains("prompts + code"));
         assert!(stream.contains("session stream: off"), "got: {stream}");
         // Must NOT claim the run is "local only" while routing is on.
@@ -217,6 +228,7 @@ mod tests {
             task: None,
             theme: None,
             model: None,
+            effort: Some(crate::reasoning::ReasoningEffort::XHigh),
             passthrough: vec![],
             root: crate::root::scratch(),
         };
@@ -224,6 +236,7 @@ mod tests {
         let (route, _) = status_lines(&opts, Some(&anthropic), true, None);
         assert!(route.contains("model routing: on"), "got: {route}");
         assert!(route.contains("api.anthropic.com"), "got: {route}");
+        assert!(route.contains("effort xhigh"), "got: {route}");
         assert!(route.contains("billed by Anthropic"), "got: {route}");
         assert!(!route.contains("api.hanzo.ai"), "a direct route must NOT claim the gateway");
         // The key never appears in the human-facing line.
@@ -232,6 +245,18 @@ mod tests {
         let openai = Routing::OpenAI { key: "sk-x".into() };
         let (route, _) = status_lines(&opts, Some(&openai), true, None);
         assert!(route.contains("api.openai.com") && route.contains("billed by OpenAI"), "got: {route}");
+        assert!(route.contains("effort xhigh"), "got: {route}");
+
+        let ultra = Routing::Gateway {
+            api: "https://api.hanzo.ai".into(),
+            token: "T".into(),
+            org: None,
+            model: "enso-ultra".into(),
+            small_fast_model: "enso-flash".into(),
+            context_window: 1_000_000,
+        };
+        let (route, _) = status_lines(&opts, Some(&ultra), true, None);
+        assert!(route.contains("◕ enso-ultra") && route.contains("effort xhigh"), "got: {route}");
     }
 
 }

@@ -96,9 +96,11 @@ esac
     assert!(res1.error.is_none());
 
     // Turn 2: resume exact `backend_session_id` from Turn 1; `token_fn` rotates dynamically!
+    // Also exercise expanded effort level (`xhigh`) across embedded turns.
     let mut req2 = EmbeddedTurnRequest::new(root.clone(), ws_dir.path(), "Now ship phase 2");
     req2.resume_backend_session = res1.backend_session_id.clone();
     req2.model = Some("enso-pro".into());
+    req2.effort = Some("xhigh".into());
 
     let res2 = run_embedded_turn(host, req2).await.unwrap();
     assert!(res2.ok, "{res2:?}");
@@ -122,6 +124,7 @@ esac
         "{logged}"
     );
     assert!(logged.contains("model_reasoning_effort=\"high\""), "{logged}");
+    assert!(logged.contains("model_reasoning_effort=\"xhigh\""), "{logged}");
     assert!(logged.contains("sig_1") && logged.contains("sig_2"), "{logged}");
 }
 

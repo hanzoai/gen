@@ -335,6 +335,9 @@ pub struct Spec {
     /// shell's (`Inherit`, `--no-route`), or fail closed and clear it
     /// (`FailClosed`, a selected provider with no usable key).
     pub routing: Route,
+    /// Optional resolved reasoning effort level (`auto`, `off`/`none`,
+    /// `minimal`, `low`, `medium`, `high`, `xhigh`, `max`).
+    pub effort: Option<crate::reasoning::ReasoningEffort>,
     /// How much of the agent's actions auto-approve (the resolved `autoApprove`
     /// decision). Orthogonal to routing — it governs the backend's permission mode,
     /// not where model calls go. Each backend maps it to its own flags.

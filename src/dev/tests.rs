@@ -16,6 +16,7 @@ fn spec(mode: Mode, api: &str) -> Spec {
         preset_session: None,
         trust_project: false,
         resume: None,
+        effort: None,
         passthrough: vec![],
         refresh: vec!["hanzo".into(), "auth".into(), "token".into()],
         root: crate::root::scratch(),
@@ -419,8 +420,16 @@ fn gateway_route_names_the_model_window_via_catalog() {
     let body = std::fs::read_to_string(path.trim_matches('"')).expect("catalog file exists");
     let v: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(v["models"][0]["slug"], "enso");
+    assert_eq!(v["models"][0]["display_name"], "◌ enso");
     assert_eq!(v["models"][0]["context_window"], 1_000_000);
     assert_eq!(v["models"][0]["max_context_window"], 1_000_000, "the ceiling must be raised or codex clamps");
+    let advertised_efforts: Vec<&str> = v["models"][0]["supported_reasoning_levels"]
+        .as_array()
+        .expect("supported_reasoning_levels array")
+        .iter()
+        .filter_map(|e| e["effort"].as_str())
+        .collect();
+    assert_eq!(advertised_efforts, vec!["none", "minimal", "low", "medium", "high", "xhigh", "max"]);
     assert_eq!(l.cleanup.files.len(), 1);
 
     // EVERY field the agents' catalog parser requires must be present. It
@@ -530,4 +539,41 @@ fn readonly_task_uses_readonly_sandbox_and_never_injects_no_one_to_ask() {
             .any(|a| a.contains("developer_instructions=") && a.contains("read-only")),
         "must inject READ_ONLY_INSTRUCTIONS: {args:?}"
     );
+}
+
+#[test]
+fn expanded_reasoning_effort_levels_reach_dev_and_codex() {
+    use crate::reasoning::ReasoningEffort;
+
+    let mut auto = spec(Mode::Headless, "https://api.hanzo.ai");
+    auto.effort = Some(ReasoningEffort::Auto);
+    assert!(!argv(&Agent::DEV.build(&auto).unwrap()).iter().any(|a| a.starts_with("model_reasoning_effort=")));
+
+    for (effort, wire) in [
+        (ReasoningEffort::Off, "none"),
+        (ReasoningEffort::Minimal, "minimal"),
+        (ReasoningEffort::Low, "low"),
+        (ReasoningEffort::Medium, "medium"),
+        (ReasoningEffort::High, "high"),
+        (ReasoningEffort::XHigh, "xhigh"),
+        (ReasoningEffort::Max, "max"),
+    ] {
+        let mut s = spec(Mode::Headless, "https://api.hanzo.ai");
+        s.effort = Some(effort);
+        let args = argv(&Agent::DEV.build(&s).unwrap());
+        let expected = format!("model_reasoning_effort=\"{wire}\"");
+        assert!(args.iter().any(|a| a == &expected), "{effort:?} -> {args:?}");
+    }
+
+    // Explicit passthrough model_reasoning_effort wins without duplicating.
+    let mut own = spec(Mode::Headless, "https://api.hanzo.ai");
+    own.effort = Some(ReasoningEffort::Max);
+    own.passthrough = vec!["-c".into(), r#"model_reasoning_effort="low""#.into()];
+    let args = argv(&Agent::DEV.build(&own).unwrap());
+    assert_eq!(
+        args.iter().filter(|a| a.starts_with("model_reasoning_effort=")).count(),
+        1,
+        "{args:?}"
+    );
+    assert!(args.iter().any(|a| a == r#"model_reasoning_effort="low""#));
 }

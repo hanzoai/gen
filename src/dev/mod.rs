@@ -241,6 +241,17 @@ impl Backend for Agent {
             Route::Inherit => {}
         }
 
+        // Reasoning effort: full expanded ladder (`none`, `minimal`, `low`,
+        // `medium`, `high`, `xhigh`, `max`). `Auto` leaves depth to the router
+        // / model default. Explicit passthrough `-c model_reasoning_effort=…`
+        // wins over the resolved setting.
+        if let Some(eff) = spec.effort.and_then(crate::reasoning::ReasoningEffort::codex_wire) {
+            if !spec.passthrough.iter().any(|a| a.starts_with("model_reasoning_effort=")) {
+                args.push("-c".into());
+                args.push(cfg_string("model_reasoning_effort", eff));
+            }
+        }
+
         // A task run has nobody to answer, so it is told so, unless the caller named
         // developer instructions of their own or explicitly requested a read-only scan /
         // confirmation before modifying files.
@@ -408,9 +419,9 @@ fn model_catalog(model: &str, context_window: u64) -> String {
             // window. These are inert defaults; only the two windows above
             // carry meaning for us. Unknown keys are ignored, so one superset
             // satisfies both agents' slightly different schemas.
-            "display_name": model,
+            "display_name": crate::enso::format_model_id(model),
             "base_instructions": "",
-            "supported_reasoning_levels": [],
+            "supported_reasoning_levels": crate::reasoning::codex_supported_levels(),
             "supports_reasoning_summaries": false,
             "supports_parallel_tool_calls": false,
             "experimental_supported_tools": [],
