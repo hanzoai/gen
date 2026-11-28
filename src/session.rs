@@ -412,6 +412,112 @@ mod tests {
         assert_ne!(reqs[1].json()["requestId"], reqs[2].json()["requestId"], "b is its own request");
     }
 
+    /// A burst that spans turns is paid per REQUEST, not per attempt: turn A is
+    /// refused twice and lands on its third try under ONE id, then turn B lands on
+    /// its first try under a new one. The transcript holds `a` once — the repeats
+    /// are the same request — and then `b`.
+    ///
+    /// MUTATION: mint a `requestId` per try, and A is stored three times.
+    #[tokio::test]
+    async fn a_burst_over_two_turns_names_each_turn_once() {
+        let mock = MockCloud::start_refusing(&[true, true, false]).await;
+        let client = SessionClient::new(&mock.base_url(), "T").unwrap();
+
+        client.event("sess_1", Kind::Log, json!({"line":"a"})).await.expect("a lands on its third try");
+        client.event("sess_1", Kind::Log, json!({"line":"b"})).await.expect("b lands on its first");
+
+        let reqs = mock.requests();
+        let lines: Vec<String> = reqs.iter().map(|r| r.json()["payload"]["line"].as_str().unwrap_or_default().to_string()).collect();
+        assert_eq!(lines, ["a", "a", "a", "b"], "a is tried until it lands, then b");
+        let named = |i: usize| reqs[i].json()["requestId"].as_str().unwrap_or_default().to_string();
+        assert_eq!(named(0), named(1), "a's second try is a");
+        assert_eq!(named(1), named(2), "a's third try is a");
+        assert_ne!(named(2), named(3), "b is its own request");
+    }
+
+    /// A burst that falls between turns still lands every turn exactly once: each
+    /// turn's repeats share their own id, and no two turns share one.
+    ///
+    /// MUTATION: reuse the id across turns, and the platform collapses them into
+    /// one turn; drop it, and the refused tries are lost.
+    #[tokio::test]
+    async fn interleaved_refusals_land_each_turn_once() {
+        let mock = MockCloud::start_refusing(&[true, false, true, true, false, true]).await;
+        let client = SessionClient::new(&mock.base_url(), "T").unwrap();
+        for line in ["a", "b", "c"] {
+            client.event("sess_1", Kind::Log, json!({ "line": line })).await.unwrap();
+        }
+
+        let reqs = mock.requests();
+        let lines: Vec<String> = reqs.iter().map(|r| r.json()["payload"]["line"].as_str().unwrap_or_default().to_string()).collect();
+        assert_eq!(lines, ["a", "a", "b", "b", "b", "c", "c"], "each turn is tried until it lands");
+        let mut ids: Vec<String> = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            let idx = ["a", "b", "c"].iter().position(|l| l == line).unwrap();
+            let id = reqs[i].json()["requestId"].as_str().unwrap_or_default().to_string();
+            if idx == ids.len() {
+                assert!(!id.is_empty(), "turn {line} was sent unnamed");
+                assert!(!ids.contains(&id), "turn {line} shares an id with an earlier turn");
+                ids.push(id);
+            } else {
+                assert_eq!(id, ids[idx], "turn {line}'s repeat is a different request");
+            }
+        }
+        assert_eq!(ids.len(), 3);
+    }
+
+    /// A cloud that comes back is named again, and nothing it was sent twice went
+    /// under two names. Turn A is refused once then served; the next two turns are
+    /// lost (every try refused, then one unnamed try); the turn that follows lands
+    /// unnamed — the one-try policy — and the turn after that is named again.
+    ///
+    /// MUTATION: clear `lost` before the landing turn can prove it, and D is named
+    /// (a fresh retry budget on a cloud just proven down); never clear it, and E
+    /// stays unnamed after a turn has landed.
+    #[tokio::test]
+    async fn a_cloud_that_comes_back_names_turns_again_without_two_names_for_one() {
+        // A: refuse, serve. B: refuse all 4 tries. C: refuse the unnamed try.
+        // D: serve the unnamed try. E: serve, named.
+        let mock = MockCloud::start_refusing(&[true, false, true, true, true, true, true, false, false]).await;
+        let client = SessionClient::new(&mock.base_url(), "T").unwrap();
+        let turn = |line: &'static str| client.event("sess_1", Kind::Log, json!({ "line": line }));
+
+        turn("a").await.expect("a's repeat lands");
+        assert!(turn("b").await.is_err(), "b is refused every try");
+        assert!(turn("c").await.is_err(), "c is refused its single try");
+        turn("d").await.expect("the cloud is back");
+        turn("e").await.expect("and stays up");
+
+        let reqs = mock.requests();
+        assert_eq!(reqs.len(), 9, "2 for a, 4 for b, 1 each for c, d and e");
+        let line = |i: usize| reqs[i].json()["payload"]["line"].as_str().unwrap_or_default().to_string();
+        let named = |i: usize| reqs[i].json()["requestId"].as_str().unwrap_or_default().to_string();
+
+        assert_eq!(named(0), named(1), "a's repeat is a");
+        for i in 2..6 {
+            assert_eq!(line(i), "b");
+            assert_eq!(named(i), named(2), "b's tries are all b");
+        }
+        assert_ne!(named(1), named(2), "b is not a");
+        assert!(named(6).is_empty(), "c is tried once, unnamed, after a lost turn");
+        assert_eq!(line(6), "c");
+        assert!(named(7).is_empty(), "d lands under the same one-try policy");
+        assert_eq!(line(7), "d");
+        assert!(!named(8).is_empty(), "e is named: a turn has landed");
+        assert_ne!(named(8), named(0), "e is not a");
+        assert_ne!(named(8), named(2), "e is not b");
+
+        // No payload was ever sent twice under two DIFFERENT names: the platform
+        // would store such a pair as two turns.
+        for i in 0..reqs.len() {
+            for j in (i + 1)..reqs.len() {
+                if line(i) == line(j) {
+                    assert_eq!(named(i), named(j), "{} was sent under two request ids", line(i));
+                }
+            }
+        }
+    }
+
     /// Two turns are two requests: the id names one append, never the session.
     #[tokio::test]
     async fn each_event_names_itself_apart() {
