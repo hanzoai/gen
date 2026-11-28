@@ -32,6 +32,7 @@ mod control;
 pub mod contract;
 mod dev;
 pub mod embedded;
+pub mod enso;
 // The status vocabulary IS part of the session client's signature (`set_status`),
 // so anything that can hold a session — `hanzo link` as much as `hanzo dev` —
 // must be able to name the value it is setting.
@@ -46,6 +47,7 @@ pub mod ledger;
 pub mod mcp;
 pub mod native;
 pub mod private;
+pub mod reasoning;
 pub mod root;
 pub mod runner;
 pub mod sample;
@@ -55,7 +57,7 @@ pub mod settings;
 mod summary;
 pub mod target;
 mod theme;
-mod tier;
+pub mod tier;
 mod lifecycle;
 mod readonly;
 mod render;
@@ -72,7 +74,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub use args::Args;
+pub use enso::enso_glyph;
 pub use host::{Account, Host, Profile, Provider};
+pub use reasoning::ReasoningEffort;
 pub use root::Root;
 
 #[cfg(test)]
@@ -130,6 +134,9 @@ pub struct Options {
     /// (see [`resolve_model`]). Applies ONLY to a gateway route; a direct provider
     /// route names no model.
     pub model: Option<String>,
+    /// Reasoning effort level (`--effort` / `--reasoning-effort`): `auto`,
+    /// `off` (`none`), `minimal`, `low`, `medium`, `high`, `xhigh`, `max`.
+    pub effort: Option<ReasoningEffort>,
     pub task: Option<String>,
     pub passthrough: Vec<String>,
     /// Where this session keeps what it writes, decided by the launcher.
@@ -260,7 +267,7 @@ pub(crate) fn cloud_resume_block(
     })
 }
 
-pub async fn run(host: Arc<dyn Host>, opts: Options) -> Result<()> {
+pub async fn run(host: Arc<dyn Host>, mut opts: Options) -> Result<()> {
     let kind = opts.backend;
     let backend = resolve(kind);
     let mode = if opts.task.is_some() { Mode::Headless } else { Mode::Interactive };
@@ -337,6 +344,12 @@ pub async fn run(host: Arc<dyn Host>, opts: Options) -> Result<()> {
     // process env. Best-effort: a missing file is created with the defaults, a bad
     // one degrades to them.
     let settings = Settings::load(&root);
+    let effort = routing::resolve_effort(
+        opts.effort,
+        std::env::var("HANZO_REASONING_EFFORT").ok().as_deref(),
+        settings.effort.as_deref(),
+    );
+    opts.effort = effort;
 
     // Auto-approve: run the agent's actions without a per-action prompt by default
     // (the confirmed default). `--ask`/`--safe` opt out; `--no-sandbox` escalates to
@@ -552,6 +565,7 @@ pub async fn run(host: Arc<dyn Host>, opts: Options) -> Result<()> {
         task: opts.task.clone(),
         cwd: cwd.clone(),
         routing,
+        effort,
         approval,
         mcp,
         remote: equipped.and_then(|e| e.remote),

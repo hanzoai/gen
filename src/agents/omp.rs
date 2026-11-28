@@ -24,15 +24,25 @@ pub const AGENT: Agent = Agent {
 fn build(r: &mut Run) -> Result<()> {
     if let Some(g) = r.gateway() {
         let dir = r.home("omp")?;
-        let mut hanzo_models = vec![json!({ "id": g.model, "name": g.model })];
+        let active_id = crate::enso::normalize_enso_model(g.model);
+        let active_name = crate::enso::format_model_label(
+            active_id,
+            crate::enso::enso_display_name(active_id).unwrap_or(active_id),
+        );
+        let mut hanzo_models = vec![json!({ "id": active_id, "name": active_name })];
+        for m in crate::enso::ENSO_MODELS {
+            if active_id != m.id {
+                hanzo_models.push(json!({
+                    "id": m.id,
+                    "name": crate::enso::format_model_label(m.id, m.name),
+                }));
+            }
+        }
         for (id, name) in [
             ("hybrid/auto", "Hanzo Hybrid Auto (Local Qwen 3.8 27B + Remote Enso Pro)"),
-            ("enso-pro", "Enso Pro"),
-            ("enso-ultra", "Enso Ultra"),
-            ("enso-flash", "Enso Flash"),
             ("zen6", "Zen 6"),
         ] {
-            if g.model != id {
+            if active_id != id {
                 hanzo_models.push(json!({ "id": id, "name": name }));
             }
         }
@@ -67,7 +77,10 @@ fn build(r: &mut Run) -> Result<()> {
         let mcp = r.mcp().map(|m| json!({ "mcpServers": { "hanzo": { "command": m.program, "args": m.args } } })).unwrap_or_else(|| json!({ "mcpServers": {} }));
         r.write(&dir.join("mcp.json"), &mcp)?;
         r.env("PI_CODING_AGENT_DIR", &dir).env(KEY, g.token);
-        r.arg("--model").arg(format!("hanzo/{}", g.model));
+        r.arg("--model").arg(format!("hanzo/{active_id}"));
+    }
+    if let Some(thinking) = r.effort().and_then(crate::reasoning::ReasoningEffort::pi_wire) {
+        r.args(["--thinking", thinking]);
     }
     if r.auto() {
         r.arg("--auto-approve");
@@ -97,12 +110,23 @@ mod tests {
         assert_eq!(models["providers"]["hanzo"]["apiKey"], "HANZO_API_KEY");
         assert_eq!(models["virtualModels"]["hybrid/auto"]["local"], "local-llamacpp/qwen3.8-27b");
         assert_eq!(models["virtualModels"]["hybrid/auto"]["remote"], "hanzo/enso-pro");
+        let list = models["providers"]["hanzo"]["models"].as_array().unwrap();
+        assert!(list.iter().any(|m| m["id"] == "enso-auto" && m["name"] == "○ Enso Auto"));
+        assert!(list.iter().any(|m| m["id"] == "enso-ultra" && m["name"] == "◕ Enso Ultra"));
+        assert!(list.iter().any(|m| m["id"] == "enso-max" && m["name"] == "◑ Enso Max"));
+        assert!(list.iter().any(|m| m["id"] == "enso-pro" && m["name"] == "◔ Enso Pro"));
+        assert!(list.iter().any(|m| m["id"] == "enso-flash" && m["name"] == "◦ Enso Flash"));
+        assert!(!list.iter().any(|m| m["id"] == "enso-free"));
         let mcp: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("mcp.json")).unwrap()).unwrap();
         assert_eq!(mcp["mcpServers"]["hanzo"]["command"], "/opt/hanzo");
         // On its own account omp keeps its own directory.
         let own = build("omp", &spec(Mode::Headless, Route::Inherit));
         assert!(env(&own, "PI_CODING_AGENT_DIR").is_none());
         assert_eq!(argv(&own), ["--auto-approve", "-p", "fix the test"]);
+
+        let mut with_effort = spec(Mode::Headless, gateway());
+        with_effort.effort = Some(crate::reasoning::ReasoningEffort::Max);
+        assert!(argv(&build("omp", &with_effort)).windows(2).any(|w| w == ["--thinking", "max"]));
     }
 
     #[test]

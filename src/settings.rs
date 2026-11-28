@@ -64,6 +64,10 @@ pub struct Settings {
     /// the metered gateway route; a direct provider uses that provider's own window.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
+    /// Default reasoning effort level (`auto`, `off`/`none`, `minimal`, `low`,
+    /// `medium`, `high`, `xhigh`, `max`). Unset ⇒ `auto`.
+    #[serde(alias = "reasoningEffort", skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
 }
 
 impl Settings {
@@ -156,6 +160,7 @@ fn defaults_document() -> Settings {
         auto_approve: Some(true),
         mcp: Some(true),
         context_window: Some(super::DEFAULT_CONTEXT_WINDOW),
+        effort: None,
         agent: Some(super::backend::DEFAULT.as_str().to_string()),
         harness: None,
     }
@@ -192,7 +197,7 @@ mod tests {
     fn parses_camel_case_and_ignores_unknown_keys() {
         let s: Settings = serde_json::from_str(
             r#"{ "model": "enso-ultra", "smallFastModel": "enso-flash", "autoApprove": false,
-                 "mcp": false, "contextWindow": 200000, "future": 1 }"#,
+                 "mcp": false, "contextWindow": 200000, "reasoningEffort": "xhigh", "future": 1 }"#,
         )
         .expect("parses");
         assert_eq!(s.model.as_deref(), Some("enso-ultra"));
@@ -200,6 +205,7 @@ mod tests {
         assert_eq!(s.auto_approve, Some(false));
         assert_eq!(s.mcp, Some(false));
         assert_eq!(s.context_window, Some(200_000));
+        assert_eq!(s.effort.as_deref(), Some("xhigh"));
     }
 
     /// The first-run document names every default explicitly — a self-documenting

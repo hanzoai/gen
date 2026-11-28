@@ -460,21 +460,11 @@ pub async fn run_embedded_turn(
     };
 
     let mut passthrough = Vec::new();
-    if matches!(kind, BackendKind::Dev | BackendKind::Codex | BackendKind::Interpreter) {
-        if local {
-            passthrough.push("-c".to_string());
-            passthrough.push("model_providers.hanzocode.wire_api=\"chat\"".to_string());
-        }
-        if let Some(eff) = req
-            .effort
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| matches!(*s, "low" | "medium" | "high"))
-        {
-            passthrough.push("-c".to_string());
-            passthrough.push(format!("model_reasoning_effort=\"{eff}\""));
-        }
+    if matches!(kind, BackendKind::Dev | BackendKind::Codex | BackendKind::Interpreter) && local {
+        passthrough.push("-c".to_string());
+        passthrough.push("model_providers.hanzocode.wire_api=\"chat\"".to_string());
     }
+    let effort = req.effort.as_deref().and_then(crate::reasoning::ReasoningEffort::parse);
 
     let resume = req
         .resume_backend_session
@@ -495,6 +485,7 @@ pub async fn run_embedded_turn(
         preset_session: None,
         trust_project: false,
         resume,
+        effort,
         passthrough,
         refresh: host.refresh(host::BRAND),
         root: req.root,

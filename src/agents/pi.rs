@@ -23,15 +23,25 @@ pub const AGENT: Agent = Agent {
 fn build(r: &mut Run) -> Result<()> {
     if let Some(g) = r.gateway() {
         let dir = r.home("pi")?;
-        let mut hanzo_models = vec![json!({ "id": g.model, "name": g.model })];
+        let active_id = crate::enso::normalize_enso_model(g.model);
+        let active_name = crate::enso::format_model_label(
+            active_id,
+            crate::enso::enso_display_name(active_id).unwrap_or(active_id),
+        );
+        let mut hanzo_models = vec![json!({ "id": active_id, "name": active_name })];
+        for m in crate::enso::ENSO_MODELS {
+            if active_id != m.id {
+                hanzo_models.push(json!({
+                    "id": m.id,
+                    "name": crate::enso::format_model_label(m.id, m.name),
+                }));
+            }
+        }
         for (id, name) in [
             ("hybrid/auto", "Hanzo Hybrid Auto (Local Qwen 3.8 27B + Remote Enso Pro)"),
-            ("enso-pro", "Enso Pro"),
-            ("enso-ultra", "Enso Ultra"),
-            ("enso-flash", "Enso Flash"),
             ("zen6", "Zen 6"),
         ] {
-            if g.model != id {
+            if active_id != id {
                 hanzo_models.push(json!({ "id": id, "name": name }));
             }
         }
@@ -63,7 +73,10 @@ fn build(r: &mut Run) -> Result<()> {
         });
         r.write(&dir.join("models.json"), &models)?;
         r.env("PI_CODING_AGENT_DIR", &dir).env(KEY, g.token);
-        r.args(["--provider", "hanzo", "--model"]).arg(g.model);
+        r.args(["--provider", "hanzo", "--model"]).arg(active_id);
+    }
+    if let Some(thinking) = r.effort().and_then(crate::reasoning::ReasoningEffort::pi_wire) {
+        r.args(["--thinking", thinking]);
     }
     if r.headless() {
         if r.structured() {
@@ -90,7 +103,18 @@ mod tests {
         assert_eq!(doc["providers"]["hanzo"]["apiKey"], "${HANZO_API_KEY}");
         assert_eq!(doc["virtualModels"]["hybrid/auto"]["local"], "local-llamacpp/qwen3.8-27b");
         assert_eq!(doc["virtualModels"]["hybrid/auto"]["remote"], "hanzo/enso-pro");
+        let list = doc["providers"]["hanzo"]["models"].as_array().unwrap();
+        assert!(list.iter().any(|m| m["id"] == "enso-auto" && m["name"] == "○ Enso Auto"));
+        assert!(list.iter().any(|m| m["id"] == "enso-ultra" && m["name"] == "◕ Enso Ultra"));
+        assert!(list.iter().any(|m| m["id"] == "enso-max" && m["name"] == "◑ Enso Max"));
+        assert!(list.iter().any(|m| m["id"] == "enso-pro" && m["name"] == "◔ Enso Pro"));
+        assert!(list.iter().any(|m| m["id"] == "enso-flash" && m["name"] == "◦ Enso Flash"));
+        assert!(!list.iter().any(|m| m["id"] == "enso-free"));
         assert!(env(&build("pi", &spec(Mode::Headless, Route::Inherit)), "PI_CODING_AGENT_DIR").is_none());
+
+        let mut with_effort = spec(Mode::Headless, gateway());
+        with_effort.effort = Some(crate::reasoning::ReasoningEffort::XHigh);
+        assert!(argv(&build("pi", &with_effort)).windows(2).any(|w| w == ["--thinking", "xhigh"]));
     }
 
     #[test]

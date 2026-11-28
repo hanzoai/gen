@@ -16,6 +16,7 @@ fn spec(mode: Mode) -> Spec {
         preset_session: None,
         trust_project: false,
         resume: None,
+        effort: None,
         passthrough: vec![],
         refresh: Vec::new(),
         root: crate::root::scratch(),
@@ -612,10 +613,10 @@ fn every_tiering_slot_is_named_and_branded() {
     assert_eq!(env.get("ANTHROPIC_DEFAULT_OPUS_MODEL").map(String::as_str), Some("claude-opus-4-8[1m]"));
     assert_eq!(env.get("ANTHROPIC_DEFAULT_FABLE_MODEL").map(String::as_str), Some("claude-fable-5[1m]"));
     assert_eq!(env.get("ANTHROPIC_DEFAULT_HAIKU_MODEL").map(String::as_str), Some("enso-flash"));
-    assert_eq!(env.get("ANTHROPIC_DEFAULT_SONNET_MODEL_NAME").map(String::as_str), Some("Enso Pro"));
-    assert_eq!(env.get("ANTHROPIC_DEFAULT_OPUS_MODEL_NAME").map(String::as_str), Some("Enso Max"));
-    assert_eq!(env.get("ANTHROPIC_DEFAULT_FABLE_MODEL_NAME").map(String::as_str), Some("Enso Ultra"));
-    assert_eq!(env.get("ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME").map(String::as_str), Some("Enso Flash"));
+    assert_eq!(env.get("ANTHROPIC_DEFAULT_SONNET_MODEL_NAME").map(String::as_str), Some("◔ Enso Pro"));
+    assert_eq!(env.get("ANTHROPIC_DEFAULT_OPUS_MODEL_NAME").map(String::as_str), Some("◑ Enso Max"));
+    assert_eq!(env.get("ANTHROPIC_DEFAULT_FABLE_MODEL_NAME").map(String::as_str), Some("◕ Enso Ultra"));
+    assert_eq!(env.get("ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME").map(String::as_str), Some("◦ Enso Flash"));
     assert!(env.contains_key("ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION"));
 }
 
@@ -747,5 +748,38 @@ fn inherit_leaves_model_auth_untouched() {
     let l = Claude.build(&s).unwrap();
     for var in ANTHROPIC_AUTH {
         assert!(!touched(&l, var), "{var} must be left untouched under --no-route (Inherit) — no set, no remove");
+    }
+}
+
+#[test]
+fn expanded_reasoning_effort_levels_reach_claude() {
+    use crate::reasoning::ReasoningEffort;
+
+    let mut auto = spec(Mode::Headless);
+    auto.effort = Some(ReasoningEffort::Auto);
+    let l = Claude.build(&auto).unwrap();
+    assert!(!argv(&l).iter().any(|a| a == "--effort"));
+    assert!(!env_of(&l).contains_key("CLAUDE_CODE_EFFORT_LEVEL"));
+    assert!(!env_of(&l).contains_key("MAX_THINKING_TOKENS"));
+
+    let mut off = spec(Mode::Headless);
+    off.effort = Some(ReasoningEffort::Off);
+    let l = Claude.build(&off).unwrap();
+    assert_eq!(env_of(&l).get("MAX_THINKING_TOKENS").map(String::as_str), Some("0"));
+    assert!(!argv(&l).iter().any(|a| a == "--effort"));
+
+    for (effort, wire) in [
+        (ReasoningEffort::Minimal, "low"),
+        (ReasoningEffort::Low, "low"),
+        (ReasoningEffort::Medium, "medium"),
+        (ReasoningEffort::High, "high"),
+        (ReasoningEffort::XHigh, "xhigh"),
+        (ReasoningEffort::Max, "max"),
+    ] {
+        let mut s = spec(Mode::Headless);
+        s.effort = Some(effort);
+        let l = Claude.build(&s).unwrap();
+        assert!(argv(&l).windows(2).any(|w| w == ["--effort", wire]), "{effort:?}");
+        assert_eq!(env_of(&l).get("CLAUDE_CODE_EFFORT_LEVEL").map(String::as_str), Some(wire));
     }
 }

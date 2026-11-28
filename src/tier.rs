@@ -46,13 +46,23 @@ pub struct Tier {
     pub desc: &'static str,
 }
 
+impl Tier {
+    /// Picker display label prefixed with the tier's progressive Enso glyph
+    /// (for Enso models) so CLI/TUI pickers match web and desktop visuals.
+    pub fn picker_name(&self) -> String {
+        crate::enso::format_model_label(self.zen, self.name)
+    }
+}
+
 /// Every id here must be one api.hanzo.ai serves. Claude Code's own tiering is
 /// Enso's, one tier per slot: Haiku (background work and routine turns) is
 /// `enso-flash`, Sonnet `enso-pro`, Opus `enso-max`, Fable `enso-ultra`, each
 /// thinking at its own depth (low, medium, high, max) since no effort is seeded
-/// ([`super::home`]). `zen6` is the open-weights tier a user picks
-/// (`--model zen6`), in no slot.
+/// ([`super::home`]). `enso-auto` is the default adaptive router (and along with
+/// `enso-flash` is permitted on the Free tier; `enso-free` is retired and never
+/// listed). `zen6` is the open-weights tier a user picks (`--model zen6`), in no slot.
 pub const TIERS: &[Tier] = &[
+    Tier { zen: "enso-auto", carrier: None, slot: None, name: "Enso Auto", desc: "Hanzo Enso Auto — adaptive router, default (1M context)" },
     Tier { zen: "enso-flash", carrier: None, slot: Some(HAIKU), name: "Enso Flash", desc: "Hanzo Enso Flash — routine turns: reads, searches, small edits" },
     Tier { zen: "enso-pro", carrier: Some("claude-sonnet-4-6[1m]"), slot: Some("ANTHROPIC_DEFAULT_SONNET_MODEL"), name: "Enso Pro", desc: "Hanzo Enso Pro — frontier coders, routed (1M context)" },
     Tier { zen: "enso-max", carrier: Some("claude-opus-4-8[1m]"), slot: Some("ANTHROPIC_DEFAULT_OPUS_MODEL"), name: "Enso Max", desc: "Hanzo Enso Max — hard turns, routed (1M context)" },
@@ -78,7 +88,7 @@ pub fn is_hybrid_virtual_model(model: &str) -> bool {
 /// suffix — so an exported `ANTHROPIC_MODEL=enso-pro[1m]` must find the enso-pro tier
 /// rather than miss the table and grow a second suffix.
 fn of(model: &str) -> Option<&'static Tier> {
-    let model = bare(model);
+    let model = crate::enso::normalize_enso_model(bare(model));
     if is_hybrid_virtual_model(model) {
         return TIERS.iter().find(|t| t.zen == "hybrid/auto");
     }
@@ -107,7 +117,7 @@ fn short(model: &str) -> bool {
 /// 200000` opts every model back out, tiered or not, and an incoming id that
 /// already carries the suffix is normalized rather than doubled.
 pub fn wire(model: &str, context_window: u64) -> String {
-    let model = bare(model);
+    let model = crate::enso::normalize_enso_model(bare(model));
     match of(model) {
         Some(t) => wire_tier(t, context_window),
         None if context_window > STANDARD_WINDOW && !short(model) => format!("{model}[1m]"),
@@ -185,7 +195,7 @@ fn fill(out: &mut BTreeMap<String, String>, slot: &str, id: String, tier: Option
     let (name, desc) = (format!("{slot}_NAME"), format!("{slot}_DESCRIPTION"));
     match tier {
         Some(t) => {
-            out.insert(name, t.name.to_string());
+            out.insert(name, t.picker_name());
             out.insert(desc, t.desc.to_string());
         }
         None => {
@@ -223,18 +233,20 @@ mod tests {
 
     /// Claude Code's four tiering slots are Enso's four paid tiers, one each:
     /// Haiku flash, Sonnet pro, Opus max, Fable ultra. Each slot is labelled with
-    /// its own tier and SERVES its own id — the carrier is client-side only.
+    /// its own progressive Enso glyph + tier name and SERVES its own id — the
+    /// carrier is client-side only.
     #[test]
     fn each_slot_carries_its_own_enso_tier() {
         let e = env("enso-auto", "enso-flash", 1_000_000);
+        assert_eq!(e[MAIN], "enso-auto[1m]");
         assert_eq!(e[HAIKU], "enso-flash");
         assert_eq!(e["ANTHROPIC_DEFAULT_SONNET_MODEL"], "claude-sonnet-4-6[1m]");
         assert_eq!(e["ANTHROPIC_DEFAULT_OPUS_MODEL"], "claude-opus-4-8[1m]");
         assert_eq!(e["ANTHROPIC_DEFAULT_FABLE_MODEL"], "claude-fable-5[1m]");
-        assert_eq!(e[&format!("{HAIKU}_NAME")], "Enso Flash");
-        assert_eq!(e["ANTHROPIC_DEFAULT_SONNET_MODEL_NAME"], "Enso Pro");
-        assert_eq!(e["ANTHROPIC_DEFAULT_OPUS_MODEL_NAME"], "Enso Max");
-        assert_eq!(e["ANTHROPIC_DEFAULT_FABLE_MODEL_NAME"], "Enso Ultra");
+        assert_eq!(e[&format!("{HAIKU}_NAME")], "◦ Enso Flash");
+        assert_eq!(e["ANTHROPIC_DEFAULT_SONNET_MODEL_NAME"], "◔ Enso Pro");
+        assert_eq!(e["ANTHROPIC_DEFAULT_OPUS_MODEL_NAME"], "◑ Enso Max");
+        assert_eq!(e["ANTHROPIC_DEFAULT_FABLE_MODEL_NAME"], "◕ Enso Ultra");
         let o = overrides();
         assert_eq!(o["claude-sonnet-4-6"], "enso-pro");
         assert_eq!(o["claude-opus-4-8"], "enso-max");
@@ -287,11 +299,23 @@ mod tests {
         // An untiered small/fast model takes the slot and drops the tier's label.
         assert_eq!(e[HAIKU], "zen6-flash");
         assert!(!e.contains_key(&format!("{HAIKU}_NAME")));
-        // The tiers Claude picks from are still fully named.
+        // The tiers Claude picks from are still fully named with progressive Enso glyphs.
         assert_eq!(e["ANTHROPIC_DEFAULT_SONNET_MODEL"], "claude-sonnet-4-6[1m]");
-        assert_eq!(e["ANTHROPIC_DEFAULT_SONNET_MODEL_NAME"], "Enso Pro");
-        assert_eq!(e["ANTHROPIC_DEFAULT_OPUS_MODEL_NAME"], "Enso Max");
-        assert_eq!(e["ANTHROPIC_DEFAULT_FABLE_MODEL_NAME"], "Enso Ultra");
+        assert_eq!(e["ANTHROPIC_DEFAULT_SONNET_MODEL_NAME"], "◔ Enso Pro");
+        assert_eq!(e["ANTHROPIC_DEFAULT_OPUS_MODEL_NAME"], "◑ Enso Max");
+        assert_eq!(e["ANTHROPIC_DEFAULT_FABLE_MODEL_NAME"], "◕ Enso Ultra");
+    }
+
+    #[test]
+    fn enso_free_is_excluded_from_tiers_and_normalizes_to_enso_auto() {
+        for t in TIERS {
+            assert_ne!(t.zen, "enso-free", "enso-free must never appear in TIERS");
+            assert!(!t.name.eq_ignore_ascii_case("Enso Free"));
+        }
+        assert_eq!(of("enso-auto").expect("enso-auto tier").picker_name(), "○ Enso Auto");
+        assert_eq!(of("enso-free").expect("enso-free normalizes to enso-auto").zen, "enso-auto");
+        assert_eq!(wire("enso-free", 1_000_000), "enso-auto[1m]");
+        assert_eq!(wire("enso-free", 200_000), "enso-auto");
     }
 
     /// The env carries no secret and no endpoint — only model ids and labels — so

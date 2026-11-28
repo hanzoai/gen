@@ -95,11 +95,21 @@ pub struct Args {
     #[arg(long)]
     pub theme: Option<String>,
 
-    /// The gateway model to use, e.g. `enso-auto`, `enso-ultra`, `zen5-coder`. Applies
-    /// on the metered Hanzo gateway route only; a direct provider key names its own
-    /// model. No client-side allowlist — the gateway validates the id.
+    /// The gateway model to use, e.g. `enso-auto`, `enso-ultra`, `enso-max`,
+    /// `enso-pro`, `enso-flash`, `zen6`. Applies on the metered Hanzo gateway
+    /// route only; a direct provider key names its own model. No client-side
+    /// allowlist — the gateway validates the id.
     #[arg(long, value_name = "MODEL")]
     pub model: Option<String>,
+
+    /// Reasoning effort level: auto | off (none) | minimal | low | medium | high | xhigh | max
+    #[arg(
+        long,
+        visible_alias = "reasoning-effort",
+        value_name = "LEVEL",
+        value_parser = crate::reasoning::parse_cli_effort
+    )]
+    pub effort: Option<crate::reasoning::ReasoningEffort>,
 
     /// The task to run headless. Omit it for an interactive session.
     #[arg(value_name = "TASK")]
@@ -200,6 +210,7 @@ impl Args {
             brand: self.brand,
             theme: self.theme,
             model: self.model,
+            effort: self.effort,
             task,
             passthrough: self.passthrough,
             root,
@@ -284,5 +295,33 @@ mod tests {
     #[test]
     fn two_tools_are_refused() {
         assert!(parse(&["gen", "--claude", "--codex"]).is_err());
+    }
+
+    #[test]
+    fn effort_flag_accepts_full_expanded_ladder_and_alias() {
+        use crate::reasoning::ReasoningEffort;
+        for (raw, want) in [
+            ("auto", ReasoningEffort::Auto),
+            ("off", ReasoningEffort::Off),
+            ("none", ReasoningEffort::Off),
+            ("minimal", ReasoningEffort::Minimal),
+            ("low", ReasoningEffort::Low),
+            ("medium", ReasoningEffort::Medium),
+            ("high", ReasoningEffort::High),
+            ("xhigh", ReasoningEffort::XHigh),
+            ("max", ReasoningEffort::Max),
+        ] {
+            let o = parse(&["gen", "--effort", raw])
+                .unwrap()
+                .into_options(crate::root::scratch())
+                .unwrap();
+            assert_eq!(o.effort, Some(want), "--effort {raw}");
+        }
+        let alias = parse(&["gen", "--reasoning-effort", "xhigh"])
+            .unwrap()
+            .into_options(crate::root::scratch())
+            .unwrap();
+        assert_eq!(alias.effort, Some(ReasoningEffort::XHigh));
+        assert!(parse(&["gen", "--effort", "extreme"]).is_err());
     }
 }

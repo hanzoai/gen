@@ -72,13 +72,31 @@ pub(crate) fn resolve_approval(ask: bool, no_sandbox: bool, settings: Option<boo
 /// No allowlist: the gateway is the sole authority on validity, so a bad id simply
 /// 400s with the gateway's own message rather than being rejected client-side.
 pub(crate) fn resolve_model(flag: Option<&str>, user_env: Option<&str>, settings: Option<&str>, default: &str) -> String {
-    [flag, user_env, settings]
+    let picked = [flag, user_env, settings]
         .into_iter()
         .flatten()
         .map(str::trim)
         .find(|s| !s.is_empty())
-        .unwrap_or(default)
-        .to_string()
+        .unwrap_or(default);
+    crate::enso::normalize_enso_model(picked).to_string()
+}
+
+/// Resolve the reasoning effort level by precedence: an explicit `--effort`
+/// flag wins, then `HANZO_REASONING_EFFORT`, then `~/.hanzo/settings.json`
+/// `effort` / `reasoningEffort`. Unknown or empty values are ignored rather
+/// than crashing startup.
+pub(crate) fn resolve_effort(
+    flag: Option<crate::reasoning::ReasoningEffort>,
+    user_env: Option<&str>,
+    settings: Option<&str>,
+) -> Option<crate::reasoning::ReasoningEffort> {
+    if flag.is_some() {
+        return flag;
+    }
+    [user_env, settings]
+        .into_iter()
+        .flatten()
+        .find_map(crate::reasoning::ReasoningEffort::parse)
 }
 
 /// The resolved gateway model selection for a run — carried into `Routing::Gateway`
@@ -264,6 +282,19 @@ mod tests {
         // Empty / whitespace-only tiers name no model and are skipped.
         assert_eq!(resolve_model(Some("  "), Some(""), Some("file"), "enso"), "file");
         assert_eq!(resolve_model(Some(""), Some("  "), Some("  "), "enso"), "enso");
+        // Retired `enso-free` normalizes to `enso-auto`.
+        assert_eq!(resolve_model(Some("enso-free"), None, None, "enso-auto"), "enso-auto");
+        assert_eq!(resolve_model(None, None, Some("hanzo/enso-free"), "enso-auto"), "enso-auto");
+    }
+
+    #[test]
+    fn resolve_effort_precedence_and_aliases() {
+        use crate::reasoning::ReasoningEffort;
+        assert_eq!(resolve_effort(Some(ReasoningEffort::XHigh), Some("low"), Some("high")), Some(ReasoningEffort::XHigh));
+        assert_eq!(resolve_effort(None, Some("none"), Some("high")), Some(ReasoningEffort::Off));
+        assert_eq!(resolve_effort(None, Some("  "), Some("minimal")), Some(ReasoningEffort::Minimal));
+        assert_eq!(resolve_effort(None, Some("unknown"), Some("max")), Some(ReasoningEffort::Max));
+        assert_eq!(resolve_effort(None, None, None), None);
     }
 
     /// The auto-approve precedence: an explicit CLI flag wins, then the persisted
