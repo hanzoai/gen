@@ -64,6 +64,24 @@ Runnable multi-turn assistant and tool-dispatch examples in [`examples/`](exampl
 - **Rust**: [`examples/rust/`](examples/rust/) (Type-safe tool calling client with `reqwest`)
 - **cURL**: [`examples/curl/assistant.sh`](examples/curl/assistant.sh) (One-liner CLI query)
 
+## Headless Single-Prompt & Troubleshooting
+
+Run any harness in headless single-prompt mode:
+
+```sh
+hanzo "summarize this repository"
+hanzo --claude "summarize this repository"
+hanzo --codex "summarize this repository"
+hanzo --gemini "summarize this repository"
+```
+
+### Verified flags & runtime notes
+
+- **Hanzo MCP attachment (`hanzo __mcp`)**: attached automatically for `dev`, `claude`, and `codex` (and opt-out via `--no-mcp`). Repo-local `.mcp.json` / project settings remain isolated unless `--project-mcp` (`--trust-project`) is passed.
+- **Gemini headless runs**: `--gemini` does not attach a per-run MCP flag on the CLI; register Hanzo MCP once in user scope via `gemini mcp add -s user hanzo hanzo-mcp` if desired.
+- **Local / offline runs**: pass `--no-link` to skip cloud session streaming while preserving local execution and `hanzo dev · session summary` formatting.
+- **Running the test suite (`Linux` / `WSL2`)**: the CI suite tests UNIX signal and `HOME` isolation invariants (`hanzo.yml`). On Windows hosts, run the Linux test matrix inside WSL2 (`cargo test --locked`) in addition to native Windows checks (`cargo test --locked --test multi_agent_harness_matrix --test filesize`).
+
 ## Build
 
 ```sh
