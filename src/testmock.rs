@@ -82,8 +82,10 @@ struct Config {
     refuse_claims: bool,
     /// Optional server-side long-poll hold on `/claim` before answering.
     claim_hold: std::time::Duration,
-    /// Answer 503 to the first this-many requests, then serve normally.
-    refuse_first: usize,
+    /// Answer 503 to the requests whose position is `true`, then serve normally
+    /// past the end: a cloud that is ready except for the moments named here.
+    refuse_schedule: Vec<bool>,
+    /// The position of the next request in the schedule, shared across connections.
     refused: Arc<std::sync::atomic::AtomicUsize>,
     /// The folders every target answer carries as granted; a test changes them
     /// with [`MockCloud::grant`].
@@ -112,7 +114,7 @@ impl Default for Config {
             reject_first_key: false,
             refuse_claims: false,
             claim_hold: std::time::Duration::ZERO,
-            refuse_first: 0,
+            refuse_schedule: Vec::new(),
             refused: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             folders: Arc::new(Mutex::new(Vec::new())),
         }
@@ -148,9 +150,16 @@ impl MockCloud {
     }
 
     /// A mock that answers 503 to its first `n` requests and then serves normally:
-    /// a cloud that is briefly not ready.
+    /// a cloud that is briefly not ready. Exactly the schedule of `n` refusals.
     pub async fn start_refusing_first(n: usize) -> MockCloud {
-        Self::with(Config { refuse_first: n, ..Config::default() }).await
+        Self::start_refusing(&vec![true; n]).await
+    }
+
+    /// A mock that answers 503 at each position that is `true` and serves every
+    /// other request — and everything past the end of the schedule. Bursts can be
+    /// placed on the turns a test means them for, instead of only at the start.
+    pub async fn start_refusing(schedule: &[bool]) -> MockCloud {
+        Self::with(Config { refuse_schedule: schedule.to_vec(), ..Config::default() }).await
     }
 
     /// A mock that fails GET on a session id with `code` while register still
@@ -369,7 +378,14 @@ fn respond(cfg: &Config, method: &str, path: &str, bearer: bool, claim_key: Opti
     if let Some(code) = cfg.force_status {
         return (format!("{code} Error"), r#"{"error":"forced"}"#.to_string());
     }
-    if cfg.refused.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < cfg.refuse_first {
+    // Past the end of the schedule, a position is served normally: a short
+    // schedule names a burst, not a cloud that never recovers.
+    if cfg
+        .refuse_schedule
+        .get(cfg.refused.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
+        .copied()
+        .unwrap_or(false)
+    {
         return ("503 Service Unavailable".into(), r#"{"error":"not ready"}"#.to_string());
     }
     // The org's kit, as the caller reads it.
